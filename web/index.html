@@ -421,6 +421,42 @@
     setTimeout(() => { btn.disabled = false; btn.textContent = "Check updates"; }, 5000);
   }
 
+  function clearUpdateFlags(btn) {
+    // Mirror a successful update in the cached data and the visible badges
+    // right away, without re-rendering (which would wipe the ✅ + duration).
+    const { kind, iid, sid, cid } = btn.dataset;
+    const instUpd = updates.instances.find((u) => u.instance.id === Number(iid));
+    if (instUpd) {
+      if (kind === "container") {
+        const c = (instUpd.containers || []).find((x) => x.id === cid);
+        if (c && c.status === "update-available") c.status = "up-to-date";
+      } else {
+        const s = instUpd.stacks.find((x) => x.id === Number(sid));
+        if (s) {
+          s.images.forEach((i) => { if (i.status === "update-available") i.status = "up-to-date"; });
+          s.updatesAvailable = 0;
+        }
+      }
+    }
+    const row = btn.closest("tr");
+    if (row) {
+      row.querySelector(".badge.upd")?.remove();
+      row.querySelectorAll(".img-line.upd").forEach((el) => {
+        el.classList.remove("upd");
+        el.title = "Updated just now";
+        el.textContent = el.textContent.replace(/^⬆ /, "").replace(/ new version$/, "");
+      });
+    }
+    const hdrBadge = btn.closest("section")?.querySelector(".instance-header .badge.upd");
+    if (hdrBadge && instUpd) {
+      const remaining =
+        instUpd.stacks.reduce((n, s) => n + (s.updatesAvailable || 0), 0) +
+        (instUpd.containers || []).filter((c) => c.status === "update-available").length;
+      if (remaining) hdrBadge.textContent = `⬆ ${remaining} update${remaining === 1 ? "" : "s"}`;
+      else hdrBadge.remove();
+    }
+  }
+
   async function runUpdate(btn) {
     const { kind, iid, sid, cid } = btn.dataset;
     const key = kind === "container" ? cid : sid;
@@ -437,7 +473,7 @@
       const body = await res.json().catch(() => ({}));
       const ok = res.ok && body.ok;
       btn.innerHTML = ok ? "✅ Updated" : "❌ Failed";
-      if (ok) btn.classList.remove("has-upd");
+      if (ok) { btn.classList.remove("has-upd"); clearUpdateFlags(btn); }
       if (msg) {
         msg.textContent = ok
           ? `${((body.durationMs || 0) / 1000).toFixed(1)}s`

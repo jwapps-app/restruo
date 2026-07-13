@@ -322,6 +322,8 @@ async def update_stack(request: Request, iid: int, sid: int):
         raise HTTPException(status_code=404, detail=f"No stack with id {sid} on this instance")
 
     result = await _update_one(client, stack)
+    if result["ok"]:
+        request.app.state.checker.mark_updated(iid, stack_id=sid)
     status = 200 if result["ok"] else 502
     return JSONResponse(status_code=status, content=result)
 
@@ -345,6 +347,7 @@ async def update_container(request: Request, iid: int, cid: str):
             raise HTTPException(status_code=404, detail=f"No container {cid[:12]} on this instance")
         endpoint_id, container = target
         await client.recreate_container(endpoint_id, cid)
+        request.app.state.checker.mark_updated(iid, container_id=cid)
     except HTTPException:
         raise
     except Exception as exc:
@@ -389,7 +392,10 @@ async def update_all(request: Request, body: UpdateAllRequest | None = None):
         # Sequential within an instance to avoid hammering one Portainer with
         # simultaneous redeploys; instances run in parallel.
         for stack in stacks:
-            entry["results"].append(await _update_one(client, stack))
+            outcome = await _update_one(client, stack)
+            if outcome["ok"]:
+                request.app.state.checker.mark_updated(iid, stack_id=stack["Id"])
+            entry["results"].append(outcome)
         return entry
 
     targets = [

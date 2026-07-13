@@ -222,6 +222,21 @@ async def test_compares_running_container_not_local_tag():
     await registry.aclose()
 
 
+async def test_mark_updated_clears_cached_flags():
+    checker, snapshot, portainer, registry = await run_check(OLD_DIGEST, NEW_DIGEST)
+    stack = snapshot["instances"][0]["stacks"][0]
+    assert stack["updatesAvailable"] == 1
+
+    checker.mark_updated(0, stack_id=stack["id"])
+    refreshed = checker.snapshot()["instances"][0]["stacks"][0]
+    assert refreshed["updatesAvailable"] == 0
+    assert all(i["status"] != "update-available" for i in refreshed["images"])
+    # Pinned images stay pinned — only update-available flips to up-to-date.
+    assert any(i["status"] == "pinned" for i in refreshed["images"])
+    await portainer.aclose()
+    await registry.aclose()
+
+
 def standalone_transport(running_digest: str) -> httpx.MockTransport:
     """Instance with no stacks — just one standalone container tracking :latest."""
 

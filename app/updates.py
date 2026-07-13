@@ -190,6 +190,27 @@ class UpdateChecker:
                 result["containers"].append({**normalized, **checked})
         return result
 
+    def mark_updated(
+        self, iid: int, stack_id: int | None = None, container_id: str | None = None
+    ) -> None:
+        """Reflect a successful repull+redeploy in the cached results so badges
+        clear immediately instead of waiting for the next registry check."""
+        for instance_result in self.results:
+            if instance_result["instance"]["id"] != iid:
+                continue
+            if stack_id is not None:
+                for stack in instance_result["stacks"]:
+                    if stack["id"] == stack_id:
+                        for image in stack["images"]:
+                            if image["status"] == STATUS_UPDATE_AVAILABLE:
+                                image["status"] = STATUS_UP_TO_DATE
+                        stack["updatesAvailable"] = 0
+            if container_id is not None:
+                for container in instance_result.get("containers", []):
+                    if container["id"] == container_id and \
+                            container["status"] == STATUS_UPDATE_AVAILABLE:
+                        container["status"] = STATUS_UP_TO_DATE
+
     async def check_all(self) -> dict:
         async with self._lock:
             self.checking = True
