@@ -165,6 +165,22 @@ class PortainerClient:
         self._check(response)
         return response.json()
 
+    async def recreate_container(self, endpoint_id: int, container_id: int | str) -> dict:
+        """Portainer's own recreate action: pulls the image fresh and recreates
+        the container with its existing configuration (same as the UI's
+        Recreate button with 're-pull image' enabled)."""
+        response = await self._request(
+            "POST",
+            f"/api/docker/{endpoint_id}/containers/{container_id}/recreate",
+            json={"PullImage": True},
+            timeout=REDEPLOY_TIMEOUT,
+        )
+        self._check(response)
+        try:
+            return response.json()
+        except ValueError:
+            return {}
+
     async def redeploy_compose(
         self,
         stack_id: int,
@@ -227,6 +243,31 @@ class PortainerClient:
         # never redeploy stale content.
         stack_file_content = await self.get_stack_file(stack_id)
         return await self.redeploy_compose(stack_id, endpoint_id, stack_file_content, env)
+
+
+def standalone_containers(containers: list[dict], stack_names: set[str]) -> list[dict]:
+    """Containers that don't belong to any Portainer stack on this instance."""
+    out = []
+    for container in containers:
+        labels = container.get("Labels") or {}
+        project = labels.get("com.docker.compose.project") or labels.get(
+            "com.docker.stack.namespace"
+        )
+        if project and project in stack_names:
+            continue
+        out.append(container)
+    return out
+
+
+def normalize_container(container: dict, endpoint_id: int) -> dict:
+    names = container.get("Names") or []
+    return {
+        "id": container.get("Id", ""),
+        "name": names[0].lstrip("/") if names else container.get("Id", "")[:12],
+        "image": container.get("Image", ""),
+        "state": container.get("State", ""),
+        "endpointId": endpoint_id,
+    }
 
 
 def normalize_stack(stack: dict, images: list[str]) -> dict:

@@ -60,6 +60,10 @@
   .badge.ok { color: var(--ok); }
   .badge.err { color: var(--err); }
   .badge.upd { color: var(--accent); font-weight: 600; }
+  .update-btn.has-upd {
+    background: var(--accent); border-color: var(--accent);
+    color: var(--accent-text); font-weight: 600;
+  }
   .count { color: var(--muted); font-size: 13px; }
   .img-line { display: block; }
   .img-line.upd { color: var(--accent); font-weight: 600; }
@@ -215,24 +219,33 @@
     return inst ? inst.stacks.find((s) => s.id === sid) : null;
   }
 
+  function updateInfoForCtr(iid, cid) {
+    const inst = updates.instances.find((u) => u.instance.id === iid);
+    return inst ? (inst.containers || []).find((c) => c.id === cid) : null;
+  }
+
+  function imgLine(img) {
+    if (img.status === "update-available")
+      return `<span class="img-line upd" title="A newer image is available from the registry">⬆ ${esc(img.image)} <span class="img-note">new version</span></span>`;
+    if (img.status === "pinned")
+      return `<span class="img-line" title="Pinned to a specific version — not checked">${esc(img.image)} <span class="img-note">pinned</span></span>`;
+    if (img.status === "up-to-date")
+      return `<span class="img-line" title="Up to date with the registry">${esc(img.image)}</span>`;
+    return `<span class="img-line unk" title="${esc(img.detail || "Could not check")}">${esc(img.image)} <span class="img-note">?</span></span>`;
+  }
+
   function renderImagesCell(stack, iid) {
     const info = updateInfoFor(iid, stack.id);
     if (!info || !info.images.length) return esc(stack.images.join(", ") || "—");
-    return info.images.map((img) => {
-      if (img.status === "update-available")
-        return `<span class="img-line upd" title="A newer image is available from the registry">⬆ ${esc(img.image)} <span class="img-note">new version</span></span>`;
-      if (img.status === "pinned")
-        return `<span class="img-line" title="Pinned to a specific version — not checked">${esc(img.image)} <span class="img-note">pinned</span></span>`;
-      if (img.status === "up-to-date")
-        return `<span class="img-line" title="Up to date with the registry">${esc(img.image)}</span>`;
-      return `<span class="img-line unk" title="${esc(img.detail || "Could not check")}">${esc(img.image)} <span class="img-note">?</span></span>`;
-    }).join("");
+    return info.images.map(imgLine).join("");
   }
 
-  function confirmModal(title, text) {
+  function confirmModal(title, text, opts = {}) {
     return new Promise((resolve) => {
       $("#modal-title").textContent = title;
       $("#modal-text").textContent = text;
+      $("#modal-confirm").textContent = opts.okText || "Update";
+      $("#modal-cancel").style.display = opts.okOnly ? "none" : "";
       const backdrop = $("#modal-backdrop");
       backdrop.classList.add("open");
       const done = (answer) => {
@@ -251,14 +264,18 @@
     const root = $("#instances");
     root.innerHTML = "";
     for (const inst of data) {
+      const iid = inst.instance.id;
       const stacks = inst.stacks.filter((s) =>
         !filter || s.name.toLowerCase().includes(filter) ||
         s.images.some((i) => i.toLowerCase().includes(filter)));
-      if (filter && stacks.length === 0 && inst.reachable) continue;
+      const ctrs = (inst.containers || []).filter((c) =>
+        !filter || c.name.toLowerCase().includes(filter) ||
+        c.image.toLowerCase().includes(filter));
+      if (filter && stacks.length === 0 && ctrs.length === 0 && inst.reachable) continue;
 
       const section = document.createElement("section");
       section.className = "instance" +
-        (collapsed.has(inst.instance.id) ? " collapsed" : "") +
+        (collapsed.has(iid) ? " collapsed" : "") +
         (inst.reachable ? "" : " greyed");
       const badge = inst.reachable
         ? '<span class="badge ok">● reachable</span>'
@@ -267,44 +284,67 @@
       let body;
       if (!inst.reachable) {
         body = `<div class="stack-body unreachable-note">${esc(inst.error)}</div>`;
-      } else if (stacks.length === 0) {
-        body = '<div class="stack-body unreachable-note" style="color:var(--muted)">No stacks.</div>';
+      } else if (stacks.length === 0 && ctrs.length === 0) {
+        body = '<div class="stack-body unreachable-note" style="color:var(--muted)">No stacks or standalone containers.</div>';
       } else {
-        const rows = stacks.map((s) => {
-          const info = updateInfoFor(inst.instance.id, s.id);
-          const updBadge = info && info.updatesAvailable
+        const stackRows = stacks.map((s) => {
+          const info = updateInfoFor(iid, s.id);
+          const hasUpd = !!(info && info.updatesAvailable);
+          const updBadge = hasUpd
             ? ` <span class="badge upd">⬆ ${info.updatesAvailable} update${info.updatesAvailable === 1 ? "" : "s"}</span>` : "";
           return `
           <tr>
             <td><strong>${esc(s.name)}</strong>${updBadge}</td>
             <td><span class="type-tag">${esc(s.git ? s.type + " · git" : s.type)}</span></td>
-            <td class="images hide-sm">${renderImagesCell(s, inst.instance.id)}</td>
+            <td class="images hide-sm">${renderImagesCell(s, iid)}</td>
             <td class="when hide-sm">${fmtWhen(s.updatedAt)}</td>
             <td>
-              <button class="update-btn" data-iid="${inst.instance.id}" data-sid="${s.id}"
-                data-name="${esc(s.name)}">Update</button>
-              <span class="result-msg" id="msg-${inst.instance.id}-${s.id}"></span>
+              <button class="update-btn${hasUpd ? " has-upd" : ""}" data-kind="stack"
+                data-iid="${iid}" data-sid="${s.id}" data-name="${esc(s.name)}">${hasUpd ? "⬆ Update" : "Update"}</button>
+              <span class="result-msg" id="msg-${iid}-${s.id}"></span>
+            </td>
+          </tr>`;
+        }).join("");
+        const ctrRows = ctrs.map((c) => {
+          const cInfo = updateInfoForCtr(iid, c.id);
+          const hasUpd = !!(cInfo && cInfo.status === "update-available");
+          const imagesCell = cInfo
+            ? imgLine({ image: c.image, status: cInfo.status, detail: cInfo.detail })
+            : esc(c.image);
+          return `
+          <tr>
+            <td><strong>${esc(c.name)}</strong>${hasUpd ? ' <span class="badge upd">⬆ update</span>' : ""}</td>
+            <td><span class="type-tag">container</span></td>
+            <td class="images hide-sm">${imagesCell}</td>
+            <td class="when hide-sm">${esc(c.state)}</td>
+            <td>
+              <button class="update-btn${hasUpd ? " has-upd" : ""}" data-kind="container"
+                data-iid="${iid}" data-cid="${esc(c.id)}" data-name="${esc(c.name)}">${hasUpd ? "⬆ Update" : "Update"}</button>
+              <span class="result-msg" id="msg-${iid}-${esc(c.id)}"></span>
             </td>
           </tr>`;
         }).join("");
         body = `<div class="stack-body"><table>
-          <thead><tr><th>Stack</th><th>Type</th><th class="hide-sm">Images</th>
+          <thead><tr><th>Stack / container</th><th>Type</th><th class="hide-sm">Images</th>
           <th class="hide-sm">Updated</th><th></th></tr></thead>
-          <tbody>${rows}</tbody></table></div>`;
+          <tbody>${stackRows}${ctrRows}</tbody></table></div>`;
       }
 
-      const updInst = updates.instances.find((u) => u.instance.id === inst.instance.id);
+      const updInst = updates.instances.find((u) => u.instance.id === iid);
       const instUpdCount = updInst
-        ? updInst.stacks.reduce((n, s) => n + (s.updatesAvailable || 0), 0) : 0;
+        ? updInst.stacks.reduce((n, s) => n + (s.updatesAvailable || 0), 0) +
+          (updInst.containers || []).filter((c) => c.status === "update-available").length
+        : 0;
+      const ctrCount = (inst.containers || []).length;
       section.innerHTML = `
         <div class="instance-header">
           <span class="caret">▼</span>
           <h2>${esc(inst.instance.name)}</h2>
-          <span class="count">${inst.stacks.length} stack${inst.stacks.length === 1 ? "" : "s"}</span>
+          <span class="count">${inst.stacks.length} stack${inst.stacks.length === 1 ? "" : "s"}${ctrCount ? ` · ${ctrCount} container${ctrCount === 1 ? "" : "s"}` : ""}</span>
           ${instUpdCount ? `<span class="badge upd">⬆ ${instUpdCount} update${instUpdCount === 1 ? "" : "s"}</span>` : ""}
           ${badge}
-          ${inst.reachable && inst.stacks.length ?
-            `<button class="update-all-btn" data-iid="${inst.instance.id}">Update all</button>` : ""}
+          ${inst.reachable && (inst.stacks.length || ctrCount) ?
+            `<button class="update-all-btn" data-iid="${iid}">Update all</button>` : ""}
         </div>${body}`;
 
       $(".instance-header", section).addEventListener("click", (e) => {
@@ -381,28 +421,35 @@
     setTimeout(() => { btn.disabled = false; btn.textContent = "Check updates"; }, 5000);
   }
 
-  async function runUpdate(btn, iid, sid, name) {
-    const msg = $(`#msg-${iid}-${sid}`);
+  async function runUpdate(btn) {
+    const { kind, iid, sid, cid } = btn.dataset;
+    const key = kind === "container" ? cid : sid;
+    const url = kind === "container"
+      ? `/api/instances/${iid}/containers/${cid}/update`
+      : `/api/instances/${iid}/stacks/${sid}/update`;
+    const msg = document.getElementById(`msg-${iid}-${key}`);
+    const idleLabel = () => btn.classList.contains("has-upd") ? "⬆ Update" : "Update";
     btn.disabled = true;
     btn.innerHTML = '<span class="spinner"></span>Updating…';
     if (msg) { msg.textContent = ""; msg.className = "result-msg"; }
     try {
-      const res = await fetch(`/api/instances/${iid}/stacks/${sid}/update`, { method: "POST" });
+      const res = await fetch(url, { method: "POST" });
       const body = await res.json().catch(() => ({}));
       const ok = res.ok && body.ok;
       btn.innerHTML = ok ? "✅ Updated" : "❌ Failed";
+      if (ok) btn.classList.remove("has-upd");
       if (msg) {
         msg.textContent = ok
           ? `${((body.durationMs || 0) / 1000).toFixed(1)}s`
           : (body.message || body.detail || `HTTP ${res.status}`);
         msg.className = "result-msg " + (ok ? "ok" : "err");
       }
-      setTimeout(() => { btn.disabled = false; btn.textContent = "Update"; }, 4000);
+      setTimeout(() => { btn.disabled = false; btn.textContent = idleLabel(); }, 4000);
       return ok;
     } catch (err) {
       btn.innerHTML = "❌ Failed";
       if (msg) { msg.textContent = err.message; msg.className = "result-msg err"; }
-      setTimeout(() => { btn.disabled = false; btn.textContent = "Update"; }, 4000);
+      setTimeout(() => { btn.disabled = false; btn.textContent = idleLabel(); }, 4000);
       return false;
     }
   }
@@ -410,10 +457,12 @@
   document.addEventListener("click", async (e) => {
     const updateBtn = e.target.closest(".update-btn");
     if (updateBtn) {
-      const { iid, sid, name } = updateBtn.dataset;
-      const yes = await confirmModal(`Update “${name}”?`,
-        "This repulls the image(s) and redeploys the stack. Containers will restart.");
-      if (yes) runUpdate(updateBtn, iid, sid, name);
+      const { kind, name } = updateBtn.dataset;
+      const text = kind === "container"
+        ? "This pulls the image fresh and recreates the container with its existing configuration."
+        : "This repulls the image(s) and redeploys the stack. Containers will restart.";
+      const yes = await confirmModal(`Update “${name}”?`, text);
+      if (yes) runUpdate(updateBtn);
       return;
     }
     const allBtn = e.target.closest(".update-all-btn");
@@ -421,16 +470,27 @@
       const iid = Number(allBtn.dataset.iid);
       const inst = data.find((i) => i.instance.id === iid);
       if (!inst) return;
-      const yes = await confirmModal(`Update all on “${inst.instance.name}”?`,
-        `This repulls and redeploys all ${inst.stacks.length} stacks on this instance, one at a time.`);
+      if (!updates.checkedAt) {
+        await confirmModal("No update check yet",
+          "Run “Check updates” first — “Update all” only redeploys stacks and containers that actually have an update available.",
+          { okOnly: true, okText: "OK" });
+        return;
+      }
+      const section = allBtn.closest("section");
+      const flagged = [...section.querySelectorAll(".update-btn.has-upd")];
+      if (!flagged.length) {
+        await confirmModal("All up to date",
+          `Nothing on “${inst.instance.name}” has an update available.`,
+          { okOnly: true, okText: "OK" });
+        return;
+      }
+      const yes = await confirmModal(
+        `Update ${flagged.length} on “${inst.instance.name}”?`,
+        `Only the ${flagged.length} item${flagged.length === 1 ? "" : "s"} with an update available will be repulled and redeployed, one at a time.`);
       if (!yes) return;
       allBtn.disabled = true;
-      allBtn.innerHTML = '<span class="spinner"></span>Updating all…';
-      for (const stack of inst.stacks) {
-        const btn = document.querySelector(
-          `.update-btn[data-iid="${iid}"][data-sid="${stack.id}"]`);
-        if (btn) await runUpdate(btn, iid, stack.id, stack.name);
-      }
+      allBtn.innerHTML = '<span class="spinner"></span>Updating…';
+      for (const btn of flagged) await runUpdate(btn);
       allBtn.disabled = false;
       allBtn.textContent = "Update all";
     }

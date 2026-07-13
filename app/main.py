@@ -15,7 +15,14 @@ from pydantic import BaseModel
 from .config import AppConfig, load_config
 from .instances import ClientManager, InstanceRecord, InstanceStore
 from .notifiers import build_notifiers
-from .portainer import PortainerClient, PortainerError, extract_images, normalize_stack
+from .portainer import (
+    PortainerClient,
+    PortainerError,
+    extract_images,
+    normalize_container,
+    normalize_stack,
+    standalone_containers,
+)
 from .registry import RegistryClient
 from .updates import UpdateChecker
 
@@ -214,6 +221,7 @@ async def _stacks_for_instance(iid: int, name: str, client: PortainerClient) -> 
     result = {
         "instance": {"id": iid, "name": name},
         "stacks": [],
+        "containers": [],
         "reachable": True,
         "error": None,
     }
@@ -236,6 +244,22 @@ async def _stacks_for_instance(iid: int, name: str, client: PortainerClient) -> 
     result["stacks"] = [
         normalize_stack(stack, images) for stack, images in zip(stacks, image_lists)
     ]
+
+    # Containers that live outside any Portainer stack.
+    stack_names = {s.get("Name") for s in stacks}
+    try:
+        for endpoint in await client.list_endpoints():
+            endpoint_id = endpoint["Id"]
+            try:
+                containers = await client.list_containers(endpoint_id)
+            except Exception:
+                continue
+            result["containers"].extend(
+                normalize_container(c, endpoint_id)
+                for c in standalone_containers(containers, stack_names)
+            )
+    except Exception:
+        pass
     return result
 
 
@@ -300,6 +324,45 @@ async def update_stack(request: Request, iid: int, sid: int):
     result = await _update_one(client, stack)
     status = 200 if result["ok"] else 502
     return JSONResponse(status_code=status, content=result)
+
+
+@app.post("/api/instances/{iid}/containers/{cid}/update", dependencies=[Depends(require_auth)])
+async def update_container(request: Request, iid: int, cid: str):
+    """Repull + recreate a standalone container via Portainer's recreate action."""
+    client = _get_client(request, iid)
+    started = time.monotonic()
+    try:
+        endpoints = await client.list_endpoints()
+        target = None
+        for endpoint in endpoints:
+            for container in await client.list_containers(endpoint["Id"]):
+                if container.get("Id") == cid:
+                    target = (endpoint["Id"], container)
+                    break
+            if target:
+                break
+        if target is None:
+            raise HTTPException(status_code=404, detail=f"No container {cid[:12]} on this instance")
+        endpoint_id, container = target
+        await client.recreate_container(endpoint_id, cid)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        message = exc.message if isinstance(exc, PortainerError) else str(exc)
+        return JSONResponse(status_code=502, content={
+            "ok": False,
+            "stack": cid[:12],
+            "durationMs": int((time.monotonic() - started) * 1000),
+            "message": message,
+        })
+    names = container.get("Names") or []
+    name = names[0].lstrip("/") if names else cid[:12]
+    return {
+        "ok": True,
+        "stack": name,
+        "durationMs": int((time.monotonic() - started) * 1000),
+        "message": "Repulled and recreated.",
+    }
 
 
 class UpdateAllRequest(BaseModel):

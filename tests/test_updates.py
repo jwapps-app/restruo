@@ -222,6 +222,50 @@ async def test_compares_running_container_not_local_tag():
     await registry.aclose()
 
 
+def standalone_transport(running_digest: str) -> httpx.MockTransport:
+    """Instance with no stacks — just one standalone container tracking :latest."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/stacks":
+            return httpx.Response(200, json=[])
+        if path == "/api/endpoints":
+            return httpx.Response(200, json=[{"Id": 2}])
+        if path == "/api/endpoints/2/docker/containers/json":
+            return httpx.Response(200, json=[{
+                "Id": "ctr-1",
+                "Names": ["/adguard"],
+                "Image": "registry.test/acme/web:latest",
+                "ImageID": "sha256:running-image-id",
+                "State": "running",
+                "Labels": {},
+            }])
+        if path == "/api/endpoints/2/docker/images/sha256:running-image-id/json":
+            return httpx.Response(
+                200, json={"RepoDigests": [f"registry.test/acme/web@{running_digest}"]}
+            )
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    return httpx.MockTransport(handler)
+
+
+async def test_standalone_container_checked_and_flagged():
+    portainer = PortainerClient(INSTANCE, transport=standalone_transport(OLD_DIGEST))
+    registry = RegistryClient(transport=registry_transport(NEW_DIGEST, require_token=False))
+    notifier = RecordingNotifier()
+    checker = UpdateChecker(
+        lambda: [(0, portainer)], registry, interval_hours=6, notifiers=[notifier]
+    )
+    snapshot = await checker.check_all()
+    containers = snapshot["instances"][0]["containers"]
+    assert len(containers) == 1
+    assert containers[0]["name"] == "adguard"
+    assert containers[0]["status"] == "update-available"
+    assert notifier.batches[0][0].stack_name == "adguard"
+    await portainer.aclose()
+    await registry.aclose()
+
+
 async def test_running_container_current_is_up_to_date():
     portainer = PortainerClient(
         INSTANCE, transport=container_aware_transport(NEW_DIGEST, NEW_DIGEST)

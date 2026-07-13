@@ -116,6 +116,19 @@ async def test_missing_env_defaults_to_empty_list():
     assert json.loads(requests[0].content)["Env"] == []
 
 
+async def test_recreate_container_uses_portainer_recreate_action():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/api/docker/2/containers/abc123/recreate"
+        assert json.loads(request.content) == {"PullImage": True}
+        return httpx.Response(200, json={"Id": "def456"})
+
+    client, requests = make_client(handler)
+    await client.recreate_container(2, "abc123")
+    await client.aclose()
+    assert len(requests) == 1
+
+
 async def test_portainer_error_surfaces_message():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(403, json={"message": "access denied to resource"})

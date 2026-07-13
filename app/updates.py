@@ -10,7 +10,12 @@ import logging
 import time
 
 from .notifiers import Notifier, UpdateEvent
-from .portainer import PortainerClient, extract_images
+from .portainer import (
+    PortainerClient,
+    extract_images,
+    normalize_container,
+    standalone_containers,
+)
 from .registry import RegistryClient, parse_image_ref
 
 logger = logging.getLogger("restack.updates")
@@ -39,7 +44,7 @@ class UpdateChecker:
         self.results: list[dict] = []
         self.checking = False
         self._lock = asyncio.Lock()
-        self._notified: set[tuple[int, int, str]] = set()
+        self._notified: set[tuple] = set()
 
     def snapshot(self) -> dict:
         return {
@@ -128,6 +133,7 @@ class UpdateChecker:
         result = {
             "instance": {"id": iid, "name": client.instance.name},
             "stacks": [],
+            "containers": [],
             "error": None,
         }
         try:
@@ -137,14 +143,19 @@ class UpdateChecker:
             return result
 
         containers_by_endpoint: dict[int, list[dict]] = {}
-        for stack in stacks:
-            endpoint_id = stack["EndpointId"]
+
+        async def containers_for(endpoint_id: int) -> list[dict]:
             if endpoint_id not in containers_by_endpoint:
                 try:
                     containers_by_endpoint[endpoint_id] = await client.list_containers(endpoint_id)
                 except Exception:
                     containers_by_endpoint[endpoint_id] = []
-            stack_containers = self._stack_containers(stack, containers_by_endpoint[endpoint_id])
+            return containers_by_endpoint[endpoint_id]
+
+        for stack in stacks:
+            stack_containers = self._stack_containers(
+                stack, await containers_for(stack["EndpointId"])
+            )
             try:
                 images = extract_images(await client.get_stack_file(stack["Id"]))
             except Exception:
@@ -161,6 +172,22 @@ class UpdateChecker:
                     1 for c in checked if c["status"] == STATUS_UPDATE_AVAILABLE
                 ),
             })
+
+        # Containers that live outside any Portainer stack.
+        stack_names = {s.get("Name") for s in stacks}
+        try:
+            endpoint_ids = [e["Id"] for e in await client.list_endpoints()]
+        except Exception:
+            endpoint_ids = list(containers_by_endpoint)
+        for endpoint_id in endpoint_ids:
+            for raw_container in standalone_containers(
+                await containers_for(endpoint_id), stack_names
+            ):
+                normalized = normalize_container(raw_container, endpoint_id)
+                checked = await self._check_image(
+                    client, endpoint_id, normalized["image"], [raw_container]
+                )
+                result["containers"].append({**normalized, **checked})
         return result
 
     async def check_all(self) -> dict:
@@ -182,7 +209,7 @@ class UpdateChecker:
         return self.snapshot()
 
     async def _notify_new(self) -> None:
-        current: set[tuple[int, int, str]] = set()
+        current: set[tuple] = set()
         events: list[UpdateEvent] = []
         for instance_result in self.results:
             iid = instance_result["instance"]["id"]
@@ -198,6 +225,17 @@ class UpdateChecker:
                             stack_name=stack["name"],
                             image=image["image"],
                         ))
+            for container in instance_result.get("containers", []):
+                if container["status"] != STATUS_UPDATE_AVAILABLE:
+                    continue
+                key = (iid, "container", container["id"], container["image"])
+                current.add(key)
+                if key not in self._notified:
+                    events.append(UpdateEvent(
+                        instance_name=instance_result["instance"]["name"],
+                        stack_name=container["name"],
+                        image=container["image"],
+                    ))
         # Forget resolved updates so they re-notify if they reappear later.
         self._notified = current
         if not events:
