@@ -146,6 +146,16 @@ class PortainerClient:
         self._check(response)
         return response.json().get("StackFileContent", "")
 
+    async def list_containers(self, endpoint_id: int) -> list[dict]:
+        """All containers (running or not) on the environment's Docker engine."""
+        response = await self._request(
+            "GET",
+            f"/api/endpoints/{endpoint_id}/docker/containers/json",
+            params={"all": "1"},
+        )
+        self._check(response)
+        return response.json()
+
     async def get_image_info(self, endpoint_id: int, image: str) -> dict:
         """Inspect an image on the environment's Docker engine via Portainer's
         docker proxy. Used by update checks to read local RepoDigests."""

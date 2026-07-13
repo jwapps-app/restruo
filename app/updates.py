@@ -48,7 +48,41 @@ class UpdateChecker:
             "instances": self.results,
         }
 
-    async def _check_image(self, client: PortainerClient, endpoint_id: int, raw: str) -> dict:
+    @staticmethod
+    def _normalize_image(image: str) -> str:
+        base = image.partition("@")[0]
+        last = base.rsplit("/", 1)[-1]
+        return base if ":" in last else f"{base}:latest"
+
+    async def _running_digests(
+        self, client: PortainerClient, endpoint_id: int, raw: str, containers: list[dict]
+    ) -> set[str] | None:
+        """Repo digests of the image the stack's containers are ACTUALLY running.
+
+        The local tag may already point at a newer pull while the container still
+        runs the old image — comparing the running image is what tells the truth.
+        Returns None when no matching container exists (fall back to the tag).
+        """
+        wanted = self._normalize_image(raw)
+        image_ids = {
+            c.get("ImageID")
+            for c in containers
+            if c.get("ImageID") and self._normalize_image(c.get("Image", "")) == wanted
+        }
+        if not image_ids:
+            return None
+        digests: set[str] = set()
+        for image_id in image_ids:
+            try:
+                info = await client.get_image_info(endpoint_id, image_id)
+                digests |= {e.rpartition("@")[2] for e in info.get("RepoDigests") or []}
+            except Exception:
+                pass
+        return digests
+
+    async def _check_image(
+        self, client: PortainerClient, endpoint_id: int, raw: str, containers: list[dict]
+    ) -> dict:
         ref = parse_image_ref(raw)
         if ref is None:
             return {"image": raw, "status": STATUS_UNKNOWN,
@@ -61,13 +95,16 @@ class UpdateChecker:
         except Exception as exc:
             return {"image": raw, "status": STATUS_UNKNOWN, "detail": f"registry: {exc}"}
 
-        try:
-            info = await client.get_image_info(endpoint_id, raw)
-            local_digests = {
-                entry.rpartition("@")[2] for entry in info.get("RepoDigests") or []
-            }
-        except Exception as exc:
-            return {"image": raw, "status": STATUS_UNKNOWN, "detail": f"local image: {exc}"}
+        local_digests = await self._running_digests(client, endpoint_id, raw, containers)
+        if local_digests is None:
+            # No matching container found — fall back to what the tag points at.
+            try:
+                info = await client.get_image_info(endpoint_id, raw)
+                local_digests = {
+                    entry.rpartition("@")[2] for entry in info.get("RepoDigests") or []
+                }
+            except Exception as exc:
+                return {"image": raw, "status": STATUS_UNKNOWN, "detail": f"local image: {exc}"}
 
         if not local_digests:
             # Locally built image with no repo digest — nothing to compare.
@@ -75,6 +112,17 @@ class UpdateChecker:
 
         status = STATUS_UP_TO_DATE if remote_digest in local_digests else STATUS_UPDATE_AVAILABLE
         return {"image": raw, "status": status}
+
+    @staticmethod
+    def _stack_containers(stack: dict, containers: list[dict]) -> list[dict]:
+        name = stack.get("Name", "")
+        out = []
+        for c in containers:
+            labels = c.get("Labels") or {}
+            if labels.get("com.docker.compose.project") == name or \
+                    labels.get("com.docker.stack.namespace") == name:
+                out.append(c)
+        return out
 
     async def _check_instance(self, iid: int, client: PortainerClient) -> dict:
         result = {
@@ -88,13 +136,22 @@ class UpdateChecker:
             result["error"] = str(exc)
             return result
 
+        containers_by_endpoint: dict[int, list[dict]] = {}
         for stack in stacks:
+            endpoint_id = stack["EndpointId"]
+            if endpoint_id not in containers_by_endpoint:
+                try:
+                    containers_by_endpoint[endpoint_id] = await client.list_containers(endpoint_id)
+                except Exception:
+                    containers_by_endpoint[endpoint_id] = []
+            stack_containers = self._stack_containers(stack, containers_by_endpoint[endpoint_id])
             try:
                 images = extract_images(await client.get_stack_file(stack["Id"]))
             except Exception:
                 images = []
             checked = [
-                await self._check_image(client, stack["EndpointId"], raw) for raw in images
+                await self._check_image(client, stack["EndpointId"], raw, stack_containers)
+                for raw in images
             ]
             result["stacks"].append({
                 "id": stack["Id"],

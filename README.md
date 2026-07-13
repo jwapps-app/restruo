@@ -79,9 +79,10 @@ restack can tell you when a newer image is available for a stack:
 - Only images that **track `:latest`** (or have no tag, which Docker treats as `latest`)
   are checked. Anything pinned to a version (`mariadb:11`, `img@sha256:…`) is shown as
   **pinned** and deliberately not checked — pin a tag when you *don't* want update noise.
-- The check compares the digest of the image on the machine (read via Portainer's Docker
-  proxy, using the same API token) against the registry's current digest for the tag —
-  nothing is downloaded. Works anonymously with Docker Hub, ghcr.io, lscr.io, and any
+- The check compares the digest of the image the stack's containers are **actually
+  running** (read via Portainer's Docker proxy) against the registry's current digest for
+  the tag — nothing is downloaded. If no matching container is found it falls back to the
+  locally tagged image. Works anonymously with Docker Hub, ghcr.io, lscr.io, and any
   standard v2 registry; locally built images show as not checkable.
 - Checks run on a schedule (`updates.interval_hours`, default 6h — keep it modest, Docker
   Hub rate-limits anonymous requests) and on demand via the **Check updates** button.

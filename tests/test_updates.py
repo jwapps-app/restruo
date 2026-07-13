@@ -173,3 +173,66 @@ async def test_matching_digest_is_up_to_date():
     assert notifier.batches == []
     await portainer.aclose()
     await registry.aclose()
+
+
+def container_aware_transport(running_digest: str, tag_digest: str) -> httpx.MockTransport:
+    """Mock where the running container's image differs from what the local tag
+    points at (something re-pulled the tag but the container wasn't recreated)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/stacks":
+            return httpx.Response(200, json=[STACK])
+        if path == "/api/stacks/1/file":
+            return httpx.Response(200, json={"StackFileContent": COMPOSE_YAML})
+        if path == "/api/endpoints/2/docker/containers/json":
+            return httpx.Response(200, json=[{
+                "Image": "registry.test/acme/web:latest",
+                "ImageID": "sha256:running-image-id",
+                "Labels": {"com.docker.compose.project": "mystack"},
+            }])
+        if path == "/api/endpoints/2/docker/images/sha256:running-image-id/json":
+            return httpx.Response(
+                200, json={"RepoDigests": [f"registry.test/acme/web@{running_digest}"]}
+            )
+        if path.startswith("/api/endpoints/2/docker/images/") and path.endswith("/json"):
+            return httpx.Response(
+                200, json={"RepoDigests": [f"registry.test/acme/web@{tag_digest}"]}
+            )
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    return httpx.MockTransport(handler)
+
+
+async def test_compares_running_container_not_local_tag():
+    # The tag was already re-pulled to NEW, but the container still runs OLD:
+    # an update IS available (this is what container-watchers like WUD report).
+    portainer = PortainerClient(
+        INSTANCE, transport=container_aware_transport(OLD_DIGEST, NEW_DIGEST)
+    )
+    registry = RegistryClient(transport=registry_transport(NEW_DIGEST, require_token=False))
+    checker = UpdateChecker(lambda: [(0, portainer)], registry, interval_hours=6)
+    snapshot = await checker.check_all()
+    by_image = {
+        img["image"]: img["status"]
+        for img in snapshot["instances"][0]["stacks"][0]["images"]
+    }
+    assert by_image["registry.test/acme/web:latest"] == "update-available"
+    await portainer.aclose()
+    await registry.aclose()
+
+
+async def test_running_container_current_is_up_to_date():
+    portainer = PortainerClient(
+        INSTANCE, transport=container_aware_transport(NEW_DIGEST, NEW_DIGEST)
+    )
+    registry = RegistryClient(transport=registry_transport(NEW_DIGEST, require_token=False))
+    checker = UpdateChecker(lambda: [(0, portainer)], registry, interval_hours=6)
+    snapshot = await checker.check_all()
+    by_image = {
+        img["image"]: img["status"]
+        for img in snapshot["instances"][0]["stacks"][0]["images"]
+    }
+    assert by_image["registry.test/acme/web:latest"] == "up-to-date"
+    await portainer.aclose()
+    await registry.aclose()
