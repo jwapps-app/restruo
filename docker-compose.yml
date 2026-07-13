@@ -1,0 +1,13 @@
+services:
+  restack:
+    build: .
+    # image: ghcr.io/<you>/restack:latest   # once published
+    container_name: restack
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+      - ./data:/data          # persists the instance list managed from the settings UI
+    environment:
+      - DASHBOARD_PASSWORD=change-me
+    restart: unless-stopped

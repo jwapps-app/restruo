@@ -1,0 +1,26 @@
+# restack configuration — copy to config.yaml.
+#
+# Portainer instances are managed from the dashboard's "⚙ Instances" settings
+# page and stored in /data/instances.json — you normally don't list them here.
+# The optional `instances:` block below is a SEED: it is imported into the
+# store on first start (when /data/instances.json doesn't exist yet), then
+# ignored. Useful for pre-provisioning with API tokens.
+#
+# instances:
+#   - name: "Machine A (prod)"
+#     base_url: "https://portainer-a.example.lan:9443"
+#     api_key: "ptr_xxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+#     verify_tls: false        # false for self-signed certs (common in home labs)
+
+# Update checks: images tagged :latest (or untagged) are compared against the
+# registry; pinned tags like mariadb:11 are skipped and shown as "pinned".
+updates:
+  enabled: true
+  interval_hours: 6
+
+ui:
+  title: "restack"
+  auth:
+    enabled: true
+    username: "admin"
+    password_env: "DASHBOARD_PASSWORD"   # password comes from this env var, never from this file

@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>restack</title>
+<link rel="icon" type="image/svg+xml" href="/icon.svg">
+<style>
+  :root {
+    --bg: #f5f6f8; --panel: #ffffff; --text: #1a1d21; --muted: #6b7280;
+    --border: #e2e5ea; --accent: #2563eb; --accent-text: #ffffff;
+    --ok: #16a34a; --err: #dc2626; --warn: #d97706; --badge-bg: #eef2f7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1216; --panel: #171b21; --text: #e6e9ee; --muted: #8b93a1;
+      --border: #262c35; --accent: #3b82f6; --accent-text: #ffffff;
+      --ok: #22c55e; --err: #ef4444; --warn: #f59e0b; --badge-bg: #1f2630;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 14px 20px; border-bottom: 1px solid var(--border);
+    background: var(--panel); position: sticky; top: 0; z-index: 5;
+  }
+  header h1 { font-size: 18px; margin: 0; }
+  header h1 span { color: var(--muted); font-weight: 400; font-size: 13px; margin-left: 8px; }
+  #search {
+    flex: 1; min-width: 160px; max-width: 340px; padding: 7px 10px;
+    border: 1px solid var(--border); border-radius: 8px;
+    background: var(--bg); color: var(--text);
+  }
+  button {
+    font: inherit; border: 1px solid var(--border); border-radius: 8px;
+    padding: 7px 14px; cursor: pointer; background: var(--panel); color: var(--text);
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  button:disabled { opacity: .55; cursor: default; }
+  main { padding: 16px 20px 60px; max-width: 1100px; margin: 0 auto; }
+  .instance {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; margin-bottom: 16px; overflow: hidden;
+  }
+  .instance-header {
+    display: flex; align-items: center; gap: 10px; padding: 12px 16px;
+    cursor: pointer; user-select: none; flex-wrap: wrap;
+  }
+  .instance-header h2 { font-size: 15px; margin: 0; flex: 1; }
+  .caret { transition: transform .15s; color: var(--muted); }
+  .collapsed .caret { transform: rotate(-90deg); }
+  .collapsed .stack-body { display: none; }
+  .badge {
+    font-size: 12px; padding: 2px 9px; border-radius: 999px; background: var(--badge-bg);
+  }
+  .badge.ok { color: var(--ok); }
+  .badge.err { color: var(--err); }
+  .badge.upd { color: var(--accent); font-weight: 600; }
+  .count { color: var(--muted); font-size: 13px; }
+  .img-line { display: block; }
+  .img-line.upd { color: var(--accent); font-weight: 600; }
+  .img-line.unk { cursor: help; }
+  .img-note { color: var(--muted); font-weight: 400; font-size: 12px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 9px 16px; border-top: 1px solid var(--border); }
+  th { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  td.images { color: var(--muted); font-size: 13px; max-width: 320px; overflow-wrap: anywhere; }
+  td.when { color: var(--muted); font-size: 13px; white-space: nowrap; }
+  .type-tag { font-size: 12px; background: var(--badge-bg); border-radius: 6px; padding: 2px 7px; }
+  .unreachable-note { padding: 12px 16px; color: var(--err); border-top: 1px solid var(--border); font-size: 14px; }
+  .result-msg { font-size: 12px; display: block; margin-top: 4px; max-width: 260px; overflow-wrap: anywhere; }
+  .result-msg.ok { color: var(--ok); }
+  .result-msg.err { color: var(--err); }
+  .greyed { opacity: .45; }
+  .spinner {
+    display: inline-block; width: 12px; height: 12px; margin-right: 6px;
+    border: 2px solid currentColor; border-top-color: transparent;
+    border-radius: 50%; animation: spin .7s linear infinite; vertical-align: -2px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #status-line { color: var(--muted); font-size: 13px; margin: 0 0 14px; }
+  /* settings */
+  .settings-panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 18px; margin-bottom: 16px;
+  }
+  .settings-panel h2 { font-size: 16px; margin: 0 0 12px; }
+  .settings-panel h3 { font-size: 14px; margin: 20px 0 10px; }
+  .inst-row {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 10px 0; border-top: 1px solid var(--border);
+  }
+  .inst-row:first-child { border-top: none; }
+  .inst-row .inst-name { font-weight: 600; }
+  .inst-row .inst-url { color: var(--muted); font-size: 13px; flex: 1; overflow-wrap: anywhere; }
+  #inst-form label { display: block; margin: 10px 0 4px; font-size: 13px; color: var(--muted); }
+  #inst-form input[type="text"], #inst-form input[type="url"],
+  #inst-form input[type="password"] {
+    width: 100%; max-width: 440px; padding: 7px 10px; font: inherit;
+    border: 1px solid var(--border); border-radius: 8px;
+    background: var(--bg); color: var(--text);
+  }
+  #inst-form .check, #inst-form .radio {
+    display: inline-flex; align-items: center; gap: 6px;
+    color: var(--text); margin-right: 16px; font-size: 14px;
+  }
+  .form-actions { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+  #form-msg { font-size: 13px; margin: 10px 0 0; }
+  #form-msg.ok { color: var(--ok); }
+  #form-msg.err { color: var(--err); }
+  /* modal */
+  #modal-backdrop {
+    position: fixed; inset: 0; background: rgba(0,0,0,.45);
+    display: none; align-items: center; justify-content: center; z-index: 20;
+  }
+  #modal-backdrop.open { display: flex; }
+  #modal {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 20px; width: min(420px, 90vw);
+  }
+  #modal h3 { margin: 0 0 8px; font-size: 16px; }
+  #modal p { margin: 0 0 18px; color: var(--muted); }
+  #modal .actions { display: flex; gap: 10px; justify-content: flex-end; }
+  @media (max-width: 640px) {
+    th.hide-sm, td.hide-sm { display: none; }
+    main { padding: 12px 10px 60px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <img src="/icon.svg" alt="" width="26" height="26" style="border-radius:6px">
+  <h1 id="title">restack <span>Portainer stack updater</span></h1>
+  <input id="search" type="search" placeholder="Filter stacks…">
+  <button id="check-updates">Check updates</button>
+  <button id="settings-btn" title="Manage Portainer instances">⚙ Instances</button>
+  <button id="refresh" class="primary">Refresh</button>
+</header>
+<main>
+  <div id="view-dashboard">
+    <p id="status-line">Loading…</p>
+    <div id="instances"></div>
+  </div>
+  <div id="view-settings" style="display:none">
+    <div class="settings-panel">
+      <h2>Portainer instances</h2>
+      <div id="inst-list"><p class="count">Loading…</p></div>
+      <h3 id="form-title">Add an instance</h3>
+      <form id="inst-form" autocomplete="off">
+        <label for="f-name">Name</label>
+        <input type="text" id="f-name" required placeholder="NAS (prod)">
+        <label for="f-url">Portainer URL</label>
+        <input type="url" id="f-url" required placeholder="https://192.168.1.20:9443">
+        <label style="margin-top:12px">Authentication</label>
+        <span class="radio"><input type="radio" name="authType" id="f-auth-key" value="api_key" checked> API token</span>
+        <span class="radio"><input type="radio" name="authType" id="f-auth-cred" value="credentials"> Username &amp; password</span>
+        <div id="auth-key-fields">
+          <label for="f-apikey">API token <span id="apikey-hint"></span></label>
+          <input type="password" id="f-apikey" placeholder="ptr_…">
+        </div>
+        <div id="auth-cred-fields" style="display:none">
+          <label for="f-username">Username</label>
+          <input type="text" id="f-username" placeholder="admin">
+          <label for="f-password">Password <span id="password-hint"></span></label>
+          <input type="password" id="f-password">
+        </div>
+        <label class="check" style="margin-top:12px"><input type="checkbox" id="f-verify"> Verify TLS certificate (uncheck for self-signed certs)</label>
+        <div class="form-actions">
+          <button type="button" id="f-test">Test connection</button>
+          <button type="submit" class="primary" id="f-save">Add instance</button>
+          <button type="button" id="f-cancel" style="display:none">Cancel edit</button>
+        </div>
+        <p id="form-msg"></p>
+      </form>
+    </div>
+    <button id="settings-close">← Back to dashboard</button>
+  </div>
+</main>
+
+<div id="modal-backdrop">
+  <div id="modal" role="dialog" aria-modal="true">
+    <h3 id="modal-title"></h3>
+    <p id="modal-text"></p>
+    <div class="actions">
+      <button id="modal-cancel">Cancel</button>
+      <button id="modal-confirm" class="primary">Update</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+  "use strict";
+  let data = [];
+  let updates = { checkedAt: null, instances: [] };
+  const collapsed = new Set();
+  const $ = (sel, el = document) => el.querySelector(sel);
+
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
+    (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+  function fmtWhen(ts) {
+    if (!ts) return "—";
+    const ms = ts > 1e12 ? ts : ts * 1000;
+    return new Date(ms).toLocaleString(undefined,
+      { dateStyle: "medium", timeStyle: "short" });
+  }
+
+  function updateInfoFor(iid, sid) {
+    const inst = updates.instances.find((u) => u.instance.id === iid);
+    return inst ? inst.stacks.find((s) => s.id === sid) : null;
+  }
+
+  function renderImagesCell(stack, iid) {
+    const info = updateInfoFor(iid, stack.id);
+    if (!info || !info.images.length) return esc(stack.images.join(", ") || "—");
+    return info.images.map((img) => {
+      if (img.status === "update-available")
+        return `<span class="img-line upd" title="A newer image is available from the registry">⬆ ${esc(img.image)} <span class="img-note">new version</span></span>`;
+      if (img.status === "pinned")
+        return `<span class="img-line" title="Pinned to a specific version — not checked">${esc(img.image)} <span class="img-note">pinned</span></span>`;
+      if (img.status === "up-to-date")
+        return `<span class="img-line" title="Up to date with the registry">${esc(img.image)}</span>`;
+      return `<span class="img-line unk" title="${esc(img.detail || "Could not check")}">${esc(img.image)} <span class="img-note">?</span></span>`;
+    }).join("");
+  }
+
+  function confirmModal(title, text) {
+    return new Promise((resolve) => {
+      $("#modal-title").textContent = title;
+      $("#modal-text").textContent = text;
+      const backdrop = $("#modal-backdrop");
+      backdrop.classList.add("open");
+      const done = (answer) => {
+        backdrop.classList.remove("open");
+        $("#modal-confirm").onclick = $("#modal-cancel").onclick = backdrop.onclick = null;
+        resolve(answer);
+      };
+      $("#modal-confirm").onclick = () => done(true);
+      $("#modal-cancel").onclick = () => done(false);
+      backdrop.onclick = (e) => { if (e.target === backdrop) done(false); };
+    });
+  }
+
+  function render() {
+    const filter = $("#search").value.trim().toLowerCase();
+    const root = $("#instances");
+    root.innerHTML = "";
+    for (const inst of data) {
+      const stacks = inst.stacks.filter((s) =>
+        !filter || s.name.toLowerCase().includes(filter) ||
+        s.images.some((i) => i.toLowerCase().includes(filter)));
+      if (filter && stacks.length === 0 && inst.reachable) continue;
+
+      const section = document.createElement("section");
+      section.className = "instance" +
+        (collapsed.has(inst.instance.id) ? " collapsed" : "") +
+        (inst.reachable ? "" : " greyed");
+      const badge = inst.reachable
+        ? '<span class="badge ok">● reachable</span>'
+        : `<span class="badge err" title="${esc(inst.error)}">● unreachable</span>`;
+
+      let body;
+      if (!inst.reachable) {
+        body = `<div class="stack-body unreachable-note">${esc(inst.error)}</div>`;
+      } else if (stacks.length === 0) {
+        body = '<div class="stack-body unreachable-note" style="color:var(--muted)">No stacks.</div>';
+      } else {
+        const rows = stacks.map((s) => {
+          const info = updateInfoFor(inst.instance.id, s.id);
+          const updBadge = info && info.updatesAvailable
+            ? ` <span class="badge upd">⬆ ${info.updatesAvailable} update${info.updatesAvailable === 1 ? "" : "s"}</span>` : "";
+          return `
+          <tr>
+            <td><strong>${esc(s.name)}</strong>${updBadge}</td>
+            <td><span class="type-tag">${esc(s.git ? s.type + " · git" : s.type)}</span></td>
+            <td class="images hide-sm">${renderImagesCell(s, inst.instance.id)}</td>
+            <td class="when hide-sm">${fmtWhen(s.updatedAt)}</td>
+            <td>
+              <button class="update-btn" data-iid="${inst.instance.id}" data-sid="${s.id}"
+                data-name="${esc(s.name)}">Update</button>
+              <span class="result-msg" id="msg-${inst.instance.id}-${s.id}"></span>
+            </td>
+          </tr>`;
+        }).join("");
+        body = `<div class="stack-body"><table>
+          <thead><tr><th>Stack</th><th>Type</th><th class="hide-sm">Images</th>
+          <th class="hide-sm">Updated</th><th></th></tr></thead>
+          <tbody>${rows}</tbody></table></div>`;
+      }
+
+      const updInst = updates.instances.find((u) => u.instance.id === inst.instance.id);
+      const instUpdCount = updInst
+        ? updInst.stacks.reduce((n, s) => n + (s.updatesAvailable || 0), 0) : 0;
+      section.innerHTML = `
+        <div class="instance-header">
+          <span class="caret">▼</span>
+          <h2>${esc(inst.instance.name)}</h2>
+          <span class="count">${inst.stacks.length} stack${inst.stacks.length === 1 ? "" : "s"}</span>
+          ${instUpdCount ? `<span class="badge upd">⬆ ${instUpdCount} update${instUpdCount === 1 ? "" : "s"}</span>` : ""}
+          ${badge}
+          ${inst.reachable && inst.stacks.length ?
+            `<button class="update-all-btn" data-iid="${inst.instance.id}">Update all</button>` : ""}
+        </div>${body}`;
+
+      $(".instance-header", section).addEventListener("click", (e) => {
+        if (e.target.closest("button")) return;
+        const id = inst.instance.id;
+        collapsed.has(id) ? collapsed.delete(id) : collapsed.add(id);
+        section.classList.toggle("collapsed");
+      });
+      root.appendChild(section);
+    }
+  }
+
+  async function refresh() {
+    $("#status-line").textContent = "Loading stacks from all instances…";
+    $("#refresh").disabled = true;
+    try {
+      const res = await fetch("/api/stacks");
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      data = await res.json();
+      const total = data.reduce((n, i) => n + i.stacks.length, 0);
+      const down = data.filter((i) => !i.reachable).length;
+      $("#status-line").textContent = data.length === 0
+        ? "No Portainer instances configured — click “⚙ Instances” to add your servers."
+        : `${total} stacks across ${data.length} instance${data.length === 1 ? "" : "s"}` +
+          (down ? ` — ${down} instance${down === 1 ? "" : "s"} unreachable` : "") +
+          ` · updated ${new Date().toLocaleTimeString()}`;
+      render();
+    } catch (err) {
+      $("#status-line").textContent = "Failed to load: " + err.message;
+    } finally {
+      $("#refresh").disabled = false;
+    }
+  }
+
+  async function loadUpdates() {
+    try {
+      const res = await fetch("/api/updates");
+      if (res.ok) { updates = await res.json(); render(); }
+    } catch (err) { /* update info is optional; dashboard works without it */ }
+  }
+
+  async function checkUpdates() {
+    const btn = $("#check-updates");
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>Checking…';
+    try {
+      const res = await fetch("/api/check-updates", { method: "POST" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      updates = await res.json();
+      render();
+      const total = updates.instances.reduce((n, i) =>
+        n + i.stacks.reduce((m, s) => m + (s.updatesAvailable || 0), 0), 0);
+      btn.textContent = total ? `⬆ ${total} update${total === 1 ? "" : "s"} found` : "✓ All up to date";
+    } catch (err) {
+      btn.textContent = "❌ Check failed";
+    }
+    setTimeout(() => { btn.disabled = false; btn.textContent = "Check updates"; }, 5000);
+  }
+
+  async function runUpdate(btn, iid, sid, name) {
+    const msg = $(`#msg-${iid}-${sid}`);
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>Updating…';
+    if (msg) { msg.textContent = ""; msg.className = "result-msg"; }
+    try {
+      const res = await fetch(`/api/instances/${iid}/stacks/${sid}/update`, { method: "POST" });
+      const body = await res.json().catch(() => ({}));
+      const ok = res.ok && body.ok;
+      btn.innerHTML = ok ? "✅ Updated" : "❌ Failed";
+      if (msg) {
+        msg.textContent = ok
+          ? `${((body.durationMs || 0) / 1000).toFixed(1)}s`
+          : (body.message || body.detail || `HTTP ${res.status}`);
+        msg.className = "result-msg " + (ok ? "ok" : "err");
+      }
+      setTimeout(() => { btn.disabled = false; btn.textContent = "Update"; }, 4000);
+      return ok;
+    } catch (err) {
+      btn.innerHTML = "❌ Failed";
+      if (msg) { msg.textContent = err.message; msg.className = "result-msg err"; }
+      setTimeout(() => { btn.disabled = false; btn.textContent = "Update"; }, 4000);
+      return false;
+    }
+  }
+
+  document.addEventListener("click", async (e) => {
+    const updateBtn = e.target.closest(".update-btn");
+    if (updateBtn) {
+      const { iid, sid, name } = updateBtn.dataset;
+      const yes = await confirmModal(`Update “${name}”?`,
+        "This repulls the image(s) and redeploys the stack. Containers will restart.");
+      if (yes) runUpdate(updateBtn, iid, sid, name);
+      return;
+    }
+    const allBtn = e.target.closest(".update-all-btn");
+    if (allBtn) {
+      const iid = Number(allBtn.dataset.iid);
+      const inst = data.find((i) => i.instance.id === iid);
+      if (!inst) return;
+      const yes = await confirmModal(`Update all on “${inst.instance.name}”?`,
+        `This repulls and redeploys all ${inst.stacks.length} stacks on this instance, one at a time.`);
+      if (!yes) return;
+      allBtn.disabled = true;
+      allBtn.innerHTML = '<span class="spinner"></span>Updating all…';
+      for (const stack of inst.stacks) {
+        const btn = document.querySelector(
+          `.update-btn[data-iid="${iid}"][data-sid="${stack.id}"]`);
+        if (btn) await runUpdate(btn, iid, stack.id, stack.name);
+      }
+      allBtn.disabled = false;
+      allBtn.textContent = "Update all";
+    }
+  });
+
+  // --- instance settings ---
+  let editingId = null;
+
+  function showSettings(show) {
+    $("#view-settings").style.display = show ? "" : "none";
+    $("#view-dashboard").style.display = show ? "none" : "";
+    if (show) loadInstances();
+    else { refresh(); loadUpdates(); }
+  }
+
+  function authTypeSelected() {
+    return $("#f-auth-cred").checked ? "credentials" : "api_key";
+  }
+
+  function syncAuthFields() {
+    const cred = authTypeSelected() === "credentials";
+    $("#auth-key-fields").style.display = cred ? "none" : "";
+    $("#auth-cred-fields").style.display = cred ? "" : "none";
+  }
+
+  function fillForm(rec) {
+    editingId = rec ? rec.id : null;
+    $("#form-title").textContent = rec ? `Edit “${rec.name}”` : "Add an instance";
+    $("#f-save").textContent = rec ? "Save changes" : "Add instance";
+    $("#f-cancel").style.display = rec ? "" : "none";
+    $("#f-name").value = rec ? rec.name : "";
+    $("#f-url").value = rec ? rec.baseUrl : "";
+    $("#f-verify").checked = rec ? rec.verifyTls : false;
+    ($("#f-auth-" + (rec && rec.authType === "credentials" ? "cred" : "key"))).checked = true;
+    $("#f-apikey").value = "";
+    $("#f-username").value = rec && rec.username ? rec.username : "";
+    $("#f-password").value = "";
+    const secretHint = rec ? "(leave blank to keep current)" : "";
+    $("#apikey-hint").textContent = secretHint;
+    $("#password-hint").textContent = secretHint;
+    $("#form-msg").textContent = "";
+    $("#form-msg").className = "";
+    syncAuthFields();
+  }
+
+  function formBody() {
+    return {
+      name: $("#f-name").value.trim(),
+      baseUrl: $("#f-url").value.trim(),
+      verifyTls: $("#f-verify").checked,
+      authType: authTypeSelected(),
+      apiKey: $("#f-apikey").value || null,
+      username: $("#f-username").value.trim() || null,
+      password: $("#f-password").value || null,
+    };
+  }
+
+  function formMsg(text, ok) {
+    $("#form-msg").textContent = text;
+    $("#form-msg").className = ok ? "ok" : "err";
+  }
+
+  async function loadInstances() {
+    const list = $("#inst-list");
+    try {
+      const res = await fetch("/api/instances");
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const insts = await res.json();
+      if (!insts.length) {
+        list.innerHTML = '<p class="count">No instances yet — add your first Portainer below.</p>';
+        return;
+      }
+      list.innerHTML = insts.map((i) => `
+        <div class="inst-row">
+          <span class="inst-name">${esc(i.name)}</span>
+          <span class="type-tag">${i.authType === "credentials" ? "user/pass" : "API token"}</span>
+          ${i.reachable ? '<span class="badge ok">● reachable</span>'
+            : `<span class="badge err" title="${esc(i.error)}">● unreachable</span>`}
+          <span class="inst-url">${esc(i.baseUrl)}${i.verifyTls ? "" : " · TLS not verified"}</span>
+          <button class="inst-edit" data-id="${i.id}">Edit</button>
+          <button class="inst-del" data-id="${i.id}" data-name="${esc(i.name)}">Delete</button>
+        </div>`).join("");
+      list.querySelectorAll(".inst-edit").forEach((btn) =>
+        btn.addEventListener("click", () =>
+          fillForm(insts.find((i) => i.id === Number(btn.dataset.id)))));
+      list.querySelectorAll(".inst-del").forEach((btn) =>
+        btn.addEventListener("click", async () => {
+          const yes = await confirmModal(`Delete “${btn.dataset.name}”?`,
+            "restack will forget this Portainer instance and its credentials. Nothing on the machine itself is touched.");
+          if (!yes) return;
+          const res = await fetch(`/api/instances/${btn.dataset.id}`, { method: "DELETE" });
+          if (res.ok && editingId === Number(btn.dataset.id)) fillForm(null);
+          loadInstances();
+        }));
+    } catch (err) {
+      list.innerHTML = `<p class="count">Failed to load: ${esc(err.message)}</p>`;
+    }
+  }
+
+  $("#inst-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const saveBtn = $("#f-save");
+    saveBtn.disabled = true;
+    try {
+      const url = editingId === null ? "/api/instances" : `/api/instances/${editingId}`;
+      const res = await fetch(url, {
+        method: editingId === null ? "POST" : "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(formBody()),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
+      const wasAdd = editingId === null;
+      fillForm(null);
+      formMsg(wasAdd ? "Instance added." : "Saved.", true);
+      loadInstances();
+    } catch (err) {
+      formMsg(err.message, false);
+    } finally {
+      saveBtn.disabled = false;
+    }
+  });
+
+  $("#f-test").addEventListener("click", async () => {
+    const btn = $("#f-test");
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>Testing…';
+    try {
+      const qs = editingId === null ? "" : `?id=${editingId}`;
+      const res = await fetch(`/api/instances/test${qs}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(formBody()),
+      });
+      const body = await res.json();
+      if (body.ok) formMsg(`✅ Connected — ${body.endpoints} environment${body.endpoints === 1 ? "" : "s"} found.`, true);
+      else formMsg(`❌ ${body.error || "Connection failed"}`, false);
+    } catch (err) {
+      formMsg(`❌ ${err.message}`, false);
+    }
+    btn.disabled = false;
+    btn.textContent = "Test connection";
+  });
+
+  document.querySelectorAll('input[name="authType"]').forEach((radio) =>
+    radio.addEventListener("change", syncAuthFields));
+  $("#f-cancel").addEventListener("click", () => fillForm(null));
+  $("#settings-btn").addEventListener("click", () => showSettings(true));
+  $("#settings-close").addEventListener("click", () => showSettings(false));
+
+  $("#refresh").addEventListener("click", () => { refresh(); loadUpdates(); });
+  $("#check-updates").addEventListener("click", checkUpdates);
+  $("#search").addEventListener("input", render);
+
+  fetch("/api/ui-config").then((r) => r.ok ? r.json() : null).then((cfg) => {
+    if (cfg && cfg.title) {
+      document.title = cfg.title;
+      $("#title").innerHTML = `${esc(cfg.title)} <span>Portainer stack updater</span>`;
+    }
+  }).catch(() => {});
+
+  refresh();
+  loadUpdates();
+})();
+</script>
+</body>
+</html>

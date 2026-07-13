@@ -1,0 +1,9 @@
+config.yaml
+data/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# internal working notes, not part of the published project
+portainer-stack-updater-spec.md
