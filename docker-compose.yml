@@ -1,13 +1,13 @@
 services:
   restack:
     build: .
-    # image: ghcr.io/<you>/restack:latest   # once published
+    # image: ghcr.io/jwapps-app/restack:latest   # once a prebuilt image is published
     container_name: restack
     ports:
-      - "8080:8080"
+      - "${RESTACK_PORT:-8080}:8080"
     volumes:
-      - ./config.yaml:/config/config.yaml:ro
-      - ./data:/data          # persists the instance list managed from the settings UI
+      - ${RESTACK_CONFIG:-./config.yaml}:/config/config.yaml:ro
+      - ${RESTACK_DATA:-./data}:/data
     environment:
-      - DASHBOARD_PASSWORD=change-me
+      - DASHBOARD_PASSWORD=${DASHBOARD_PASSWORD:?set DASHBOARD_PASSWORD in .env or the stack environment}
     restart: unless-stopped
