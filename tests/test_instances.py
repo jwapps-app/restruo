@@ -163,6 +163,10 @@ def csrf_portainer_transport(state: dict) -> httpx.MockTransport:
         if request.method in ("PUT", "POST", "DELETE"):
             if request.headers.get("X-CSRF-Token") != state["valid_csrf"]:
                 return httpx.Response(403, text="Forbidden - CSRF token not found in request")
+            # Over HTTPS Portainer also requires a same-origin referer.
+            referer = request.headers.get("Referer", "")
+            if not referer.startswith("https://portainer.test:9443"):
+                return httpx.Response(403, text="Forbidden - referer not supplied")
         if path == "/api/stacks/5/git/redeploy":
             return httpx.Response(200, json={"Id": 5})
         raise AssertionError(f"unexpected request: {request.method} {path}")

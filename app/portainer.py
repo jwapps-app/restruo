@@ -102,8 +102,13 @@ class PortainerClient:
 
         headers = kwargs.setdefault("headers", {})
         headers["Authorization"] = f"Bearer {self._jwt}"
-        if mutating and self._csrf:
-            headers["X-CSRF-Token"] = self._csrf
+        if mutating:
+            if self._csrf:
+                headers["X-CSRF-Token"] = self._csrf
+            # Over HTTPS, Portainer's CSRF layer additionally requires a
+            # same-origin Referer ("Forbidden - referer not supplied").
+            headers["Referer"] = f"{self.instance.base_url}/"
+            headers["Origin"] = self.instance.base_url
         response = await self._client.request(method, url, **kwargs)
 
         if response.status_code == 401:
