@@ -1,8 +1,11 @@
 """Configuration loading for restack.
 
-Config lives in a single YAML file (default /config/config.yaml, override with
-CONFIG_PATH). The dashboard password is never stored in the file — the config
-names an environment variable and the value is read from the process env.
+The YAML config file is OPTIONAL. Without one, sensible defaults apply: auth
+enabled (username RESTACK_USERNAME or "admin", password from
+DASHBOARD_PASSWORD), title from RESTACK_TITLE, update checks every 6 hours.
+A file at /config/config.yaml (override with CONFIG_PATH) overrides those.
+Passwords are never stored in the file — the config names an environment
+variable and the value is read from the process env.
 """
 
 import os
@@ -25,8 +28,8 @@ class InstanceConfig(BaseModel):
 
 
 class AuthConfig(BaseModel):
-    enabled: bool = False
-    username: str = "admin"
+    enabled: bool = True
+    username: str = Field(default_factory=lambda: os.environ.get("RESTACK_USERNAME", "admin"))
     password_env: str = "DASHBOARD_PASSWORD"
 
     @property
@@ -35,7 +38,7 @@ class AuthConfig(BaseModel):
 
 
 class UIConfig(BaseModel):
-    title: str = "restack"
+    title: str = Field(default_factory=lambda: os.environ.get("RESTACK_TITLE", "restack"))
     auth: AuthConfig = Field(default_factory=AuthConfig)
 
 
@@ -57,18 +60,16 @@ DEFAULT_CONFIG_PATH = "/config/config.yaml"
 
 def load_config(path: str | None = None) -> AppConfig:
     config_path = Path(path or os.environ.get("CONFIG_PATH", DEFAULT_CONFIG_PATH))
-    if not config_path.is_file():
-        raise FileNotFoundError(
-            f"Config file not found at {config_path}. "
-            "Mount your config.yaml there or set CONFIG_PATH."
-        )
-    with config_path.open() as f:
-        raw = yaml.safe_load(f) or {}
+    raw = {}
+    if config_path.is_file():
+        with config_path.open() as f:
+            raw = yaml.safe_load(f) or {}
     config = AppConfig.model_validate(raw)
 
     if config.ui.auth.enabled and not config.ui.auth.password:
         raise ValueError(
             f"Dashboard auth is enabled but the environment variable "
-            f"'{config.ui.auth.password_env}' is not set."
+            f"'{config.ui.auth.password_env}' is not set. Set it, or disable "
+            "auth via a config file (ui.auth.enabled: false)."
         )
     return config

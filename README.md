@@ -19,16 +19,23 @@ Built and tested against Portainer 2.x (API paths and field casing verified July
 
 ## Setup
 
-### 1. Configure & run
+### 1. Deploy — no files or folders needed
 
-```sh
-cp config.example.yaml config.yaml   # dashboard title/auth/update settings
-docker compose up -d --build
-```
+As a Portainer stack (Repository deploy pointing at this repo, compose path
+`docker-compose.yml`) or plain `docker compose up -d --build`. Set one required
+environment variable in the stack environment:
 
-The dashboard itself is protected by basic auth. The username lives in the config; the
-password is read from the environment variable named by `password_env` (default
-`DASHBOARD_PASSWORD`) and is never stored in the file.
+| Variable | Required | Default | Purpose |
+|----------|----------|---------|---------|
+| `DASHBOARD_PASSWORD` | yes | — | Dashboard login password |
+| `RESTACK_USERNAME` | no | `admin` | Dashboard login username |
+| `RESTACK_TITLE` | no | `restack` | Dashboard title |
+| `RESTACK_PORT` | no | `8080` | Host port |
+
+Instance data (the Portainers you add, including their credentials) lives in the
+`restack-data` named volume. A YAML config file is entirely optional — mount one at
+`/config/config.yaml` only if you want to change update-check intervals, disable auth,
+or pre-seed instances (see `config.example.yaml`).
 
 ### 2. Add your Portainer instances
 
