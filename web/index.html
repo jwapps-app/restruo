@@ -142,7 +142,7 @@
 </header>
 <main>
   <div id="view-dashboard">
-    <p id="status-line">Loading…</p>
+    <p id="status-line"><span id="status-stacks">Loading…</span> <span id="status-updates"></span></p>
     <div id="instances"></div>
   </div>
   <div id="view-settings" style="display:none">
@@ -318,7 +318,7 @@
   }
 
   async function refresh() {
-    $("#status-line").textContent = "Loading stacks from all instances…";
+    $("#status-stacks").textContent = "Loading stacks from all instances…";
     $("#refresh").disabled = true;
     try {
       const res = await fetch("/api/stacks");
@@ -326,23 +326,38 @@
       data = await res.json();
       const total = data.reduce((n, i) => n + i.stacks.length, 0);
       const down = data.filter((i) => !i.reachable).length;
-      $("#status-line").textContent = data.length === 0
+      $("#status-stacks").textContent = data.length === 0
         ? "No Portainer instances configured — click “⚙ Instances” to add your servers."
         : `${total} stacks across ${data.length} instance${data.length === 1 ? "" : "s"}` +
           (down ? ` — ${down} instance${down === 1 ? "" : "s"} unreachable` : "") +
           ` · updated ${new Date().toLocaleTimeString()}`;
       render();
     } catch (err) {
-      $("#status-line").textContent = "Failed to load: " + err.message;
+      $("#status-stacks").textContent = "Failed to load: " + err.message;
     } finally {
       $("#refresh").disabled = false;
     }
   }
 
+  function ago(ts) {
+    const mins = Math.round((Date.now() / 1000 - ts) / 60);
+    if (mins < 1) return "just now";
+    if (mins < 60) return `${mins}m ago`;
+    return `${Math.round(mins / 60)}h ago`;
+  }
+
+  function renderCheckStatus() {
+    $("#status-updates").textContent = updates.checking
+      ? "· checking registries…"
+      : updates.checkedAt
+        ? `· updates checked ${ago(updates.checkedAt)}`
+        : "· updates not checked yet — click “Check updates”";
+  }
+
   async function loadUpdates() {
     try {
       const res = await fetch("/api/updates");
-      if (res.ok) { updates = await res.json(); render(); }
+      if (res.ok) { updates = await res.json(); render(); renderCheckStatus(); }
     } catch (err) { /* update info is optional; dashboard works without it */ }
   }
 
@@ -350,11 +365,13 @@
     const btn = $("#check-updates");
     btn.disabled = true;
     btn.innerHTML = '<span class="spinner"></span>Checking…';
+    $("#status-updates").textContent = "· checking registries…";
     try {
       const res = await fetch("/api/check-updates", { method: "POST" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       updates = await res.json();
       render();
+      renderCheckStatus();
       const total = updates.instances.reduce((n, i) =>
         n + i.stacks.reduce((m, s) => m + (s.updatesAvailable || 0), 0), 0);
       btn.textContent = total ? `⬆ ${total} update${total === 1 ? "" : "s"} found` : "✓ All up to date";
@@ -530,6 +547,9 @@
       fillForm(null);
       formMsg(wasAdd ? "Instance added." : "Saved.", true);
       loadInstances();
+      // Cover the new/changed instance right away instead of waiting for the
+      // next scheduled registry check.
+      fetch("/api/check-updates", { method: "POST" }).then(() => loadUpdates()).catch(() => {});
     } catch (err) {
       formMsg(err.message, false);
     } finally {
