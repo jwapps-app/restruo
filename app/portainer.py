@@ -61,6 +61,7 @@ class PortainerClient:
             **kwargs,
         )
         self._jwt: str | None = None
+        self._csrf: str | None = None
         self._auth_lock = asyncio.Lock()
 
     async def aclose(self) -> None:
@@ -74,23 +75,50 @@ class PortainerClient:
         self._check(response)
         self._jwt = response.json().get("jwt")
 
+    async def _fetch_csrf(self) -> None:
+        # Portainer 2.20.2+ requires an X-CSRF-Token on mutating requests made
+        # with a session JWT (API keys are exempt). The token is issued via a
+        # response header on any GET, paired with a cookie the client jar keeps.
+        response = await self._client.get("/")
+        self._csrf = response.headers.get("X-CSRF-Token") or self._csrf
+
+    @staticmethod
+    def _is_csrf_error(response: httpx.Response) -> bool:
+        return response.status_code == 403 and "csrf" in response.text.lower()
+
     async def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
         if self._auth_type != "credentials":
             return await self._client.request(method, url, **kwargs)
 
+        mutating = method.upper() not in ("GET", "HEAD", "OPTIONS")
         if self._jwt is None:
             async with self._auth_lock:
                 if self._jwt is None:
                     await self._login()
+        if mutating and self._csrf is None:
+            async with self._auth_lock:
+                if self._csrf is None:
+                    await self._fetch_csrf()
+
         headers = kwargs.setdefault("headers", {})
         headers["Authorization"] = f"Bearer {self._jwt}"
+        if mutating and self._csrf:
+            headers["X-CSRF-Token"] = self._csrf
         response = await self._client.request(method, url, **kwargs)
+
         if response.status_code == 401:
             # Session JWT expired — log in again and retry once.
             async with self._auth_lock:
                 await self._login()
             headers["Authorization"] = f"Bearer {self._jwt}"
             response = await self._client.request(method, url, **kwargs)
+        if self._is_csrf_error(response):
+            # Stale/missing CSRF token — refresh it and retry once.
+            async with self._auth_lock:
+                await self._fetch_csrf()
+            if self._csrf:
+                headers["X-CSRF-Token"] = self._csrf
+                response = await self._client.request(method, url, **kwargs)
         return response
 
     @staticmethod
