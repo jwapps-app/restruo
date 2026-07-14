@@ -14,6 +14,9 @@ re-pull checkbox → deploy) across all your machines.
 - Update-available badges for images tracking `:latest` (see below).
 - Per-instance **Clean up**: prune unused images (reclaims space from superseded
   `:latest` pulls) and networks; optionally unused volumes (off by default — deletes data).
+- **Installable as a web app** (add to home screen): manifest and icons included. Login
+  is a fast in-app form backed by a 30-day session cookie, so a force-closed app reopens
+  signed in. Basic auth still works for scripts/curl.
 - Single small container. Portainer stays the source of truth for stacks; Restruo only
   persists its instance list (a JSON file on the `/data` volume).
 

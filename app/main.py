@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 
+from .auth import SESSION_COOKIE, SESSION_TTL_SECONDS, SessionManager
 from .config import AppConfig, load_config
 from .instances import ClientManager, InstanceRecord, InstanceStore
 from .notifiers import build_notifiers
@@ -59,6 +60,7 @@ async def lifespan(app: FastAPI):
     manager = ClientManager(store)
     await manager.refresh()
     app.state.manager = manager
+    app.state.sessions = SessionManager(store.path.parent / "session_secret")
 
     app.state.registry = RegistryClient()
     app.state.checker = UpdateChecker(
@@ -83,21 +85,49 @@ app = FastAPI(title="Restruo", lifespan=lifespan)
 _basic = HTTPBasic(auto_error=False)
 
 
+def _credentials_valid(request: Request, username: str, password: str) -> bool:
+    auth = request.app.state.config.ui.auth
+    return (
+        secrets.compare_digest(username.encode(), auth.username.encode())
+        and secrets.compare_digest(password.encode(), (auth.password or "").encode())
+    )
+
+
 def require_auth(request: Request, credentials: HTTPBasicCredentials | None = Depends(_basic)):
     auth = request.app.state.config.ui.auth
     if not auth.enabled:
         return
-    valid = (
-        credentials is not None
-        and secrets.compare_digest(credentials.username.encode(), auth.username.encode())
-        and secrets.compare_digest(credentials.password.encode(), (auth.password or "").encode())
+    token = request.cookies.get(SESSION_COOKIE)
+    if token and request.app.state.sessions.verify(token):
+        return
+    if credentials is not None and _credentials_valid(
+        request, credentials.username, credentials.password
+    ):
+        return
+    # No WWW-Authenticate header: the app has its own login form, and the
+    # header would make browsers pop the (slow) native basic-auth dialog.
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/api/login")
+async def login(request: Request, body: LoginRequest):
+    auth = request.app.state.config.ui.auth
+    if auth.enabled and not _credentials_valid(request, body.username, body.password):
+        raise HTTPException(status_code=401, detail="Wrong username or password.")
+    response = JSONResponse({"ok": True})
+    response.set_cookie(
+        SESSION_COOKIE,
+        request.app.state.sessions.issue(),
+        max_age=SESSION_TTL_SECONDS,
+        httponly=True,
+        samesite="lax",
     )
-    if not valid:
-        raise HTTPException(
-            status_code=401,
-            detail="Unauthorized",
-            headers={"WWW-Authenticate": 'Basic realm="Restruo"'},
-        )
+    return response
 
 
 def _manager(request: Request) -> ClientManager:
@@ -479,11 +509,13 @@ async def check_updates(request: Request):
     return await request.app.state.checker.check_all()
 
 
-@app.get("/api/ui-config", dependencies=[Depends(require_auth)])
+# Title/version are cosmetic and shown on the login screen — no auth.
+@app.get("/api/ui-config")
 async def ui_config(request: Request):
     return {
         "title": request.app.state.config.ui.title,
         "version": os.environ.get("RESTRUO_VERSION", "dev"),
+        "authEnabled": request.app.state.config.ui.auth.enabled,
     }
 
 
@@ -492,7 +524,25 @@ async def icon():
     return FileResponse(WEB_DIR / "icon.svg", media_type="image/svg+xml")
 
 
-@app.get("/", dependencies=[Depends(require_auth)])
+@app.get("/manifest.webmanifest")
+async def manifest():
+    return FileResponse(
+        WEB_DIR / "manifest.webmanifest", media_type="application/manifest+json"
+    )
+
+
+@app.get("/icons/{filename}")
+async def icons(filename: str):
+    path = (WEB_DIR / "icons" / filename).resolve()
+    if path.parent != (WEB_DIR / "icons").resolve() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Not found")
+    return FileResponse(path)
+
+
+# The app shell is public (it contains no data); every data endpoint stays
+# behind auth. This makes first paint instant and lets the login form render
+# immediately instead of blocking on the browser's basic-auth dialog.
+@app.get("/")
 async def index():
     # no-cache = revalidate on every load, so the UI can't go stale after an update.
     return FileResponse(WEB_DIR / "index.html", headers={"Cache-Control": "no-cache"})

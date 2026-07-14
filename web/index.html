@@ -5,6 +5,13 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Restruo</title>
 <link rel="icon" type="image/svg+xml" href="/icon.svg">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+<meta name="theme-color" content="#0086c9">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Restruo">
 <style>
   :root {
     --bg: #f5f6f8; --panel: #ffffff; --text: #1a1d21; --muted: #6b7280;
@@ -88,6 +95,21 @@
   }
   @keyframes spin { to { transform: rotate(360deg); } }
   #status-line { color: var(--muted); font-size: 13px; margin: 0 0 14px; }
+  /* login */
+  #view-login { display: flex; justify-content: center; padding-top: 10vh; }
+  .login-card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 16px;
+    padding: 32px 28px; width: min(340px, 92vw); text-align: center;
+  }
+  .login-card img { border-radius: 13px; margin-bottom: 10px; }
+  .login-card h2 { margin: 0 0 20px; font-size: 20px; }
+  .login-card input {
+    width: 100%; padding: 10px 12px; margin-bottom: 10px; font: inherit;
+    border: 1px solid var(--border); border-radius: 8px;
+    background: var(--bg); color: var(--text);
+  }
+  .login-card button { width: 100%; padding: 10px; margin-top: 4px; }
+  #login-msg { font-size: 13px; color: var(--err); min-height: 18px; margin: 10px 0 0; }
   /* settings */
   .settings-panel {
     background: var(--panel); border: 1px solid var(--border);
@@ -149,6 +171,18 @@
   <button id="refresh" class="primary">Refresh</button>
 </header>
 <main>
+  <div id="view-login" style="display:none">
+    <div class="login-card">
+      <img src="/icon.svg" width="56" height="56" alt="">
+      <h2 id="login-title">Restruo</h2>
+      <form id="login-form">
+        <input id="l-user" type="text" placeholder="Username" autocomplete="username" required>
+        <input id="l-pass" type="password" placeholder="Password" autocomplete="current-password" required>
+        <button class="primary" type="submit" id="l-submit">Sign in</button>
+        <p id="login-msg"></p>
+      </form>
+    </div>
+  </div>
   <div id="view-dashboard">
     <p id="status-line"><span id="status-stacks">Loading…</span> <span id="status-updates"></span></p>
     <div id="instances"></div>
@@ -372,11 +406,47 @@
     }
   }
 
+  function showLogin(show) {
+    $("#view-login").style.display = show ? "" : "none";
+    $("#view-dashboard").style.display = show ? "none" : "";
+    $("#view-settings").style.display = "none";
+    for (const id of ["search", "check-updates", "settings-btn", "refresh"])
+      document.getElementById(id).style.display = show ? "none" : "";
+    if (show) setTimeout(() => $("#l-user").focus(), 50);
+  }
+
+  $("#login-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const btn = $("#l-submit");
+    btn.disabled = true;
+    $("#login-msg").textContent = "";
+    try {
+      const res = await fetch("/api/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username: $("#l-user").value.trim(),
+          password: $("#l-pass").value,
+        }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
+      $("#l-pass").value = "";
+      showLogin(false);
+      refresh();
+      loadUpdates();
+    } catch (err) {
+      $("#login-msg").textContent = err.message;
+    }
+    btn.disabled = false;
+  });
+
   async function refresh() {
     $("#status-stacks").textContent = "Loading stacks from all instances…";
     $("#refresh").disabled = true;
     try {
       const res = await fetch("/api/stacks");
+      if (res.status === 401) { showLogin(true); return; }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       data = await res.json();
       const total = data.reduce((n, i) => n + i.stacks.length, 0);
@@ -416,6 +486,10 @@
     } catch (err) { /* update info is optional; dashboard works without it */ }
   }
 
+  fetch("/api/ui-config").then((r) => r.ok ? r.json() : null).then((cfg) => {
+    if (cfg && cfg.title) $("#login-title").textContent = cfg.title;
+  }).catch(() => {});
+
   async function checkUpdates() {
     const btn = $("#check-updates");
     btn.disabled = true;
@@ -423,6 +497,7 @@
     $("#status-updates").textContent = "· checking registries…";
     try {
       const res = await fetch("/api/check-updates", { method: "POST" });
+      if (res.status === 401) { showLogin(true); throw new Error("Signed out"); }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       updates = await res.json();
       render();
