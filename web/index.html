@@ -293,7 +293,7 @@
       } else if (stacks.length === 0 && ctrs.length === 0) {
         body = '<div class="stack-body unreachable-note" style="color:var(--muted)">No stacks or standalone containers.</div>';
       } else {
-        const stackRows = stacks.map((s) => {
+        const stackRow = (s) => {
           const info = updateInfoFor(iid, s.id);
           const hasUpd = !!(info && info.updatesAvailable);
           const updBadge = hasUpd
@@ -310,8 +310,8 @@
               <span class="result-msg" id="msg-${iid}-${s.id}"></span>
             </td>
           </tr>`;
-        }).join("");
-        const ctrRows = ctrs.map((c) => {
+        };
+        const ctrRow = (c) => {
           const cInfo = updateInfoForCtr(iid, c.id);
           const hasUpd = !!(cInfo && cInfo.status === "update-available");
           const isPortainer = c.image.includes("portainer/portainer");
@@ -332,11 +332,16 @@
               <span class="result-msg" id="msg-${iid}-${esc(c.id)}"></span>
             </td>
           </tr>`;
-        }).join("");
+        };
+        // One combined A–Z list — stacks and containers interleaved.
+        const rows = [
+          ...stacks.map((s) => ({ name: s.name, html: () => stackRow(s) })),
+          ...ctrs.map((c) => ({ name: c.name, html: () => ctrRow(c) })),
+        ].sort(byName).map((r) => r.html()).join("");
         body = `<div class="stack-body"><table>
           <thead><tr><th>Stack / container</th><th>Type</th><th class="hide-sm">Images</th>
           <th class="hide-sm">Updated</th><th></th></tr></thead>
-          <tbody>${stackRows}${ctrRows}</tbody></table></div>`;
+          <tbody>${rows}</tbody></table></div>`;
       }
 
       const updInst = updates.instances.find((u) => u.instance.id === iid);

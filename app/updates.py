@@ -14,6 +14,7 @@ from .portainer import (
     PortainerClient,
     extract_images,
     normalize_container,
+    resolve_image_name,
     standalone_containers,
 )
 from .registry import RegistryClient, parse_image_ref
@@ -184,6 +185,9 @@ class UpdateChecker:
                 await containers_for(endpoint_id), stack_names
             ):
                 normalized = normalize_container(raw_container, endpoint_id)
+                normalized["image"] = await resolve_image_name(
+                    client, endpoint_id, raw_container
+                )
                 checked = await self._check_image(
                     client, endpoint_id, normalized["image"], [raw_container]
                 )

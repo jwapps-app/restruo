@@ -22,6 +22,7 @@ from .portainer import (
     extract_images,
     normalize_container,
     normalize_stack,
+    resolve_image_name,
     standalone_containers,
 )
 from .registry import RegistryClient
@@ -255,10 +256,10 @@ async def _stacks_for_instance(iid: int, name: str, client: PortainerClient) -> 
                 containers = await client.list_containers(endpoint_id)
             except Exception:
                 continue
-            result["containers"].extend(
-                normalize_container(c, endpoint_id)
-                for c in standalone_containers(containers, stack_names)
-            )
+            for c in standalone_containers(containers, stack_names):
+                normalized = normalize_container(c, endpoint_id)
+                normalized["image"] = await resolve_image_name(client, endpoint_id, c)
+                result["containers"].append(normalized)
     except Exception:
         pass
     return result
@@ -347,7 +348,8 @@ async def update_container(request: Request, iid: int, cid: str):
         if target is None:
             raise HTTPException(status_code=404, detail=f"No container {cid[:12]} on this instance")
         endpoint_id, container = target
-        if "portainer/portainer" in (container.get("Image") or ""):
+        resolved_image = await resolve_image_name(client, endpoint_id, container)
+        if "portainer/portainer" in resolved_image:
             # Portainer dies the moment it stops itself, before the replacement
             # is created — the recreate can never complete. Refuse.
             raise HTTPException(

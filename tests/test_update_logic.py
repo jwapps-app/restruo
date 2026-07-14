@@ -116,6 +116,31 @@ async def test_missing_env_defaults_to_empty_list():
     assert json.loads(requests[0].content)["Env"] == []
 
 
+async def test_resolve_image_name_recovers_repo_from_digest():
+    from app.portainer import resolve_image_name
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/endpoints/2/docker/images/sha256:img-id/json"
+        return httpx.Response(200, json={
+            "RepoTags": [],
+            "RepoDigests": ["portainer/portainer-ce@sha256:" + "a" * 64],
+        })
+
+    client, _ = make_client(handler)
+    # Container whose tag was re-pulled elsewhere: Image is a bare digest.
+    resolved = await resolve_image_name(client, 2, {
+        "Image": "sha256:" + "f" * 64, "ImageID": "sha256:img-id",
+    })
+    await client.aclose()
+    assert resolved.startswith("portainer/portainer-ce@")
+
+    # Normal tagged images pass through without an inspect call.
+    client2, requests = make_client(handler)
+    assert await resolve_image_name(client2, 2, {"Image": "nginx:latest"}) == "nginx:latest"
+    await client2.aclose()
+    assert requests == []
+
+
 async def test_recreate_container_uses_portainer_recreate_action():
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "POST"

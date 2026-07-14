@@ -296,6 +296,24 @@ class PortainerClient:
         return await self.redeploy_compose(stack_id, endpoint_id, stack_file_content, env)
 
 
+async def resolve_image_name(
+    client: PortainerClient, endpoint_id: int, container: dict
+) -> str:
+    """Containers whose image tag was re-pulled elsewhere report a bare sha256
+    digest as their image. Resolve it back to a repository name via the image
+    metadata so display, update checks, and guards keep working."""
+    image = container.get("Image") or ""
+    if not image.startswith("sha256:"):
+        return image
+    try:
+        info = await client.get_image_info(endpoint_id, container.get("ImageID") or image)
+        tags = info.get("RepoTags") or []
+        digests = info.get("RepoDigests") or []
+        return (tags or digests or [image])[0]
+    except Exception:
+        return image
+
+
 def standalone_containers(containers: list[dict], stack_names: set[str]) -> list[dict]:
     """Containers that don't belong to any Portainer stack on this instance."""
     out = []
