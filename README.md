@@ -94,7 +94,8 @@ Restruo can tell you when a newer image is available for a stack:
   locally tagged image. Works anonymously with Docker Hub, ghcr.io, lscr.io, and any
   standard v2 registry; locally built images show as not checkable.
 - Checks run on a schedule (`updates.interval_hours`, default 6h — keep it modest, Docker
-  Hub rate-limits anonymous requests) and on demand via the **Check updates** button.
+  Hub rate-limits anonymous requests) and on demand: **Refresh** reloads the stack lists
+  immediately and scans the registries in the background.
 - Results appear as **⬆ update available** badges per stack and per instance; new findings
   are also written to the container log. The notifier layer is pluggable, so additional
   paths (ntfy, webhooks, …) can be added later.

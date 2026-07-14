@@ -173,9 +173,8 @@
   <img src="/icon.svg" alt="" width="26" height="26" style="border-radius:6px">
   <h1 id="title">Restruo <span>Portainer stack updater</span></h1>
   <input id="search" type="search" placeholder="Filter stacks…">
-  <button id="check-updates">Check updates</button>
   <button id="settings-btn" title="Manage Portainer instances">⚙ Instances</button>
-  <button id="refresh" class="primary">Refresh</button>
+  <button id="refresh" class="primary" title="Reload stacks and scan registries for updates">Refresh</button>
 </header>
 <main>
   <div id="view-login" style="display:none">
@@ -417,7 +416,7 @@
     $("#view-login").style.display = show ? "" : "none";
     $("#view-dashboard").style.display = show ? "none" : "";
     $("#view-settings").style.display = "none";
-    for (const id of ["search", "check-updates", "settings-btn", "refresh"])
+    for (const id of ["search", "settings-btn", "refresh"])
       document.getElementById(id).style.display = show ? "none" : "";
     if (show) setTimeout(() => $("#l-user").focus(), 50);
   }
@@ -483,7 +482,7 @@
       ? "· checking registries…"
       : updates.checkedAt
         ? `· updates checked ${ago(updates.checkedAt)}`
-        : "· updates not checked yet — click “Check updates”";
+        : "· updates not checked yet — click “Refresh”";
   }
 
   async function loadUpdates() {
@@ -497,25 +496,24 @@
     if (cfg && cfg.title) $("#login-title").textContent = cfg.title;
   }).catch(() => {});
 
-  async function checkUpdates() {
-    const btn = $("#check-updates");
-    btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span>Checking…';
+  let checking = false;
+  async function backgroundCheck() {
+    // Fired by Refresh: scans registries without blocking the stack reload.
+    if (checking) return;
+    checking = true;
     $("#status-updates").textContent = "· checking registries…";
     try {
       const res = await fetch("/api/check-updates", { method: "POST" });
-      if (res.status === 401) { showLogin(true); throw new Error("Signed out"); }
+      if (res.status === 401) { showLogin(true); return; }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       updates = await res.json();
       render();
       renderCheckStatus();
-      const total = updates.instances.reduce((n, i) =>
-        n + i.stacks.reduce((m, s) => m + (s.updatesAvailable || 0), 0), 0);
-      btn.textContent = total ? `⬆ ${total} update${total === 1 ? "" : "s"} found` : "✓ All up to date";
     } catch (err) {
-      btn.textContent = "❌ Check failed";
+      $("#status-updates").textContent = "· registry check failed";
+    } finally {
+      checking = false;
     }
-    setTimeout(() => { btn.disabled = false; btn.textContent = "Check updates"; }, 5000);
   }
 
   function clearUpdateFlags(btn) {
@@ -698,7 +696,7 @@
       if (!inst) return;
       if (!updates.checkedAt) {
         await confirmModal("No update check yet",
-          "Run “Check updates” first — “Update all” only redeploys stacks and containers that actually have an update available.",
+          "Hit “Refresh” first so the registries get scanned — “Update all” only redeploys stacks and containers that actually have an update available.",
           { okOnly: true, okText: "OK" });
         return;
       }
@@ -870,8 +868,7 @@
   $("#settings-btn").addEventListener("click", () => showSettings(true));
   $("#settings-close").addEventListener("click", () => showSettings(false));
 
-  $("#refresh").addEventListener("click", () => { refresh(); loadUpdates(); });
-  $("#check-updates").addEventListener("click", checkUpdates);
+  $("#refresh").addEventListener("click", () => { refresh(); backgroundCheck(); });
   $("#search").addEventListener("input", render);
 
   fetch("/api/ui-config").then((r) => r.ok ? r.json() : null).then((cfg) => {
