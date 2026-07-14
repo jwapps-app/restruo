@@ -60,7 +60,7 @@
   .badge.ok { color: var(--ok); }
   .badge.err { color: var(--err); }
   .badge.upd { color: var(--accent); font-weight: 600; }
-  .update-btn.has-upd {
+  .update-btn.has-upd, .update-all-btn.has-upd {
     background: var(--accent); border-color: var(--accent);
     color: var(--accent-text); font-weight: 600;
   }
@@ -265,12 +265,13 @@
     root.innerHTML = "";
     for (const inst of data) {
       const iid = inst.instance.id;
+      const byName = (a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
       const stacks = inst.stacks.filter((s) =>
         !filter || s.name.toLowerCase().includes(filter) ||
-        s.images.some((i) => i.toLowerCase().includes(filter)));
+        s.images.some((i) => i.toLowerCase().includes(filter))).sort(byName);
       const ctrs = (inst.containers || []).filter((c) =>
         !filter || c.name.toLowerCase().includes(filter) ||
-        c.image.toLowerCase().includes(filter));
+        c.image.toLowerCase().includes(filter)).sort(byName);
       if (filter && stacks.length === 0 && ctrs.length === 0 && inst.reachable) continue;
 
       const section = document.createElement("section");
@@ -344,7 +345,7 @@
           ${instUpdCount ? `<span class="badge upd">⬆ ${instUpdCount} update${instUpdCount === 1 ? "" : "s"}</span>` : ""}
           ${badge}
           ${inst.reachable && (inst.stacks.length || ctrCount) ?
-            `<button class="update-all-btn" data-iid="${iid}">Update all</button>` : ""}
+            `<button class="update-all-btn${instUpdCount ? " has-upd" : ""}" data-iid="${iid}">${instUpdCount ? "⬆ Update all" : "Update all"}</button>` : ""}
         </div>${body}`;
 
       $(".instance-header", section).addEventListener("click", (e) => {
@@ -447,13 +448,21 @@
         el.textContent = el.textContent.replace(/^⬆ /, "").replace(/ new version$/, "");
       });
     }
-    const hdrBadge = btn.closest("section")?.querySelector(".instance-header .badge.upd");
-    if (hdrBadge && instUpd) {
+    const section = btn.closest("section");
+    const hdrBadge = section?.querySelector(".instance-header .badge.upd");
+    if (instUpd) {
       const remaining =
         instUpd.stacks.reduce((n, s) => n + (s.updatesAvailable || 0), 0) +
         (instUpd.containers || []).filter((c) => c.status === "update-available").length;
-      if (remaining) hdrBadge.textContent = `⬆ ${remaining} update${remaining === 1 ? "" : "s"}`;
-      else hdrBadge.remove();
+      if (hdrBadge) {
+        if (remaining) hdrBadge.textContent = `⬆ ${remaining} update${remaining === 1 ? "" : "s"}`;
+        else hdrBadge.remove();
+      }
+      const allBtn = section?.querySelector(".update-all-btn");
+      if (allBtn && !remaining) {
+        allBtn.classList.remove("has-upd");
+        if (!allBtn.disabled) allBtn.textContent = "Update all";
+      }
     }
   }
 
