@@ -157,7 +157,14 @@
   #modal-extra .danger { color: var(--err); }
   @media (max-width: 640px) {
     th.hide-sm, td.hide-sm { display: none; }
-    main { padding: 12px 10px 60px; }
+    main { padding: 12px 8px 60px; }
+    th, td { padding: 8px 8px; }
+    td:first-child { overflow-wrap: anywhere; }
+    td:last-child { white-space: nowrap; }
+    .update-btn, .update-all-btn, .cleanup-btn { padding: 6px 10px; }
+    header { padding: 10px 12px; gap: 8px; }
+    .instance-header { padding: 10px 12px; gap: 8px; }
+    .result-msg { max-width: 140px; white-space: normal; }
   }
 </style>
 </head>
@@ -240,7 +247,7 @@
   "use strict";
   let data = [];
   let updates = { checkedAt: null, instances: [] };
-  const collapsed = new Set();
+  const expanded = new Set();  // instances start collapsed; user opens what they need
   const $ = (sel, el = document) => el.querySelector(sel);
 
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
@@ -315,7 +322,7 @@
 
       const section = document.createElement("section");
       section.className = "instance" +
-        (collapsed.has(iid) ? " collapsed" : "") +
+        (filter || expanded.has(iid) ? "" : " collapsed") +
         (inst.reachable ? "" : " greyed");
       const badge = inst.reachable
         ? '<span class="badge ok">● reachable</span>'
@@ -335,7 +342,7 @@
           return `
           <tr>
             <td><strong>${esc(s.name)}</strong>${updBadge}</td>
-            <td><span class="type-tag">${esc(s.git ? s.type + " · git" : s.type)}</span></td>
+            <td class="hide-sm"><span class="type-tag">${esc(s.git ? s.type + " · git" : s.type)}</span></td>
             <td class="images hide-sm">${renderImagesCell(s, iid)}</td>
             <td class="when hide-sm">${fmtWhen(s.updatedAt)}</td>
             <td>
@@ -355,7 +362,7 @@
           return `
           <tr>
             <td><strong>${esc(c.name)}</strong>${hasUpd ? ' <span class="badge upd">⬆ update</span>' : ""}</td>
-            <td><span class="type-tag">container</span></td>
+            <td class="hide-sm"><span class="type-tag">container</span></td>
             <td class="images hide-sm">${imagesCell}</td>
             <td class="when hide-sm">${esc(c.state)}</td>
             <td>
@@ -373,7 +380,7 @@
           ...ctrs.map((c) => ({ name: c.name, html: () => ctrRow(c) })),
         ].sort(byName).map((r) => r.html()).join("");
         body = `<div class="stack-body"><table>
-          <thead><tr><th>Stack / container</th><th>Type</th><th class="hide-sm">Images</th>
+          <thead><tr><th>Stack / container</th><th class="hide-sm">Type</th><th class="hide-sm">Images</th>
           <th class="hide-sm">Updated</th><th></th></tr></thead>
           <tbody>${rows}</tbody></table></div>`;
       }
@@ -399,7 +406,7 @@
       $(".instance-header", section).addEventListener("click", (e) => {
         if (e.target.closest("button")) return;
         const id = inst.instance.id;
-        collapsed.has(id) ? collapsed.delete(id) : collapsed.add(id);
+        expanded.has(id) ? expanded.delete(id) : expanded.add(id);
         section.classList.toggle("collapsed");
       });
       root.appendChild(section);
