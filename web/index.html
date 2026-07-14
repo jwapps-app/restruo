@@ -129,6 +129,9 @@
   #modal h3 { margin: 0 0 8px; font-size: 16px; }
   #modal p { margin: 0 0 18px; color: var(--muted); }
   #modal .actions { display: flex; gap: 10px; justify-content: flex-end; }
+  #modal-extra:not(:empty) { margin: -6px 0 18px; }
+  #modal-extra .chk { display: flex; gap: 8px; align-items: baseline; margin: 8px 0; font-size: 14px; }
+  #modal-extra .danger { color: var(--err); }
   @media (max-width: 640px) {
     th.hide-sm, td.hide-sm { display: none; }
     main { padding: 12px 10px 60px; }
@@ -189,6 +192,7 @@
   <div id="modal" role="dialog" aria-modal="true">
     <h3 id="modal-title"></h3>
     <p id="modal-text"></p>
+    <div id="modal-extra"></div>
     <div class="actions">
       <button id="modal-cancel">Cancel</button>
       <button id="modal-confirm" class="primary">Update</button>
@@ -344,6 +348,7 @@
           <span class="count">${inst.stacks.length} stack${inst.stacks.length === 1 ? "" : "s"}${ctrCount ? ` · ${ctrCount} container${ctrCount === 1 ? "" : "s"}` : ""}</span>
           ${instUpdCount ? `<span class="badge upd">⬆ ${instUpdCount} update${instUpdCount === 1 ? "" : "s"}</span>` : ""}
           ${badge}
+          ${inst.reachable ? `<button class="cleanup-btn" data-iid="${iid}" title="Remove unused images, networks, and optionally volumes">Clean up</button>` : ""}
           ${inst.reachable && (inst.stacks.length || ctrCount) ?
             `<button class="update-all-btn${instUpdCount ? " has-upd" : ""}" data-iid="${iid}">${instUpdCount ? "⬆ Update all" : "Update all"}</button>` : ""}
         </div>${body}`;
@@ -499,7 +504,64 @@
     }
   }
 
+  function fmtBytes(bytes) {
+    if (!bytes) return "0 B";
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    const i = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
+    return `${(bytes / 1024 ** i).toFixed(i ? 1 : 0)} ${units[i]}`;
+  }
+
+  async function runCleanup(btn, inst) {
+    $("#modal-extra").innerHTML = `
+      <label class="chk"><input type="checkbox" id="cl-images" checked>
+        <span>Unused images — anything no container uses, including old versions of updated images</span></label>
+      <label class="chk"><input type="checkbox" id="cl-networks" checked>
+        <span>Unused networks</span></label>
+      <label class="chk"><input type="checkbox" id="cl-volumes">
+        <span>Unused volumes — <span class="danger">permanently deletes the data</span> in volumes no container references</span></label>`;
+    const yes = await confirmModal(`Clean up “${inst.instance.name}”?`,
+      "Removes Docker leftovers. Running stacks and containers are never touched.",
+      { okText: "Clean up" });
+    const opts = yes && {
+      images: $("#cl-images").checked,
+      networks: $("#cl-networks").checked,
+      volumes: $("#cl-volumes").checked,
+    };
+    $("#modal-extra").innerHTML = "";
+    if (!opts || (!opts.images && !opts.networks && !opts.volumes)) return;
+
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>Cleaning…';
+    try {
+      const res = await fetch(`/api/instances/${inst.instance.id}/prune`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(opts),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
+      const parts = [];
+      if (opts.images) parts.push(`${body.images} image${body.images === 1 ? "" : "s"}`);
+      if (opts.networks) parts.push(`${body.networks} network${body.networks === 1 ? "" : "s"}`);
+      if (opts.volumes) parts.push(`${body.volumes} volume${body.volumes === 1 ? "" : "s"}`);
+      const summary = `Freed ${fmtBytes(body.spaceReclaimed)} — removed ${parts.join(", ")}.` +
+        (body.errors.length ? `\n\nProblems: ${body.errors.join("; ")}` : "");
+      await confirmModal(body.ok ? "Cleanup finished" : "Cleanup finished with errors",
+        summary, { okOnly: true, okText: "OK" });
+    } catch (err) {
+      await confirmModal("Cleanup failed", err.message, { okOnly: true, okText: "OK" });
+    }
+    btn.disabled = false;
+    btn.textContent = "Clean up";
+  }
+
   document.addEventListener("click", async (e) => {
+    const cleanupBtn = e.target.closest(".cleanup-btn");
+    if (cleanupBtn) {
+      const inst = data.find((i) => i.instance.id === Number(cleanupBtn.dataset.iid));
+      if (inst) runCleanup(cleanupBtn, inst);
+      return;
+    }
     const updateBtn = e.target.closest(".update-btn");
     if (updateBtn) {
       const { kind, name } = updateBtn.dataset;

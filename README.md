@@ -12,6 +12,8 @@ re-pull checkbox → deploy) across all your machines.
 - Instances are managed from a **settings page** in the dashboard — add a Portainer with
   either an **API token** or a **username/password**, test the connection, save.
 - Update-available badges for images tracking `:latest` (see below).
+- Per-instance **Clean up**: prune unused images (reclaims space from superseded
+  `:latest` pulls) and networks; optionally unused volumes (off by default — deletes data).
 - Single small container. Portainer stays the source of truth for stacks; restack only
   persists its instance list (a JSON file on the `/data` volume).
 
@@ -115,6 +117,8 @@ restack can tell you when a newer image is available for a stack:
 | POST   | `/api/instances/test`                         | Test a connection without saving         |
 | GET    | `/api/stacks`                                 | All stacks across all instances          |
 | POST   | `/api/instances/{iid}/stacks/{sid}/update`    | Repull + redeploy one stack              |
+| POST   | `/api/instances/{iid}/containers/{cid}/update` | Repull + recreate a standalone container |
+| POST   | `/api/instances/{iid}/prune`                  | Remove unused images/networks/volumes (body `{"images","networks","volumes"}`) |
 | POST   | `/api/update-all`                             | Update every stack (optional `{"instanceId": n}` filter) |
 | GET    | `/api/updates`                                | Cached update-check results              |
 | POST   | `/api/check-updates`                          | Run an update check now                  |

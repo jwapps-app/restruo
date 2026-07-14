@@ -129,6 +129,48 @@ async def test_recreate_container_uses_portainer_recreate_action():
     assert len(requests) == 1
 
 
+async def test_prune_images_removes_all_unused_not_just_dangling():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/api/endpoints/2/docker/images/prune"
+        assert json.loads(request.url.params["filters"]) == {"dangling": ["false"]}
+        return httpx.Response(200, json={"ImagesDeleted": [{}, {}], "SpaceReclaimed": 123})
+
+    client, _ = make_client(handler)
+    pruned = await client.prune_images(2)
+    await client.aclose()
+    assert pruned["SpaceReclaimed"] == 123
+
+
+async def test_prune_volumes_includes_named_with_fallback():
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/endpoints/2/docker/volumes/prune"
+        calls.append(request.url.params.get("filters"))
+        if request.url.params.get("filters"):
+            # Older engine: rejects the "all" filter.
+            return httpx.Response(400, json={"message": "invalid filter 'all'"})
+        return httpx.Response(200, json={"VolumesDeleted": ["v1"], "SpaceReclaimed": 55})
+
+    client, _ = make_client(handler)
+    pruned = await client.prune_volumes(2)
+    await client.aclose()
+    assert calls == ['{"all": ["true"]}', None]
+    assert pruned["VolumesDeleted"] == ["v1"]
+
+
+async def test_prune_networks():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/endpoints/2/docker/networks/prune"
+        return httpx.Response(200, json={"NetworksDeleted": ["a", "b"]})
+
+    client, _ = make_client(handler)
+    pruned = await client.prune_networks(2)
+    await client.aclose()
+    assert len(pruned["NetworksDeleted"]) == 2
+
+
 async def test_portainer_error_surfaces_message():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(403, json={"message": "access denied to resource"})

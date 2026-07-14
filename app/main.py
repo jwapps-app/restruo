@@ -368,6 +368,55 @@ async def update_container(request: Request, iid: int, cid: str):
     }
 
 
+class PruneRequest(BaseModel):
+    images: bool = True
+    networks: bool = True
+    volumes: bool = False
+
+
+@app.post("/api/instances/{iid}/prune", dependencies=[Depends(require_auth)])
+async def prune_instance(request: Request, iid: int, body: PruneRequest):
+    """Remove unused Docker leftovers on every environment of one instance."""
+    client = _get_client(request, iid)
+    summary = {
+        "ok": True, "spaceReclaimed": 0,
+        "images": 0, "networks": 0, "volumes": 0, "errors": [],
+    }
+    try:
+        endpoints = await client.list_endpoints()
+    except Exception as exc:
+        message = exc.message if isinstance(exc, PortainerError) else str(exc)
+        raise HTTPException(status_code=502, detail=f"Could not list environments: {message}")
+
+    def _msg(exc: Exception) -> str:
+        return exc.message if isinstance(exc, PortainerError) else str(exc)
+
+    for endpoint in endpoints:
+        endpoint_id = endpoint["Id"]
+        if body.images:
+            try:
+                pruned = await client.prune_images(endpoint_id)
+                summary["images"] += len(pruned.get("ImagesDeleted") or [])
+                summary["spaceReclaimed"] += pruned.get("SpaceReclaimed") or 0
+            except Exception as exc:
+                summary["errors"].append(f"images: {_msg(exc)}")
+        if body.networks:
+            try:
+                pruned = await client.prune_networks(endpoint_id)
+                summary["networks"] += len(pruned.get("NetworksDeleted") or [])
+            except Exception as exc:
+                summary["errors"].append(f"networks: {_msg(exc)}")
+        if body.volumes:
+            try:
+                pruned = await client.prune_volumes(endpoint_id)
+                summary["volumes"] += len(pruned.get("VolumesDeleted") or [])
+                summary["spaceReclaimed"] += pruned.get("SpaceReclaimed") or 0
+            except Exception as exc:
+                summary["errors"].append(f"volumes: {_msg(exc)}")
+    summary["ok"] = not summary["errors"]
+    return summary
+
+
 class UpdateAllRequest(BaseModel):
     instanceId: int | None = None
 

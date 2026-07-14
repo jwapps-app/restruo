@@ -10,6 +10,7 @@ Secrets are never logged.
 """
 
 import asyncio
+import json
 import re
 
 import httpx
@@ -168,6 +169,51 @@ class PortainerClient:
             "GET", f"/api/endpoints/{endpoint_id}/docker/images/{image}/json"
         )
         self._check(response)
+        return response.json()
+
+    async def prune_images(self, endpoint_id: int) -> dict:
+        """Remove ALL unused images (dangling=false), not just untagged layers —
+        this is what reclaims space from superseded :latest pulls."""
+        response = await self._request(
+            "POST",
+            f"/api/endpoints/{endpoint_id}/docker/images/prune",
+            params={"filters": json.dumps({"dangling": ["false"]})},
+            timeout=REDEPLOY_TIMEOUT,
+        )
+        self._check(response)
+        return response.json()
+
+    async def prune_networks(self, endpoint_id: int) -> dict:
+        response = await self._request(
+            "POST",
+            f"/api/endpoints/{endpoint_id}/docker/networks/prune",
+            timeout=REDEPLOY_TIMEOUT,
+        )
+        self._check(response)
+        return response.json()
+
+    async def prune_volumes(self, endpoint_id: int) -> dict:
+        """Remove ALL volumes no container references — named ones included.
+        Destructive by nature; callers must gate this behind explicit consent.
+        Older engines reject the all filter, where the default prune (anonymous
+        volumes only) is the best available."""
+        try:
+            response = await self._request(
+                "POST",
+                f"/api/endpoints/{endpoint_id}/docker/volumes/prune",
+                params={"filters": json.dumps({"all": ["true"]})},
+                timeout=REDEPLOY_TIMEOUT,
+            )
+            self._check(response)
+        except PortainerError as exc:
+            if exc.status_code != 400:
+                raise
+            response = await self._request(
+                "POST",
+                f"/api/endpoints/{endpoint_id}/docker/volumes/prune",
+                timeout=REDEPLOY_TIMEOUT,
+            )
+            self._check(response)
         return response.json()
 
     async def recreate_container(self, endpoint_id: int, container_id: int | str) -> dict:
