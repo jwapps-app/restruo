@@ -271,7 +271,7 @@
 
   function imgLine(img) {
     if (img.status === "update-available")
-      return `<span class="img-line upd" title="A newer image is available from the registry">⬆ ${esc(img.image)} <span class="img-note">new version</span></span>`;
+      return `<span class="img-line upd" title="${esc(img.detail || "A newer image is available from the registry")}">⬆ ${esc(img.image)} <span class="img-note">new version</span></span>`;
     if (img.status === "pinned")
       return `<span class="img-line" title="Pinned to a specific version — not checked">${esc(img.image)} <span class="img-note">pinned</span></span>`;
     if (img.status === "up-to-date")

@@ -118,8 +118,15 @@ class UpdateChecker:
             # Locally built image with no repo digest — nothing to compare.
             return {"image": raw, "status": STATUS_UNKNOWN, "detail": "no local repo digest"}
 
-        status = STATUS_UP_TO_DATE if remote_digest in local_digests else STATUS_UPDATE_AVAILABLE
-        return {"image": raw, "status": status}
+        if remote_digest in local_digests:
+            return {"image": raw, "status": STATUS_UP_TO_DATE}
+        # Show both digests so a stuck badge is diagnosable from the tooltip.
+        local_short = ", ".join(sorted(d.removeprefix("sha256:")[:12] for d in local_digests))
+        return {
+            "image": raw,
+            "status": STATUS_UPDATE_AVAILABLE,
+            "detail": f"running {local_short} · registry {remote_digest.removeprefix('sha256:')[:12]}",
+        }
 
     @staticmethod
     def _stack_containers(stack: dict, containers: list[dict]) -> list[dict]:
