@@ -64,6 +64,11 @@
     background: var(--accent); border-color: var(--accent);
     color: var(--accent-text); font-weight: 600;
   }
+  .guard-note {
+    background: none; border: none; color: var(--muted); font-size: 13px;
+    text-decoration: underline; text-underline-offset: 3px;
+    padding: 7px 4px; cursor: help;
+  }
   .count { color: var(--muted); font-size: 13px; }
   .img-line { display: block; }
   .img-line.upd { color: var(--accent); font-weight: 600; }
@@ -324,10 +329,10 @@
             <td class="images hide-sm">${imagesCell}</td>
             <td class="when hide-sm">${esc(c.state)}</td>
             <td>
-              <button class="update-btn${hasUpd && !isPortainer ? " has-upd" : ""}" data-kind="container"
-                ${isPortainer ? 'data-guard="portainer"' : ""}
-                data-iid="${iid}" data-cid="${esc(c.id)}" data-name="${esc(c.name)}"
-                ${isPortainer ? 'title="Portainer must be updated from the host"' : ""}>${hasUpd && !isPortainer ? "⬆ Update" : "Update"}</button>
+              ${isPortainer
+                ? '<button class="guard-note" data-guard="portainer" title="Portainer can\'t update itself — click for the host-side steps">host update only</button>'
+                : `<button class="update-btn${hasUpd ? " has-upd" : ""}" data-kind="container"
+                data-iid="${iid}" data-cid="${esc(c.id)}" data-name="${esc(c.name)}">${hasUpd ? "⬆ Update" : "Update"}</button>`}
               <span class="result-msg" id="msg-${iid}-${esc(c.id)}"></span>
             </td>
           </tr>`;
@@ -587,14 +592,15 @@
       if (inst) runCleanup(cleanupBtn, inst);
       return;
     }
+    const guardNote = e.target.closest("[data-guard]");
+    if (guardNote) {
+      await confirmModal("Portainer can't update itself",
+        "Portainer dies the moment it stops its own container, so a one-click update can never finish and leaves Portainer stopped. Update it from the host instead (SSH or your NAS's container manager): stop and remove the container, then run the new image with the same volumes — see the README for the exact steps.",
+        { okOnly: true, okText: "OK" });
+      return;
+    }
     const updateBtn = e.target.closest(".update-btn");
     if (updateBtn) {
-      if (updateBtn.dataset.guard === "portainer") {
-        await confirmModal("Portainer can't update itself",
-          "Portainer dies the moment it stops its own container, so a one-click update can never finish and leaves Portainer stopped. Update it from the host instead (SSH or your NAS's container manager): stop and remove the container, then run the new image with the same volumes — see the README for the exact steps.",
-          { okOnly: true, okText: "OK" });
-        return;
-      }
       const { kind, iid, sid, cid, name } = updateBtn.dataset;
       let text = kind === "container"
         ? "This pulls the image fresh and recreates the container with its existing configuration."
