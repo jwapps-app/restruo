@@ -795,7 +795,8 @@
   fetch("/api/ui-config").then((r) => r.ok ? r.json() : null).then((cfg) => {
     if (cfg && cfg.title) {
       document.title = cfg.title;
-      $("#title").innerHTML = `${esc(cfg.title)} <span>Portainer stack updater</span>`;
+      const ver = cfg.version && cfg.version !== "dev" ? cfg.version.slice(0, 7) : cfg.version || "";
+      $("#title").innerHTML = `${esc(cfg.title)} <span title="Running build ${esc(cfg.version || "")}">Portainer stack updater${ver ? " · " + esc(ver) : ""}</span>`;
     }
   }).catch(() => {});
 

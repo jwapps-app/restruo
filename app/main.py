@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 import secrets
 import time
 from contextlib import asynccontextmanager
@@ -478,7 +479,10 @@ async def check_updates(request: Request):
 
 @app.get("/api/ui-config", dependencies=[Depends(require_auth)])
 async def ui_config(request: Request):
-    return {"title": request.app.state.config.ui.title}
+    return {
+        "title": request.app.state.config.ui.title,
+        "version": os.environ.get("RESTACK_VERSION", "dev"),
+    }
 
 
 @app.get("/icon.svg")
@@ -488,4 +492,5 @@ async def icon():
 
 @app.get("/", dependencies=[Depends(require_auth)])
 async def index():
-    return FileResponse(WEB_DIR / "index.html")
+    # no-cache = revalidate on every load, so the UI can't go stale after an update.
+    return FileResponse(WEB_DIR / "index.html", headers={"Cache-Control": "no-cache"})
