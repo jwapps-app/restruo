@@ -92,6 +92,28 @@ restack can tell you when a newer image is available for a stack:
   are also written to the container log. The notifier layer is pluggable, so additional
   paths (ntfy, webhooks, …) can be added later.
 
+## Updating Portainer itself
+
+restack deliberately refuses to update a `portainer/portainer-*` container: Portainer
+dies the instant it stops its own container, so an API-driven recreate can never finish —
+it leaves Portainer stopped with the new image pulled but unused. (If that ever happens:
+nothing else is harmed; just start the stopped Portainer container again from the host.)
+
+Upgrade Portainer from the host instead:
+
+```sh
+docker pull portainer/portainer-ce:latest
+docker stop portainer && docker rm portainer
+docker run -d --name portainer --restart=always \
+  -p 8000:8000 -p 9443:9443 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v portainer_data:/data \
+  portainer/portainer-ce:latest
+```
+
+(Match the ports/volumes to your original setup — check with `docker inspect portainer`
+first. Portainer's config lives in its data volume and survives the recreate.)
+
 ## Security notes
 
 - **Credentials are powerful** — an API token or password can do anything that Portainer

@@ -313,6 +313,7 @@
         const ctrRows = ctrs.map((c) => {
           const cInfo = updateInfoForCtr(iid, c.id);
           const hasUpd = !!(cInfo && cInfo.status === "update-available");
+          const isPortainer = c.image.includes("portainer/portainer");
           const imagesCell = cInfo
             ? imgLine({ image: c.image, status: cInfo.status, detail: cInfo.detail })
             : esc(c.image);
@@ -323,8 +324,10 @@
             <td class="images hide-sm">${imagesCell}</td>
             <td class="when hide-sm">${esc(c.state)}</td>
             <td>
-              <button class="update-btn${hasUpd ? " has-upd" : ""}" data-kind="container"
-                data-iid="${iid}" data-cid="${esc(c.id)}" data-name="${esc(c.name)}">${hasUpd ? "⬆ Update" : "Update"}</button>
+              <button class="update-btn${hasUpd && !isPortainer ? " has-upd" : ""}" data-kind="container"
+                ${isPortainer ? 'data-guard="portainer"' : ""}
+                data-iid="${iid}" data-cid="${esc(c.id)}" data-name="${esc(c.name)}"
+                ${isPortainer ? 'title="Portainer must be updated from the host"' : ""}>${hasUpd && !isPortainer ? "⬆ Update" : "Update"}</button>
               <span class="result-msg" id="msg-${iid}-${esc(c.id)}"></span>
             </td>
           </tr>`;
@@ -497,11 +500,33 @@
       setTimeout(() => { btn.disabled = false; btn.textContent = idleLabel(); }, 4000);
       return ok;
     } catch (err) {
+      if (err instanceof TypeError) {
+        // The connection to restack died mid-update — the usual cause is
+        // restack redeploying itself. Wait for it to come back, then reload.
+        btn.innerHTML = '<span class="spinner"></span>Reconnecting…';
+        if (msg) {
+          msg.textContent = "Connection lost — if this was restack itself, it's restarting. Waiting for it to come back…";
+          msg.className = "result-msg";
+        }
+        if (await waitForBackend(180)) { location.reload(); return true; }
+      }
       btn.innerHTML = "❌ Failed";
       if (msg) { msg.textContent = err.message; msg.className = "result-msg err"; }
       setTimeout(() => { btn.disabled = false; btn.textContent = idleLabel(); }, 4000);
       return false;
     }
+  }
+
+  async function waitForBackend(seconds) {
+    const deadline = Date.now() + seconds * 1000;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 3000));
+      try {
+        const res = await fetch("/healthz", { cache: "no-store" });
+        if (res.ok) return true;
+      } catch (err) { /* still down — keep waiting */ }
+    }
+    return false;
   }
 
   function fmtBytes(bytes) {
@@ -564,10 +589,22 @@
     }
     const updateBtn = e.target.closest(".update-btn");
     if (updateBtn) {
-      const { kind, name } = updateBtn.dataset;
-      const text = kind === "container"
+      if (updateBtn.dataset.guard === "portainer") {
+        await confirmModal("Portainer can't update itself",
+          "Portainer dies the moment it stops its own container, so a one-click update can never finish and leaves Portainer stopped. Update it from the host instead (SSH or your NAS's container manager): stop and remove the container, then run the new image with the same volumes — see the README for the exact steps.",
+          { okOnly: true, okText: "OK" });
+        return;
+      }
+      const { kind, iid, sid, cid, name } = updateBtn.dataset;
+      let text = kind === "container"
         ? "This pulls the image fresh and recreates the container with its existing configuration."
         : "This repulls the image(s) and redeploys the stack. Containers will restart.";
+      const inst = data.find((i) => i.instance.id === Number(iid));
+      const images = kind === "container"
+        ? [inst?.containers?.find((c) => c.id === cid)?.image || ""]
+        : inst?.stacks?.find((s) => s.id === Number(sid))?.images || [];
+      if (images.some((i) => i.toLowerCase().includes("restack")))
+        text += " This looks like restack itself — the page will disconnect while it restarts, then reload automatically.";
       const yes = await confirmModal(`Update “${name}”?`, text);
       if (yes) runUpdate(updateBtn);
       return;

@@ -346,6 +346,14 @@ async def update_container(request: Request, iid: int, cid: str):
         if target is None:
             raise HTTPException(status_code=404, detail=f"No container {cid[:12]} on this instance")
         endpoint_id, container = target
+        if "portainer/portainer" in (container.get("Image") or ""):
+            # Portainer dies the moment it stops itself, before the replacement
+            # is created — the recreate can never complete. Refuse.
+            raise HTTPException(
+                status_code=400,
+                detail="Portainer can't recreate itself through its own API — "
+                       "update the Portainer container from the host instead.",
+            )
         await client.recreate_container(endpoint_id, cid)
         request.app.state.checker.mark_updated(iid, container_id=cid)
     except HTTPException:
