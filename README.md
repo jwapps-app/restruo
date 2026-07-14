@@ -1,6 +1,6 @@
-<img src="web/icon.svg" alt="restack icon" width="72" align="left" style="margin-right: 12px">
+<img src="web/icon.svg" alt="Restruo icon" width="72" align="left" style="margin-right: 12px">
 
-# restack
+# Restruo
 
 One dashboard for multiple Portainer instances, with a one-click **repull + redeploy**
 button per stack. Replaces the manual per-stack flow (login → stack → editor → update →
@@ -14,7 +14,7 @@ re-pull checkbox → deploy) across all your machines.
 - Update-available badges for images tracking `:latest` (see below).
 - Per-instance **Clean up**: prune unused images (reclaims space from superseded
   `:latest` pulls) and networks; optionally unused volumes (off by default — deletes data).
-- Single small container. Portainer stays the source of truth for stacks; restack only
+- Single small container. Portainer stays the source of truth for stacks; Restruo only
   persists its instance list (a JSON file on the `/data` volume).
 
 Built and tested against Portainer 2.x (API paths and field casing verified July 2026).
@@ -30,12 +30,12 @@ environment variable in the stack environment:
 | Variable | Required | Default | Purpose |
 |----------|----------|---------|---------|
 | `DASHBOARD_PASSWORD` | yes | — | Dashboard login password |
-| `RESTACK_USERNAME` | no | `admin` | Dashboard login username |
-| `RESTACK_TITLE` | no | `restack` | Dashboard title |
-| `RESTACK_PORT` | no | `8080` | Host port |
+| `RESTRUO_USERNAME` | no | `admin` | Dashboard login username |
+| `RESTRUO_TITLE` | no | `Restruo` | Dashboard title |
+| `RESTRUO_PORT` | no | `8080` | Host port |
 
 Instance data (the Portainers you add, including their credentials) lives in the
-`restack-data` named volume. A YAML config file is entirely optional — mount one at
+`restruo-data` named volume. A YAML config file is entirely optional — mount one at
 `/config/config.yaml` only if you want to change update-check intervals, disable auth,
 or pre-seed instances (see `config.example.yaml`).
 
@@ -44,7 +44,7 @@ or pre-seed instances (see `config.example.yaml`).
 Open `http://<host>:8080`, log in, and click **⚙ Instances**. For each Portainer, enter
 its URL and pick an auth method:
 
-- **Username & password** — easiest: the same login you use in the Portainer UI. restack
+- **Username & password** — easiest: the same login you use in the Portainer UI. Restruo
   exchanges it for a session token and re-authenticates automatically when it expires.
   Doesn't work for accounts that sign in via OAuth/SSO.
 - **API token** — create one in that Portainer under **My account → Access tokens**.
@@ -58,12 +58,12 @@ Instances persist in `/data/instances.json` (mounted volume), so they survive co
 updates. A `config.yaml` `instances:` block is also supported as a one-time seed —
 imported on first start, then the settings page takes over.
 
-To run restack *as a Portainer stack* (it can then update itself), paste
+To run Restruo *as a Portainer stack* (it can then update itself), paste
 `docker-compose.yml` into a new stack and mount `config.yaml` and a data volume.
 
 ## How an update works
 
-For each stack, restack does exactly what the UI checkbox flow does:
+For each stack, Restruo does exactly what the UI checkbox flow does:
 
 - **Git-based stack** (has `GitConfig`): `PUT /api/stacks/{id}/git/redeploy` with
   `RepullImageAndRedeploy: true`.
@@ -76,7 +76,7 @@ Portainer performs a rolling service update for those — they're labelled `swar
 
 ## Update notifications
 
-restack can tell you when a newer image is available for a stack:
+Restruo can tell you when a newer image is available for a stack:
 
 - Only images that **track `:latest`** (or have no tag, which Docker treats as `latest`)
   are checked. Anything pinned to a version (`mariadb:11`, `img@sha256:…`) is shown as
@@ -94,7 +94,7 @@ restack can tell you when a newer image is available for a stack:
 
 ## Updating Portainer itself
 
-restack deliberately refuses to update a `portainer/portainer-*` container: Portainer
+Restruo deliberately refuses to update a `portainer/portainer-*` container: Portainer
 dies the instant it stops its own container, so an API-driven recreate can never finish —
 it leaves Portainer stopped with the new image pulled but unused. (If that ever happens:
 nothing else is harmed; just start the stopped Portainer container again from the host.)
@@ -121,7 +121,7 @@ first. Portainer's config lives in its data volume and survives the recreate.)
   back to the browser or logged. Protect the `/data` volume accordingly.
 - **Keep dashboard auth on.** Without it, anyone who can reach port 8080 can redeploy
   your stacks.
-- **LAN only.** Don't expose restack to the internet; if you need remote access, put it
+- **LAN only.** Don't expose Restruo to the internet; if you need remote access, put it
   behind a VPN/Tailscale or an authenticated reverse proxy.
 - Rotate tokens periodically. Pass the dashboard password via env var or secret, not in
   the YAML.
@@ -165,4 +165,4 @@ CONFIG_PATH=config.yaml .venv/bin/uvicorn app.main:app --reload --port 8080
 - **Portainer Agent consolidation** — add the other machines as environments in one
   Portainer; changes your topology and still no bulk one-click repull.
 
-None provide a multi-instance dashboard with a manual repull+redeploy button — hence restack.
+None provide a multi-instance dashboard with a manual repull+redeploy button — hence Restruo.

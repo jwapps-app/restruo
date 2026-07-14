@@ -7,8 +7,8 @@ from app.config import load_config
 
 def test_defaults_without_config_file(tmp_path, monkeypatch):
     monkeypatch.setenv("DASHBOARD_PASSWORD", "pw")
-    monkeypatch.setenv("RESTACK_USERNAME", "john")
-    monkeypatch.setenv("RESTACK_TITLE", "homelab")
+    monkeypatch.setenv("RESTRUO_USERNAME", "john")
+    monkeypatch.setenv("RESTRUO_TITLE", "homelab")
     config = load_config(str(tmp_path / "missing.yaml"))
     assert config.instances == []
     assert config.ui.auth.enabled is True

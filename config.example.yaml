@@ -1,6 +1,6 @@
-# restack configuration — ENTIRELY OPTIONAL.
-# Without a config file, defaults apply: auth enabled (RESTACK_USERNAME/"admin" +
-# DASHBOARD_PASSWORD), title from RESTACK_TITLE, update checks every 6h.
+# Restruo configuration — ENTIRELY OPTIONAL.
+# Without a config file, defaults apply: auth enabled (RESTRUO_USERNAME/"admin" +
+# DASHBOARD_PASSWORD), title from RESTRUO_TITLE, update checks every 6h.
 # Mount a copy at /config/config.yaml only to override those.
 #
 # Portainer instances are managed from the dashboard's "⚙ Instances" settings
@@ -22,7 +22,7 @@ updates:
   interval_hours: 6
 
 ui:
-  title: "restack"
+  title: "Restruo"
   auth:
     enabled: true
     username: "admin"

@@ -9,7 +9,7 @@ import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-logger = logging.getLogger("restack.updates")
+logger = logging.getLogger("restruo.updates")
 
 
 @dataclass(frozen=True)

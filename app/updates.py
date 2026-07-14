@@ -18,7 +18,7 @@ from .portainer import (
 )
 from .registry import RegistryClient, parse_image_ref
 
-logger = logging.getLogger("restack.updates")
+logger = logging.getLogger("restruo.updates")
 
 STATUS_UPDATE_AVAILABLE = "update-available"
 STATUS_UP_TO_DATE = "up-to-date"

@@ -27,5 +27,5 @@ jobs:
           build-args: |
             GIT_SHA=${{ github.sha }}
           tags: |
-            ghcr.io/jwapps-app/restack:latest
-            ghcr.io/jwapps-app/restack:${{ github.sha }}
+            ghcr.io/jwapps-app/restruo:latest
+            ghcr.io/jwapps-app/restruo:${{ github.sha }}

@@ -9,7 +9,7 @@ COPY app/ ./app/
 COPY web/ ./web/
 
 ARG GIT_SHA=dev
-ENV RESTACK_VERSION=$GIT_SHA
+ENV RESTRUO_VERSION=$GIT_SHA
 
 EXPOSE 8080
 ENV CONFIG_PATH=/config/config.yaml

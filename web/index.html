@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>restack</title>
+<title>Restruo</title>
 <link rel="icon" type="image/svg+xml" href="/icon.svg">
 <style>
   :root {
@@ -141,7 +141,7 @@
 <body>
 <header>
   <img src="/icon.svg" alt="" width="26" height="26" style="border-radius:6px">
-  <h1 id="title">restack <span>Portainer stack updater</span></h1>
+  <h1 id="title">Restruo <span>Portainer stack updater</span></h1>
   <input id="search" type="search" placeholder="Filter stacks…">
   <button id="check-updates">Check updates</button>
   <button id="settings-btn" title="Manage Portainer instances">⚙ Instances</button>
@@ -501,11 +501,11 @@
       return ok;
     } catch (err) {
       if (err instanceof TypeError) {
-        // The connection to restack died mid-update — the usual cause is
-        // restack redeploying itself. Wait for it to come back, then reload.
+        // The connection to Restruo died mid-update — the usual cause is
+        // Restruo redeploying itself. Wait for it to come back, then reload.
         btn.innerHTML = '<span class="spinner"></span>Reconnecting…';
         if (msg) {
-          msg.textContent = "Connection lost — if this was restack itself, it's restarting. Waiting for it to come back…";
+          msg.textContent = "Connection lost — if this was Restruo itself, it's restarting. Waiting for it to come back…";
           msg.className = "result-msg";
         }
         if (await waitForBackend(180)) { location.reload(); return true; }
@@ -603,8 +603,8 @@
       const images = kind === "container"
         ? [inst?.containers?.find((c) => c.id === cid)?.image || ""]
         : inst?.stacks?.find((s) => s.id === Number(sid))?.images || [];
-      if (images.some((i) => i.toLowerCase().includes("restack")))
-        text += " This looks like restack itself — the page will disconnect while it restarts, then reload automatically.";
+      if (images.some((i) => /restruo|restack/.test(i.toLowerCase())))
+        text += " This looks like Restruo itself — the page will disconnect while it restarts, then reload automatically.";
       const yes = await confirmModal(`Update “${name}”?`, text);
       if (yes) runUpdate(updateBtn);
       return;
@@ -723,7 +723,7 @@
       list.querySelectorAll(".inst-del").forEach((btn) =>
         btn.addEventListener("click", async () => {
           const yes = await confirmModal(`Delete “${btn.dataset.name}”?`,
-            "restack will forget this Portainer instance and its credentials. Nothing on the machine itself is touched.");
+            "Restruo will forget this Portainer instance and its credentials. Nothing on the machine itself is touched.");
           if (!yes) return;
           const res = await fetch(`/api/instances/${btn.dataset.id}`, { method: "DELETE" });
           if (res.ok && editingId === Number(btn.dataset.id)) fillForm(null);

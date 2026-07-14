@@ -1,8 +1,8 @@
-"""Configuration loading for restack.
+"""Configuration loading for Restruo.
 
 The YAML config file is OPTIONAL. Without one, sensible defaults apply: auth
-enabled (username RESTACK_USERNAME or "admin", password from
-DASHBOARD_PASSWORD), title from RESTACK_TITLE, update checks every 6 hours.
+enabled (username RESTRUO_USERNAME or "admin", password from
+DASHBOARD_PASSWORD), title from RESTRUO_TITLE, update checks every 6 hours.
 A file at /config/config.yaml (override with CONFIG_PATH) overrides those.
 Passwords are never stored in the file — the config names an environment
 variable and the value is read from the process env.
@@ -29,7 +29,7 @@ class InstanceConfig(BaseModel):
 
 class AuthConfig(BaseModel):
     enabled: bool = True
-    username: str = Field(default_factory=lambda: os.environ.get("RESTACK_USERNAME", "admin"))
+    username: str = Field(default_factory=lambda: os.environ.get("RESTRUO_USERNAME", "admin"))
     password_env: str = "DASHBOARD_PASSWORD"
 
     @property
@@ -38,7 +38,7 @@ class AuthConfig(BaseModel):
 
 
 class UIConfig(BaseModel):
-    title: str = Field(default_factory=lambda: os.environ.get("RESTACK_TITLE", "restack"))
+    title: str = Field(default_factory=lambda: os.environ.get("RESTRUO_TITLE", "Restruo"))
     auth: AuthConfig = Field(default_factory=AuthConfig)
 
 

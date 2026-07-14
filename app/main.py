@@ -1,4 +1,4 @@
-"""restack — multi-instance Portainer stack updater dashboard."""
+"""Restruo — multi-instance Portainer stack updater dashboard."""
 
 import asyncio
 import logging
@@ -27,7 +27,7 @@ from .portainer import (
 from .registry import RegistryClient
 from .updates import UpdateChecker
 
-logger = logging.getLogger("restack")
+logger = logging.getLogger("restruo")
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
@@ -77,7 +77,7 @@ async def lifespan(app: FastAPI):
     await app.state.registry.aclose()
 
 
-app = FastAPI(title="restack", lifespan=lifespan)
+app = FastAPI(title="Restruo", lifespan=lifespan)
 
 _basic = HTTPBasic(auto_error=False)
 
@@ -95,7 +95,7 @@ def require_auth(request: Request, credentials: HTTPBasicCredentials | None = De
         raise HTTPException(
             status_code=401,
             detail="Unauthorized",
-            headers={"WWW-Authenticate": 'Basic realm="restack"'},
+            headers={"WWW-Authenticate": 'Basic realm="Restruo"'},
         )
 
 
@@ -481,7 +481,7 @@ async def check_updates(request: Request):
 async def ui_config(request: Request):
     return {
         "title": request.app.state.config.ui.title,
-        "version": os.environ.get("RESTACK_VERSION", "dev"),
+        "version": os.environ.get("RESTRUO_VERSION", "dev"),
     }
 
 

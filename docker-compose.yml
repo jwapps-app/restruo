@@ -1,21 +1,21 @@
 services:
-  restack:
+  restruo:
     build: .
-    # image: ghcr.io/jwapps-app/restack:latest   # once a prebuilt image is published
-    container_name: restack
+    # image: ghcr.io/jwapps-app/restruo:latest   # once a prebuilt image is published
+    container_name: restruo
     ports:
-      - "${RESTACK_PORT:-8080}:8080"
+      - "${RESTRUO_PORT:-8080}:8080"
     volumes:
       # Named volume holds the instance list added via the settings UI.
       # Swap for a bind mount (/some/host/path:/data) if you want it on a share.
-      - restack-data:/data
+      - restruo-data:/data
       # Optional: mount a config file to override defaults (see config.example.yaml)
-      # - /volume1/docker/restack/config.yaml:/config/config.yaml:ro
+      # - /volume1/docker/restruo/config.yaml:/config/config.yaml:ro
     environment:
       - DASHBOARD_PASSWORD=${DASHBOARD_PASSWORD:?set DASHBOARD_PASSWORD in the stack environment}
-      # - RESTACK_USERNAME=admin
-      # - RESTACK_TITLE=restack
+      # - RESTRUO_USERNAME=admin
+      # - RESTRUO_TITLE=Restruo
     restart: unless-stopped
 
 volumes:
-  restack-data:
+  restruo-data:
