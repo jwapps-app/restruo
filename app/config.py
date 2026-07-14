@@ -42,9 +42,18 @@ class UIConfig(BaseModel):
     auth: AuthConfig = Field(default_factory=AuthConfig)
 
 
+def _floating_tags_default() -> list[str]:
+    raw = os.environ.get("RESTRUO_FLOATING_TAGS", "latest")
+    return [tag.strip() for tag in raw.split(",") if tag.strip()]
+
+
 class UpdatesConfig(BaseModel):
     enabled: bool = True
     interval_hours: float = Field(default=6, gt=0)
+    # Tags treated as "floating" (checked against the registry). Anything else
+    # is considered pinned. Some projects use rolling tags besides latest,
+    # e.g. immich's :release.
+    floating_tags: list[str] = Field(default_factory=_floating_tags_default)
 
 
 class AppConfig(BaseModel):

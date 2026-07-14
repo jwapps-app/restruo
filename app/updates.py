@@ -34,10 +34,12 @@ class UpdateChecker:
         registry: RegistryClient,
         interval_hours: float,
         notifiers: list[Notifier] | None = None,
+        floating_tags: tuple[str, ...] | list[str] = ("latest",),
     ):
         # get_clients: callable returning [(instance_id, PortainerClient), ...],
         # so the checker always sees the current set of managed instances.
         self.get_clients = get_clients
+        self.floating_tags = set(floating_tags)
         self.registry = registry
         self.interval_hours = interval_hours
         self.notifiers = notifiers or []
@@ -93,7 +95,7 @@ class UpdateChecker:
         if ref is None:
             return {"image": raw, "status": STATUS_UNKNOWN,
                     "detail": "image reference uses variables or is unparseable"}
-        if not ref.tracks_latest:
+        if ref.pinned_digest or ref.tag not in self.floating_tags:
             return {"image": raw, "status": STATUS_PINNED}
 
         try:

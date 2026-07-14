@@ -222,6 +222,46 @@ async def test_compares_running_container_not_local_tag():
     await registry.aclose()
 
 
+async def test_floating_tags_extend_the_checked_set():
+    release_yaml = "services:\n  app:\n    image: registry.test/acme/web:release\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/stacks":
+            return httpx.Response(200, json=[STACK])
+        if path == "/api/stacks/1/file":
+            return httpx.Response(200, json={"StackFileContent": release_yaml})
+        if path == "/api/endpoints":
+            return httpx.Response(200, json=[{"Id": 2}])
+        if path == "/api/endpoints/2/docker/containers/json":
+            return httpx.Response(200, json=[])
+        if path.startswith("/api/endpoints/2/docker/images/"):
+            return httpx.Response(
+                200, json={"RepoDigests": [f"registry.test/acme/web@{OLD_DIGEST}"]}
+            )
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    registry = RegistryClient(transport=registry_transport(NEW_DIGEST, require_token=False))
+
+    # Default rule: :release is treated as pinned.
+    p1 = PortainerClient(INSTANCE, transport=httpx.MockTransport(handler))
+    default_checker = UpdateChecker(lambda: [(0, p1)], registry, interval_hours=6)
+    snapshot = await default_checker.check_all()
+    assert snapshot["instances"][0]["stacks"][0]["images"][0]["status"] == "pinned"
+    await p1.aclose()
+
+    # With release in floating_tags it gets checked and flagged.
+    p2 = PortainerClient(INSTANCE, transport=httpx.MockTransport(handler))
+    wide_checker = UpdateChecker(
+        lambda: [(0, p2)], registry, interval_hours=6,
+        floating_tags=["latest", "release"],
+    )
+    snapshot = await wide_checker.check_all()
+    assert snapshot["instances"][0]["stacks"][0]["images"][0]["status"] == "update-available"
+    await p2.aclose()
+    await registry.aclose()
+
+
 async def test_mark_updated_clears_cached_flags():
     checker, snapshot, portainer, registry = await run_check(OLD_DIGEST, NEW_DIGEST)
     stack = snapshot["instances"][0]["stacks"][0]

@@ -68,6 +68,7 @@ async def lifespan(app: FastAPI):
         app.state.registry,
         interval_hours=config.updates.interval_hours,
         notifiers=build_notifiers(config),
+        floating_tags=config.updates.floating_tags,
     )
     checker_task = None
     if config.updates.enabled:

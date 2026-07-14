@@ -36,6 +36,7 @@ environment variable in the stack environment:
 | `RESTRUO_USERNAME` | no | `admin` | Dashboard login username |
 | `RESTRUO_TITLE` | no | `Restruo` | Dashboard title |
 | `RESTRUO_PORT` | no | `8080` | Host port |
+| `RESTRUO_FLOATING_TAGS` | no | `latest` | Comma-separated tags treated as floating for update checks (e.g. `latest,release` for immich) |
 
 Instance data (the Portainers you add, including their credentials) lives in the
 `restruo-data` named volume. A YAML config file is entirely optional — mount one at
@@ -81,9 +82,12 @@ Portainer performs a rolling service update for those — they're labelled `swar
 
 Restruo can tell you when a newer image is available for a stack:
 
-- Only images that **track `:latest`** (or have no tag, which Docker treats as `latest`)
-  are checked. Anything pinned to a version (`mariadb:11`, `img@sha256:…`) is shown as
-  **pinned** and deliberately not checked — pin a tag when you *don't* want update noise.
+- Only images on a **floating tag** are checked — by default just `:latest` (or no tag,
+  which Docker treats as `latest`). Anything else (`mariadb:11`, `img@sha256:…`) is shown
+  as **pinned** and deliberately not checked — pin a tag when you *don't* want update
+  noise. Some projects use other rolling tags (immich's `:release`, `stable`, …): add
+  them via `RESTRUO_FLOATING_TAGS=latest,release` or `updates.floating_tags` in the
+  config file.
 - The check compares the digest of the image the stack's containers are **actually
   running** (read via Portainer's Docker proxy) against the registry's current digest for
   the tag — nothing is downloaded. If no matching container is found it falls back to the
