@@ -91,40 +91,43 @@ class PortainerClient:
         if self._auth_type != "credentials":
             return await self._client.request(method, url, **kwargs)
 
+        # A Portainer restart invalidates the JWT, the CSRF token, AND the CSRF
+        # cookie at once, and they can only be re-established in sequence. Run
+        # the request as a self-healing loop: on each failure, reset whichever
+        # piece went stale and try again with the rest rebuilt.
         mutating = method.upper() not in ("GET", "HEAD", "OPTIONS")
-        if self._jwt is None:
-            async with self._auth_lock:
-                if self._jwt is None:
-                    await self._login()
-        if mutating and self._csrf is None:
-            async with self._auth_lock:
-                if self._csrf is None:
-                    await self._fetch_csrf()
+        response: httpx.Response | None = None
+        for _ in range(3):
+            if self._jwt is None:
+                async with self._auth_lock:
+                    if self._jwt is None:
+                        await self._login()
+            if mutating and self._csrf is None:
+                async with self._auth_lock:
+                    if self._csrf is None:
+                        await self._fetch_csrf()
 
-        headers = kwargs.setdefault("headers", {})
-        headers["Authorization"] = f"Bearer {self._jwt}"
-        if mutating:
-            if self._csrf:
-                headers["X-CSRF-Token"] = self._csrf
-            # Over HTTPS, Portainer's CSRF layer additionally requires a
-            # same-origin Referer ("Forbidden - referer not supplied").
-            headers["Referer"] = f"{self.instance.base_url}/"
-            headers["Origin"] = self.instance.base_url
-        response = await self._client.request(method, url, **kwargs)
-
-        if response.status_code == 401:
-            # Session JWT expired — log in again and retry once.
-            async with self._auth_lock:
-                await self._login()
+            headers = kwargs.setdefault("headers", {})
             headers["Authorization"] = f"Bearer {self._jwt}"
+            if mutating:
+                if self._csrf:
+                    headers["X-CSRF-Token"] = self._csrf
+                # Over HTTPS, Portainer's CSRF layer additionally requires a
+                # same-origin Referer ("Forbidden - referer not supplied").
+                headers["Referer"] = f"{self.instance.base_url}/"
+                headers["Origin"] = self.instance.base_url
             response = await self._client.request(method, url, **kwargs)
-        if self._is_csrf_error(response):
-            # Stale/missing CSRF token — refresh it and retry once.
-            async with self._auth_lock:
-                await self._fetch_csrf()
-            if self._csrf:
-                headers["X-CSRF-Token"] = self._csrf
-                response = await self._client.request(method, url, **kwargs)
+
+            if response.status_code == 401:
+                self._jwt = None  # expired session — re-login on next pass
+                continue
+            if self._is_csrf_error(response):
+                # Stale CSRF state — drop the token AND the cookie jar so the
+                # next pass starts a fresh CSRF handshake.
+                self._csrf = None
+                self._client.cookies.clear()
+                continue
+            return response
         return response
 
     @staticmethod

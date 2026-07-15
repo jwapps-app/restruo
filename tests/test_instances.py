@@ -149,16 +149,20 @@ def csrf_portainer_transport(state: dict) -> httpx.MockTransport:
     The current token is issued via a response header on GET /."""
     state.setdefault("csrf_fetches", 0)
     state.setdefault("valid_csrf", "csrf-1")
+    state.setdefault("logins", 0)
+    state.setdefault("valid_jwt", None)
 
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
         if path == "/api/auth":
-            return httpx.Response(200, json={"jwt": "jwt-1"})
+            state["logins"] += 1
+            state["valid_jwt"] = f"jwt-{state['logins']}"
+            return httpx.Response(200, json={"jwt": state["valid_jwt"]})
         if path == "/" and request.method == "GET":
             # The SPA page is public and issues the CSRF token via header.
             state["csrf_fetches"] += 1
             return httpx.Response(200, headers={"X-CSRF-Token": state["valid_csrf"]}, text="<html>")
-        if request.headers.get("Authorization") != "Bearer jwt-1":
+        if request.headers.get("Authorization") != f"Bearer {state['valid_jwt']}":
             return httpx.Response(401, json={"message": "unauthorized"})
         if request.method in ("PUT", "POST", "DELETE"):
             if request.headers.get("X-CSRF-Token") != state["valid_csrf"]:
@@ -192,4 +196,18 @@ async def test_credentials_refreshes_stale_csrf_token():
     state["valid_csrf"] = "csrf-2"  # server rotated the token
     await client.update_stack(GIT_STACK)  # 403 → re-fetch → retry succeeds
     assert state["csrf_fetches"] == 2
+    await client.aclose()
+
+
+async def test_credentials_recover_from_portainer_restart():
+    """A restart invalidates the JWT, CSRF token, and CSRF cookie at once —
+    the client must rebuild the whole session inside one request."""
+    state = {}
+    client = PortainerClient(CRED_INSTANCE, transport=csrf_portainer_transport(state))
+    await client.update_stack(GIT_STACK)
+
+    state["valid_jwt"] = "gone-after-restart"
+    state["valid_csrf"] = "csrf-after-restart"
+    await client.update_stack(GIT_STACK)  # must self-heal, not wedge
+    assert state["logins"] == 2
     await client.aclose()
