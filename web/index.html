@@ -225,7 +225,10 @@
         <p id="form-msg"></p>
       </form>
     </div>
-    <button id="settings-close">← Back to dashboard</button>
+    <div style="display:flex; gap:10px; align-items:center; justify-content:space-between;">
+      <button id="settings-close">← Back to dashboard</button>
+      <button id="signout-btn" style="display:none">Sign out</button>
+    </div>
   </div>
 </main>
 
@@ -865,11 +868,16 @@
   $("#f-cancel").addEventListener("click", () => fillForm(null));
   $("#settings-btn").addEventListener("click", () => showSettings(true));
   $("#settings-close").addEventListener("click", () => showSettings(false));
+  $("#signout-btn").addEventListener("click", async () => {
+    try { await fetch("/api/logout", { method: "POST" }); } catch (err) { /* cookie may already be gone */ }
+    showLogin(true);
+  });
 
   $("#refresh").addEventListener("click", () => { refresh(); backgroundCheck(); });
   $("#search").addEventListener("input", render);
 
   fetch("/api/ui-config").then((r) => r.ok ? r.json() : null).then((cfg) => {
+    if (cfg && cfg.authEnabled) $("#signout-btn").style.display = "";
     if (cfg && cfg.title) {
       document.title = cfg.title;
       $("#login-title").textContent = cfg.title;

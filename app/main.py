@@ -132,6 +132,13 @@ async def login(request: Request, body: LoginRequest):
     return response
 
 
+@app.post("/api/logout")
+async def logout():
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(SESSION_COOKIE)
+    return response
+
+
 def _manager(request: Request) -> ClientManager:
     return request.app.state.manager
 

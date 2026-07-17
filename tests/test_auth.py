@@ -55,6 +55,13 @@ def test_login_sets_session_cookie_that_authenticates(client):
     assert client.get("/api/updates").status_code == 200
 
 
+def test_logout_clears_the_session(client):
+    client.post("/api/login", json={"username": "admin", "password": "hunter2"})
+    assert client.get("/api/instances").status_code == 200
+    client.post("/api/logout")
+    assert client.get("/api/instances").status_code == 401
+
+
 def test_basic_auth_still_works_for_scripts(client):
     response = client.get("/api/instances", auth=("admin", "hunter2"))
     assert response.status_code == 200
