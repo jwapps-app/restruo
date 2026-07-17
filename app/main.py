@@ -119,6 +119,7 @@ class LoginRequest(BaseModel):
 async def login(request: Request, body: LoginRequest):
     auth = request.app.state.config.ui.auth
     if auth.enabled and not _credentials_valid(request, body.username, body.password):
+        await asyncio.sleep(1)  # blunt the speed of brute-force attempts
         raise HTTPException(status_code=401, detail="Wrong username or password.")
     response = JSONResponse({"ok": True})
     response.set_cookie(
@@ -343,16 +344,15 @@ async def _update_one(client: PortainerClient, stack: dict) -> dict:
 @app.post("/api/instances/{iid}/stacks/{sid}/update", dependencies=[Depends(require_auth)])
 async def update_stack(request: Request, iid: int, sid: int):
     client = _get_client(request, iid)
-    # Re-fetch the stack list so Env / EndpointId are current at redeploy time.
+    # Re-fetch the stack so Env / EndpointId are current at redeploy time.
     try:
-        stacks = await client.list_stacks()
+        stack = await client.get_stack(sid)
+    except PortainerError as exc:
+        if exc.status_code == 404:
+            raise HTTPException(status_code=404, detail=f"No stack with id {sid} on this instance")
+        raise HTTPException(status_code=502, detail=f"Could not fetch stack: {exc.message}")
     except Exception as exc:
-        message = exc.message if isinstance(exc, PortainerError) else str(exc)
-        raise HTTPException(status_code=502, detail=f"Could not list stacks: {message}")
-
-    stack = next((s for s in stacks if s.get("Id") == sid), None)
-    if stack is None:
-        raise HTTPException(status_code=404, detail=f"No stack with id {sid} on this instance")
+        raise HTTPException(status_code=502, detail=f"Could not fetch stack: {exc}")
 
     result = await _update_one(client, stack)
     if result["ok"]:
@@ -457,44 +457,6 @@ async def prune_instance(request: Request, iid: int, body: PruneRequest):
                 summary["errors"].append(f"volumes: {_msg(exc)}")
     summary["ok"] = not summary["errors"]
     return summary
-
-
-class UpdateAllRequest(BaseModel):
-    instanceId: int | None = None
-
-
-@app.post("/api/update-all", dependencies=[Depends(require_auth)])
-async def update_all(request: Request, body: UpdateAllRequest | None = None):
-    instance_filter = body.instanceId if body else None
-    if instance_filter is not None:
-        _get_client(request, instance_filter)  # 404 on bad id
-
-    async def run_instance(iid: int, client: PortainerClient) -> dict:
-        entry = {
-            "instance": {"id": iid, "name": client.instance.name},
-            "results": [],
-            "error": None,
-        }
-        try:
-            stacks = await client.list_stacks()
-        except Exception as exc:
-            entry["error"] = exc.message if isinstance(exc, PortainerError) else str(exc)
-            return entry
-        # Sequential within an instance to avoid hammering one Portainer with
-        # simultaneous redeploys; instances run in parallel.
-        for stack in stacks:
-            outcome = await _update_one(client, stack)
-            if outcome["ok"]:
-                request.app.state.checker.mark_updated(iid, stack_id=stack["Id"])
-            entry["results"].append(outcome)
-        return entry
-
-    targets = [
-        (iid, client)
-        for iid, client in _manager(request).items()
-        if instance_filter is None or iid == instance_filter
-    ]
-    return await asyncio.gather(*(run_instance(iid, client) for iid, client in targets))
 
 
 # --- updates & UI -------------------------------------------------------------

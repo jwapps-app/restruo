@@ -62,6 +62,9 @@ class InstanceStore:
         self._lock = asyncio.Lock()
         self._records: list[InstanceRecord] = []
         if self.path.is_file():
+            # The file holds Portainer credentials — keep it owner-only, and
+            # repair permissions on files written by older versions.
+            self.path.chmod(0o600)
             data = json.loads(self.path.read_text() or "[]")
             self._records = [InstanceRecord.model_validate(r) for r in data]
 
@@ -79,6 +82,7 @@ class InstanceStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps([r.model_dump() for r in self._records], indent=2))
+        tmp.chmod(0o600)  # holds Portainer credentials
         tmp.replace(self.path)
 
     def _next_id(self) -> int:

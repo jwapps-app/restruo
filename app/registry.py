@@ -40,11 +40,6 @@ class ImageRef:
     tag: str
     pinned_digest: bool
 
-    @property
-    def tracks_latest(self) -> bool:
-        """True when this image floats on :latest (or has no tag at all)."""
-        return self.tag == "latest" and not self.pinned_digest
-
 
 def parse_image_ref(raw: str) -> ImageRef | None:
     """Parse a compose `image:` value. Returns None for values we can't

@@ -1,0 +1,13 @@
+.git
+.github
+.venv
+tests
+__pycache__
+*.pyc
+.pytest_cache
+data
+config.yaml
+.env
+.gitignore
+.dockerignore
+portainer-stack-updater-spec.md

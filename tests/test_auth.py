@@ -6,12 +6,21 @@ from fastapi.testclient import TestClient
 from app.main import app
 
 
+def _reset_app_state():
+    # The lifespan reuses config/store from app.state when present (test
+    # injection hook) — clear them so each test gets its own tmp paths.
+    for attr in ("config", "store"):
+        if hasattr(app.state, attr):
+            delattr(app.state, attr)
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("DASHBOARD_PASSWORD", "hunter2")
     monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "missing.yaml"))  # defaults: auth on
     monkeypatch.setenv("DATA_PATH", str(tmp_path / "instances.json"))
     monkeypatch.setenv("RESTRUO_USERNAME", "admin")
+    _reset_app_state()
     with TestClient(app) as test_client:
         yield test_client
 
@@ -56,10 +65,22 @@ def test_tampered_session_cookie_is_rejected(client):
     assert client.get("/api/instances").status_code == 401
 
 
+def test_session_secret_is_owner_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "hunter2")
+    monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "missing.yaml"))
+    monkeypatch.setenv("DATA_PATH", str(tmp_path / "instances.json"))
+    _reset_app_state()
+    with TestClient(app):
+        pass
+    secret = tmp_path / "session_secret"
+    assert (secret.stat().st_mode & 0o777) == 0o600
+
+
 def test_sessions_survive_restart(tmp_path, monkeypatch):
     monkeypatch.setenv("DASHBOARD_PASSWORD", "hunter2")
     monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "missing.yaml"))
     monkeypatch.setenv("DATA_PATH", str(tmp_path / "instances.json"))
+    _reset_app_state()
     with TestClient(app) as first:
         token = first.post(
             "/api/login", json={"username": "admin", "password": "hunter2"}

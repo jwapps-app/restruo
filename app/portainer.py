@@ -150,6 +150,11 @@ class PortainerClient:
         self._check(response)
         return response.json()
 
+    async def get_stack(self, stack_id: int) -> dict:
+        response = await self._request("GET", f"/api/stacks/{stack_id}")
+        self._check(response)
+        return response.json()
+
     async def get_stack_file(self, stack_id: int) -> str:
         response = await self._request("GET", f"/api/stacks/{stack_id}/file")
         self._check(response)

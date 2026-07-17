@@ -52,6 +52,19 @@ async def test_store_crud_and_persistence(tmp_path):
     assert store.list() == []
 
 
+async def test_store_file_is_owner_only(tmp_path):
+    path = tmp_path / "instances.json"
+    store = InstanceStore(path)
+    await store.add({
+        "name": "A", "base_url": "https://a.test", "auth_type": "api_key", "api_key": "k",
+    })
+    assert (path.stat().st_mode & 0o777) == 0o600
+    # Pre-existing world-readable files get repaired on load.
+    path.chmod(0o644)
+    InstanceStore(path)
+    assert (path.stat().st_mode & 0o777) == 0o600
+
+
 async def test_store_validation_rejects_missing_secrets(tmp_path):
     store = InstanceStore(tmp_path / "instances.json")
     with pytest.raises(ValueError):

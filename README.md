@@ -149,7 +149,6 @@ first. Portainer's config lives in its data volume and survives the recreate.)
 | POST   | `/api/instances/{iid}/stacks/{sid}/update`    | Repull + redeploy one stack              |
 | POST   | `/api/instances/{iid}/containers/{cid}/update` | Repull + recreate a standalone container |
 | POST   | `/api/instances/{iid}/prune`                  | Remove unused images/networks/volumes (body `{"images","networks","volumes"}`) |
-| POST   | `/api/update-all`                             | Update every stack (optional `{"instanceId": n}` filter) |
 | GET    | `/api/updates`                                | Cached update-check results              |
 | POST   | `/api/check-updates`                          | Run an update check now                  |
 | GET    | `/healthz`                                    | Container liveness (no auth)             |

@@ -25,6 +25,7 @@ class SessionManager:
         else:
             self._secret = secrets.token_bytes(32)
             secret_path.write_bytes(self._secret)
+        secret_path.chmod(0o600)
 
     def _sign(self, expiry: str) -> str:
         return hmac.new(self._secret, expiry.encode(), hashlib.sha256).hexdigest()

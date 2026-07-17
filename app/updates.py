@@ -48,6 +48,26 @@ class UpdateChecker:
         self.checking = False
         self._lock = asyncio.Lock()
         self._notified: set[tuple] = set()
+        # Per-run memos (reset by check_all): the same image often appears in
+        # many stacks/instances — ask each registry and docker engine once.
+        self._remote_tasks: dict = {}
+        self._inspect_tasks: dict = {}
+
+    async def _remote_digest(self, ref) -> str:
+        key = (ref.registry, ref.repository, ref.tag)
+        task = self._remote_tasks.get(key)
+        if task is None:
+            task = asyncio.ensure_future(self.registry.get_remote_digest(ref))
+            self._remote_tasks[key] = task
+        return await task
+
+    async def _image_info(self, client: PortainerClient, endpoint_id: int, image: str) -> dict:
+        key = (id(client), endpoint_id, image)
+        task = self._inspect_tasks.get(key)
+        if task is None:
+            task = asyncio.ensure_future(client.get_image_info(endpoint_id, image))
+            self._inspect_tasks[key] = task
+        return await task
 
     def snapshot(self) -> dict:
         return {
@@ -82,7 +102,7 @@ class UpdateChecker:
         digests: set[str] = set()
         for image_id in image_ids:
             try:
-                info = await client.get_image_info(endpoint_id, image_id)
+                info = await self._image_info(client, endpoint_id, image_id)
                 digests |= {e.rpartition("@")[2] for e in info.get("RepoDigests") or []}
             except Exception:
                 pass
@@ -99,7 +119,7 @@ class UpdateChecker:
             return {"image": raw, "status": STATUS_PINNED}
 
         try:
-            remote_digest = await self.registry.get_remote_digest(ref)
+            remote_digest = await self._remote_digest(ref)
         except Exception as exc:
             return {"image": raw, "status": STATUS_UNKNOWN, "detail": f"registry: {exc}"}
 
@@ -107,7 +127,7 @@ class UpdateChecker:
         if local_digests is None:
             # No matching container found — fall back to what the tag points at.
             try:
-                info = await client.get_image_info(endpoint_id, raw)
+                info = await self._image_info(client, endpoint_id, raw)
                 local_digests = {
                     entry.rpartition("@")[2] for entry in info.get("RepoDigests") or []
                 }
@@ -152,17 +172,26 @@ class UpdateChecker:
             result["error"] = str(exc)
             return result
 
-        containers_by_endpoint: dict[int, list[dict]] = {}
+        container_tasks: dict[int, asyncio.Task] = {}
 
-        async def containers_for(endpoint_id: int) -> list[dict]:
-            if endpoint_id not in containers_by_endpoint:
-                try:
-                    containers_by_endpoint[endpoint_id] = await client.list_containers(endpoint_id)
-                except Exception:
-                    containers_by_endpoint[endpoint_id] = []
-            return containers_by_endpoint[endpoint_id]
+        def containers_for(endpoint_id: int) -> asyncio.Task:
+            if endpoint_id not in container_tasks:
+                async def fetch() -> list[dict]:
+                    try:
+                        return await client.list_containers(endpoint_id)
+                    except Exception:
+                        return []
+                container_tasks[endpoint_id] = asyncio.ensure_future(fetch())
+            return container_tasks[endpoint_id]
 
-        for stack in stacks:
+        # Be gentle with each Portainer: bounded concurrency per instance.
+        semaphore = asyncio.Semaphore(6)
+
+        async def check_image_bounded(endpoint_id: int, raw: str, containers: list[dict]) -> dict:
+            async with semaphore:
+                return await self._check_image(client, endpoint_id, raw, containers)
+
+        async def check_stack(stack: dict) -> dict:
             stack_containers = self._stack_containers(
                 stack, await containers_for(stack["EndpointId"])
             )
@@ -170,37 +199,45 @@ class UpdateChecker:
                 images = extract_images(await client.get_stack_file(stack["Id"]))
             except Exception:
                 images = []
-            checked = [
-                await self._check_image(client, stack["EndpointId"], raw, stack_containers)
-                for raw in images
-            ]
-            result["stacks"].append({
+            checked = list(await asyncio.gather(
+                *(check_image_bounded(stack["EndpointId"], raw, stack_containers)
+                  for raw in images)
+            ))
+            return {
                 "id": stack["Id"],
                 "name": stack.get("Name", ""),
                 "images": checked,
                 "updatesAvailable": sum(
                     1 for c in checked if c["status"] == STATUS_UPDATE_AVAILABLE
                 ),
-            })
+            }
+
+        result["stacks"] = list(await asyncio.gather(*(check_stack(s) for s in stacks)))
 
         # Containers that live outside any Portainer stack.
         stack_names = {s.get("Name") for s in stacks}
         try:
             endpoint_ids = [e["Id"] for e in await client.list_endpoints()]
         except Exception:
-            endpoint_ids = list(containers_by_endpoint)
+            endpoint_ids = list(container_tasks)
+
+        async def check_standalone(endpoint_id: int, raw_container: dict) -> dict:
+            normalized = normalize_container(raw_container, endpoint_id)
+            normalized["image"] = await resolve_image_name(
+                client, endpoint_id, raw_container
+            )
+            checked = await check_image_bounded(
+                endpoint_id, normalized["image"], [raw_container]
+            )
+            return {**normalized, **checked}
+
+        standalone_jobs = []
         for endpoint_id in endpoint_ids:
             for raw_container in standalone_containers(
                 await containers_for(endpoint_id), stack_names
             ):
-                normalized = normalize_container(raw_container, endpoint_id)
-                normalized["image"] = await resolve_image_name(
-                    client, endpoint_id, raw_container
-                )
-                checked = await self._check_image(
-                    client, endpoint_id, normalized["image"], [raw_container]
-                )
-                result["containers"].append({**normalized, **checked})
+                standalone_jobs.append(check_standalone(endpoint_id, raw_container))
+        result["containers"] = list(await asyncio.gather(*standalone_jobs))
         return result
 
     def mark_updated(
@@ -227,6 +264,8 @@ class UpdateChecker:
     async def check_all(self) -> dict:
         async with self._lock:
             self.checking = True
+            self._remote_tasks = {}
+            self._inspect_tasks = {}
             try:
                 self.results = list(
                     await asyncio.gather(

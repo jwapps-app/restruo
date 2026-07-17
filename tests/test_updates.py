@@ -21,29 +21,28 @@ NEW_DIGEST = "sha256:" + "b" * 64
 # --- parse_image_ref -------------------------------------------------------
 
 @pytest.mark.parametrize(
-    "raw,registry,repository,tag,tracks_latest",
+    "raw,registry,repository,tag",
     [
-        ("nginx", "docker.io", "library/nginx", "latest", True),
-        ("nginx:latest", "docker.io", "library/nginx", "latest", True),
-        ("mariadb:11", "docker.io", "library/mariadb", "11", False),
-        ("acme/app", "docker.io", "acme/app", "latest", True),
-        ("ghcr.io/acme/app:latest", "ghcr.io", "acme/app", "latest", True),
-        ("lscr.io/linuxserver/plex:1.2.3", "lscr.io", "linuxserver/plex", "1.2.3", False),
-        ("localhost:5000/thing", "localhost:5000", "thing", "latest", True),
+        ("nginx", "docker.io", "library/nginx", "latest"),
+        ("nginx:latest", "docker.io", "library/nginx", "latest"),
+        ("mariadb:11", "docker.io", "library/mariadb", "11"),
+        ("acme/app", "docker.io", "acme/app", "latest"),
+        ("ghcr.io/acme/app:latest", "ghcr.io", "acme/app", "latest"),
+        ("lscr.io/linuxserver/plex:1.2.3", "lscr.io", "linuxserver/plex", "1.2.3"),
+        ("localhost:5000/thing", "localhost:5000", "thing", "latest"),
     ],
 )
-def test_parse_image_ref(raw, registry, repository, tag, tracks_latest):
+def test_parse_image_ref(raw, registry, repository, tag):
     ref = parse_image_ref(raw)
     assert ref.registry == registry
     assert ref.repository == repository
     assert ref.tag == tag
-    assert ref.tracks_latest is tracks_latest
+    assert ref.pinned_digest is False
 
 
-def test_parse_image_ref_digest_pin_never_tracks_latest():
+def test_parse_image_ref_digest_pin():
     ref = parse_image_ref("nginx:latest@" + OLD_DIGEST)
     assert ref.pinned_digest is True
-    assert ref.tracks_latest is False
 
 
 def test_parse_image_ref_rejects_interpolation_and_empty():
@@ -218,6 +217,49 @@ async def test_compares_running_container_not_local_tag():
         for img in snapshot["instances"][0]["stacks"][0]["images"]
     }
     assert by_image["registry.test/acme/web:latest"] == "update-available"
+    await portainer.aclose()
+    await registry.aclose()
+
+
+async def test_same_image_across_stacks_hits_registry_once():
+    two_stacks = [
+        {**STACK, "Id": 1, "Name": "stack-a"},
+        {**STACK, "Id": 2, "Name": "stack-b"},
+    ]
+    head_count = {"n": 0}
+
+    def portainer_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/stacks":
+            return httpx.Response(200, json=two_stacks)
+        if path in ("/api/stacks/1/file", "/api/stacks/2/file"):
+            return httpx.Response(200, json={"StackFileContent": COMPOSE_YAML})
+        if path == "/api/endpoints":
+            return httpx.Response(200, json=[{"Id": 2}])
+        if path == "/api/endpoints/2/docker/containers/json":
+            return httpx.Response(200, json=[])
+        if path.startswith("/api/endpoints/2/docker/images/"):
+            return httpx.Response(
+                200, json={"RepoDigests": [f"registry.test/acme/web@{OLD_DIGEST}"]}
+            )
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    def registry_handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "HEAD"
+        head_count["n"] += 1
+        return httpx.Response(200, headers={"Docker-Content-Digest": NEW_DIGEST})
+
+    portainer = PortainerClient(INSTANCE, transport=httpx.MockTransport(portainer_handler))
+    registry = RegistryClient(transport=httpx.MockTransport(registry_handler))
+    checker = UpdateChecker(lambda: [(0, portainer)], registry, interval_hours=6)
+    snapshot = await checker.check_all()
+
+    # web:latest appears in both stacks but the registry is asked only once.
+    assert head_count["n"] == 1
+    statuses = [
+        img["status"] for s in snapshot["instances"][0]["stacks"] for img in s["images"]
+    ]
+    assert statuses.count("update-available") == 2
     await portainer.aclose()
     await registry.aclose()
 
