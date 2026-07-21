@@ -570,6 +570,14 @@
     }
   }
 
+  let busyCount = 0;  // in-flight updates/cleanups pause the auto-refresh
+
+  function autoTick() {
+    const loginVisible = $("#view-login").style.display !== "none";
+    if (loginVisible || busyCount > 0 || document.hidden) return;
+    refresh();
+  }
+
   async function runUpdate(btn) {
     const { kind, iid, sid, cid } = btn.dataset;
     const key = kind === "container" ? cid : sid;
@@ -581,6 +589,7 @@
     btn.disabled = true;
     btn.innerHTML = '<span class="spinner"></span>Updating…';
     if (msg) { msg.textContent = ""; msg.className = "result-msg"; }
+    busyCount++;
     try {
       const res = await fetch(url, { method: "POST" });
       const body = await res.json().catch(() => ({}));
@@ -610,6 +619,8 @@
       if (msg) { msg.textContent = err.message; msg.className = "result-msg err"; }
       setTimeout(() => { btn.disabled = false; btn.textContent = idleLabel(); }, 4000);
       return false;
+    } finally {
+      busyCount--;
     }
   }
 
@@ -653,6 +664,7 @@
 
     btn.disabled = true;
     btn.innerHTML = '<span class="spinner"></span>Cleaning…';
+    busyCount++;
     try {
       const res = await fetch(`/api/instances/${inst.instance.id}/prune`, {
         method: "POST",
@@ -672,6 +684,8 @@
         summary, { okOnly: true, okText: "OK" });
     } catch (err) {
       await confirmModal("Cleanup failed", err.message, { okOnly: true, okText: "OK" });
+    } finally {
+      busyCount--;
     }
     btn.disabled = false;
     btn.textContent = "Clean up";
@@ -889,6 +903,8 @@
 
   fetch("/api/ui-config").then((r) => r.ok ? r.json() : null).then((cfg) => {
     if (cfg && cfg.authEnabled) $("#signout-btn").style.display = "";
+    if (cfg && cfg.refreshSeconds > 0)
+      setInterval(autoTick, cfg.refreshSeconds * 1000);
     if (cfg && cfg.title) {
       document.title = cfg.title;
       $("#login-title").textContent = cfg.title;
@@ -896,6 +912,11 @@
       $("#title").innerHTML = `${esc(cfg.title)} <span title="Running build ${esc(cfg.version || "")}">Portainer stack updater${ver ? " · " + esc(ver) : ""}</span>`;
     }
   }).catch(() => {});
+
+  // Coming back to an open tab/PWA refreshes immediately.
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) autoTick();
+  });
 
   refresh();
   loadUpdates();

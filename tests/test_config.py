@@ -20,6 +20,17 @@ def test_defaults_without_config_file(tmp_path, monkeypatch):
     assert config.updates.floating_tags == ["latest"]
 
 
+def test_refresh_seconds_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "pw")
+    assert load_config(str(tmp_path / "missing.yaml")).ui.refresh_seconds == 180
+    monkeypatch.setenv("RESTRUO_REFRESH_SECONDS", "30")
+    assert load_config(str(tmp_path / "missing.yaml")).ui.refresh_seconds == 30
+    monkeypatch.setenv("RESTRUO_REFRESH_SECONDS", "0")
+    assert load_config(str(tmp_path / "missing.yaml")).ui.refresh_seconds == 0
+    monkeypatch.setenv("RESTRUO_REFRESH_SECONDS", "junk")
+    assert load_config(str(tmp_path / "missing.yaml")).ui.refresh_seconds == 180
+
+
 def test_floating_tags_env(tmp_path, monkeypatch):
     monkeypatch.setenv("DASHBOARD_PASSWORD", "pw")
     monkeypatch.setenv("RESTRUO_FLOATING_TAGS", "latest, release ,stable")

@@ -496,6 +496,7 @@ async def ui_config(request: Request):
         "title": request.app.state.config.ui.title,
         "version": os.environ.get("RESTRUO_VERSION", "dev"),
         "authEnabled": request.app.state.config.ui.auth.enabled,
+        "refreshSeconds": request.app.state.config.ui.refresh_seconds,
     }
 
 

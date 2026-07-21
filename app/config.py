@@ -37,9 +37,19 @@ class AuthConfig(BaseModel):
         return os.environ.get(self.password_env)
 
 
+def _refresh_seconds_default() -> int:
+    try:
+        return max(0, int(os.environ.get("RESTRUO_REFRESH_SECONDS", "180")))
+    except ValueError:
+        return 180
+
+
 class UIConfig(BaseModel):
     title: str = Field(default_factory=lambda: os.environ.get("RESTRUO_TITLE", "Restruo"))
     auth: AuthConfig = Field(default_factory=AuthConfig)
+    # Auto-refresh cadence for the open dashboard (stack/container state only,
+    # never registry scans). 0 disables.
+    refresh_seconds: int = Field(default_factory=_refresh_seconds_default)
 
 
 def _floating_tags_default() -> list[str]:

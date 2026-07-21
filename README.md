@@ -37,6 +37,7 @@ environment variable in the stack environment:
 | `RESTRUO_TITLE` | no | `Restruo` | Dashboard title |
 | `RESTRUO_PORT` | no | `8080` | Host port |
 | `RESTRUO_FLOATING_TAGS` | no | `latest` | Comma-separated tags treated as floating for update checks (e.g. `latest,release` for immich) |
+| `RESTRUO_REFRESH_SECONDS` | no | `180` | Auto-refresh cadence for an open dashboard (stack/container state only, never registry scans). `0` disables |
 
 Instance data (the Portainers you add, including their credentials) lives in the
 `restruo-data` named volume. A YAML config file is entirely optional — mount one at
