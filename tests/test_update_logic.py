@@ -208,6 +208,17 @@ async def test_portainer_error_surfaces_message():
     assert "access denied" in excinfo.value.message
 
 
+def test_container_is_down():
+    from app.portainer import container_is_down
+
+    assert container_is_down({"State": "exited", "Status": "Exited (1) 2 hours ago"}) is True
+    assert container_is_down({"State": "dead", "Status": ""}) is True
+    assert container_is_down({"State": "restarting", "Status": ""}) is True
+    assert container_is_down({"State": "running", "Status": "Up 3 hours (unhealthy)"}) is True
+    assert container_is_down({"State": "running", "Status": "Up 3 hours (healthy)"}) is False
+    assert container_is_down({"State": "running", "Status": "Up 3 hours"}) is False
+
+
 def test_extract_images():
     yaml = (
         "services:\n"

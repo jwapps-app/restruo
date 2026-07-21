@@ -15,6 +15,7 @@ from .portainer import (
     extract_images,
     normalize_container,
     resolve_image_name,
+    stack_containers,
     standalone_containers,
 )
 from .registry import RegistryClient, parse_image_ref
@@ -148,17 +149,6 @@ class UpdateChecker:
             "detail": f"running {local_short} · registry {remote_digest.removeprefix('sha256:')[:12]}",
         }
 
-    @staticmethod
-    def _stack_containers(stack: dict, containers: list[dict]) -> list[dict]:
-        name = stack.get("Name", "")
-        out = []
-        for c in containers:
-            labels = c.get("Labels") or {}
-            if labels.get("com.docker.compose.project") == name or \
-                    labels.get("com.docker.stack.namespace") == name:
-                out.append(c)
-        return out
-
     async def _check_instance(self, iid: int, client: PortainerClient) -> dict:
         result = {
             "instance": {"id": iid, "name": client.instance.name},
@@ -192,7 +182,7 @@ class UpdateChecker:
                 return await self._check_image(client, endpoint_id, raw, containers)
 
         async def check_stack(stack: dict) -> dict:
-            stack_containers = self._stack_containers(
+            own_containers = stack_containers(
                 stack, await containers_for(stack["EndpointId"])
             )
             try:
@@ -200,7 +190,7 @@ class UpdateChecker:
             except Exception:
                 images = []
             checked = list(await asyncio.gather(
-                *(check_image_bounded(stack["EndpointId"], raw, stack_containers)
+                *(check_image_bounded(stack["EndpointId"], raw, own_containers)
                   for raw in images)
             ))
             return {

@@ -20,10 +20,13 @@ from .notifiers import build_notifiers
 from .portainer import (
     PortainerClient,
     PortainerError,
+    container_is_down,
+    container_name,
     extract_images,
     normalize_container,
     normalize_stack,
     resolve_image_name,
+    stack_containers,
     standalone_containers,
 )
 from .registry import RegistryClient
@@ -281,26 +284,33 @@ async def _stacks_for_instance(iid: int, name: str, client: PortainerClient) -> 
         except Exception:
             return []
 
+    containers_by_endpoint: dict[int, list[dict]] = {}
+    try:
+        for endpoint in await client.list_endpoints():
+            try:
+                containers_by_endpoint[endpoint["Id"]] = await client.list_containers(
+                    endpoint["Id"]
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     image_lists = await asyncio.gather(*(images_for(stack) for stack in stacks))
-    result["stacks"] = [
-        normalize_stack(stack, images) for stack, images in zip(stacks, image_lists)
-    ]
+    for stack, images in zip(stacks, image_lists):
+        normalized = normalize_stack(stack, images)
+        own = stack_containers(stack, containers_by_endpoint.get(stack.get("EndpointId"), []))
+        normalized["containersTotal"] = len(own)
+        normalized["downNames"] = [container_name(c) for c in own if container_is_down(c)]
+        result["stacks"].append(normalized)
 
     # Containers that live outside any Portainer stack.
     stack_names = {s.get("Name") for s in stacks}
-    try:
-        for endpoint in await client.list_endpoints():
-            endpoint_id = endpoint["Id"]
-            try:
-                containers = await client.list_containers(endpoint_id)
-            except Exception:
-                continue
-            for c in standalone_containers(containers, stack_names):
-                normalized = normalize_container(c, endpoint_id)
-                normalized["image"] = await resolve_image_name(client, endpoint_id, c)
-                result["containers"].append(normalized)
-    except Exception:
-        pass
+    for endpoint_id, containers in containers_by_endpoint.items():
+        for c in standalone_containers(containers, stack_names):
+            normalized = normalize_container(c, endpoint_id)
+            normalized["image"] = await resolve_image_name(client, endpoint_id, c)
+            result["containers"].append(normalized)
     return result
 
 

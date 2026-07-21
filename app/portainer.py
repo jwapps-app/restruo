@@ -336,13 +336,38 @@ def standalone_containers(containers: list[dict], stack_names: set[str]) -> list
     return out
 
 
-def normalize_container(container: dict, endpoint_id: int) -> dict:
+def stack_containers(stack: dict, containers: list[dict]) -> list[dict]:
+    """Containers belonging to one Portainer stack (compose or swarm)."""
+    name = stack.get("Name", "")
+    out = []
+    for container in containers:
+        labels = container.get("Labels") or {}
+        if labels.get("com.docker.compose.project") == name or \
+                labels.get("com.docker.stack.namespace") == name:
+            out.append(container)
+    return out
+
+
+def container_is_down(container: dict) -> bool:
+    """Not running, or running but failing its healthcheck."""
+    state = (container.get("State") or "").lower()
+    status = container.get("Status") or ""
+    return state != "running" or "(unhealthy)" in status
+
+
+def container_name(container: dict) -> str:
     names = container.get("Names") or []
+    return names[0].lstrip("/") if names else container.get("Id", "")[:12]
+
+
+def normalize_container(container: dict, endpoint_id: int) -> dict:
     return {
         "id": container.get("Id", ""),
-        "name": names[0].lstrip("/") if names else container.get("Id", "")[:12],
+        "name": container_name(container),
         "image": container.get("Image", ""),
         "state": container.get("State", ""),
+        "statusText": container.get("Status", ""),
+        "down": container_is_down(container),
         "endpointId": endpoint_id,
     }
 
