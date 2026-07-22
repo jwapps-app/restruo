@@ -15,14 +15,19 @@
 #     api_key: "ptr_xxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 #     verify_tls: false        # false for self-signed certs (common in home labs)
 
-# Update checks: images tagged :latest (or untagged) are compared against the
-# registry; pinned tags like mariadb:11 are skipped and shown as "pinned".
+# Update checks: images on a floating tag are compared against the registry;
+# anything else (mariadb:11, digest pins) is skipped and shown as "pinned".
 updates:
   enabled: true
   interval_hours: 6
+  # Tags treated as rolling. Add others if you run projects that ship on them,
+  # e.g. immich's :release. Equivalent to RESTRUO_FLOATING_TAGS.
+  floating_tags: ["latest"]
 
 ui:
   title: "Restruo"
+  # Seconds between automatic refreshes of an open dashboard (0 disables).
+  refresh_seconds: 180
   auth:
     enabled: true
     username: "admin"

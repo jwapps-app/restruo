@@ -708,7 +708,7 @@
       const images = kind === "container"
         ? [inst?.containers?.find((c) => c.id === cid)?.image || ""]
         : inst?.stacks?.find((s) => s.id === Number(sid))?.images || [];
-      if (images.some((i) => /restruo|restack/.test(i.toLowerCase())))
+      if (images.some((i) => i.toLowerCase().includes("restruo")))
         text += " This looks like Restruo itself — the page will disconnect while it restarts, then reload automatically.";
       const yes = await confirmModal(`Update “${name}”?`, text);
       if (yes) runUpdate(updateBtn);

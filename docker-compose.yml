@@ -1,20 +1,22 @@
 services:
   restruo:
-    build: .
-    # image: ghcr.io/jwapps-app/restruo:latest   # once a prebuilt image is published
+    image: ghcr.io/jwapps-app/restruo:latest
+    # build: .                # uncomment to build from source instead
     container_name: restruo
     ports:
       - "${RESTRUO_PORT:-8080}:8080"
     volumes:
-      # Named volume holds the instance list added via the settings UI.
-      # Swap for a bind mount (/some/host/path:/data) if you want it on a share.
+      # Holds the instance list added via the settings UI (and their credentials).
+      # Swap for a bind mount (/some/host/path:/data) to keep it on a share.
       - restruo-data:/data
       # Optional: mount a config file to override defaults (see config.example.yaml)
-      # - /volume1/docker/restruo/config.yaml:/config/config.yaml:ro
+      # - ./config.yaml:/config/config.yaml:ro
     environment:
       - DASHBOARD_PASSWORD=${DASHBOARD_PASSWORD:?set DASHBOARD_PASSWORD in the stack environment}
       # - RESTRUO_USERNAME=admin
       # - RESTRUO_TITLE=Restruo
+      # - RESTRUO_FLOATING_TAGS=latest,release
+      # - RESTRUO_REFRESH_SECONDS=180
     restart: unless-stopped
 
 volumes:
