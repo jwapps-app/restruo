@@ -8,7 +8,7 @@ stack → tick *Re-pull image* → Deploy — and it replaces doing that on ever
 separately.
 
 [![build](https://github.com/jwapps-app/restruo/actions/workflows/docker.yml/badge.svg)](https://github.com/jwapps-app/restruo/actions/workflows/docker.yml)
-[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![license: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 
 ![The Restruo dashboard: three Portainer instances with their stacks, update badges, and down-container alerts](docs/screenshot.png)
 
@@ -191,4 +191,6 @@ button per stack, and a badge that tells you which button is worth pressing.
 
 ## License
 
-[MIT](LICENSE).
+[AGPL-3.0](LICENSE) — you're free to use, modify, and self-host this software;
+if you run a modified version as a network service, you must make your source
+available to its users.
