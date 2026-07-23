@@ -86,6 +86,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Restruo", lifespan=lifespan)
 
+
+@app.middleware("http")
+async def no_store_api_responses(request: Request, call_next):
+    """Live state must never be served from a browser cache — a stale
+    'unreachable' would outlive the outage that caused it."""
+    response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
 _basic = HTTPBasic(auto_error=False)
 
 

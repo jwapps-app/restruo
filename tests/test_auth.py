@@ -35,6 +35,13 @@ def test_shell_and_branding_are_public(client):
     assert config["authEnabled"] is True
 
 
+def test_api_responses_are_never_cached(client):
+    # A cached "unreachable" would outlive the outage that produced it.
+    client.post("/api/login", json={"username": "admin", "password": "hunter2"})
+    for path in ("/api/stacks", "/api/instances", "/api/updates"):
+        assert client.get(path).headers["cache-control"] == "no-store", path
+
+
 def test_data_endpoints_require_auth_without_basic_challenge(client):
     response = client.get("/api/instances")
     assert response.status_code == 401

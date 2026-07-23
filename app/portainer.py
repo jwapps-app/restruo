@@ -53,13 +53,15 @@ class PortainerClient:
         headers = {}
         if self._auth_type == "api_key":
             headers["X-API-Key"] = instance.api_key
-        kwargs = {} if transport is None else {"transport": transport}
+        if transport is None:
+            # retries covers connect-level failures — after a machine reboots,
+            # the first attempt can land on a socket that died silently.
+            transport = httpx.AsyncHTTPTransport(verify=instance.verify_tls, retries=2)
         self._client = httpx.AsyncClient(
             base_url=instance.base_url,
             headers=headers,
-            verify=instance.verify_tls,
             timeout=READ_TIMEOUT,
-            **kwargs,
+            transport=transport,
         )
         self._jwt: str | None = None
         self._csrf: str | None = None

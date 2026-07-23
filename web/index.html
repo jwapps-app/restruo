@@ -481,6 +481,7 @@
       $("#status-stacks").textContent = "Failed to load: " + err.message;
     } finally {
       $("#refresh").disabled = false;
+      scheduleRefresh();
     }
   }
 
@@ -570,12 +571,29 @@
     }
   }
 
-  let busyCount = 0;  // in-flight updates/cleanups pause the auto-refresh
+  let busyCount = 0;      // in-flight updates/cleanups pause the auto-refresh
+  let refreshBase = 0;    // seconds between refreshes (0 = auto-refresh off)
+  let retryDelay = null;  // set while something is unreachable: retry sooner
+  let refreshTimer = null;
+
+  // An instance that's unreachable is usually mid-reboot, so re-check in
+  // seconds rather than waiting out the full interval, backing off until it
+  // returns. Otherwise a machine that came back stays greyed out for minutes.
+  function scheduleRefresh() {
+    clearTimeout(refreshTimer);
+    if (!refreshBase) return;
+    if (data.some((i) => !i.reachable)) {
+      retryDelay = Math.min(retryDelay ? retryDelay * 2 : 10, refreshBase);
+    } else {
+      retryDelay = null;
+    }
+    refreshTimer = setTimeout(autoTick, (retryDelay || refreshBase) * 1000);
+  }
 
   function autoTick() {
     const loginVisible = $("#view-login").style.display !== "none";
-    if (loginVisible || busyCount > 0 || document.hidden) return;
-    refresh();
+    if (loginVisible || busyCount > 0 || document.hidden) { scheduleRefresh(); return; }
+    refresh();  // reschedules itself when it finishes
   }
 
   async function runUpdate(btn) {
@@ -903,8 +921,10 @@
 
   fetch("/api/ui-config").then((r) => r.ok ? r.json() : null).then((cfg) => {
     if (cfg && cfg.authEnabled) $("#signout-btn").style.display = "";
-    if (cfg && cfg.refreshSeconds > 0)
-      setInterval(autoTick, cfg.refreshSeconds * 1000);
+    if (cfg && cfg.refreshSeconds > 0) {
+      refreshBase = cfg.refreshSeconds;
+      scheduleRefresh();
+    }
     if (cfg && cfg.title) {
       document.title = cfg.title;
       $("#login-title").textContent = cfg.title;
