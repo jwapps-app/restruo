@@ -65,10 +65,21 @@ class PortainerClient:
         )
         self._jwt: str | None = None
         self._csrf: str | None = None
+        self._logged_in = False
         self._auth_lock = asyncio.Lock()
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+    def _harvest_csrf(self, response: httpx.Response) -> None:
+        """Portainer 2.20.2+ requires an X-CSRF-Token on mutating requests made
+        with a session (API keys are exempt). It issues one on every
+        AUTHENTICATED /api response — unauthenticated requests and the SPA page
+        return the header empty — so take the token from the calls we already
+        make instead of asking for it separately."""
+        token = response.headers.get("X-CSRF-Token")
+        if token:
+            self._csrf = token
 
     async def _login(self) -> None:
         response = await self._client.post(
@@ -76,14 +87,27 @@ class PortainerClient:
             json={"Username": self.instance.username, "Password": self.instance.password},
         )
         self._check(response)
-        self._jwt = response.json().get("jwt")
+        try:
+            # Recent Portainer returns the session as a cookie and may leave the
+            # body's jwt empty; the cookie jar carries it either way.
+            self._jwt = response.json().get("jwt") or None
+        except ValueError:
+            self._jwt = None
+        self._logged_in = True
+        self._harvest_csrf(response)
 
     async def _fetch_csrf(self) -> None:
-        # Portainer 2.20.2+ requires an X-CSRF-Token on mutating requests made
-        # with a session JWT (API keys are exempt). The token is issued via a
-        # response header on any GET, paired with a cookie the client jar keeps.
-        response = await self._client.get("/")
-        self._csrf = response.headers.get("X-CSRF-Token") or self._csrf
+        """Make an authenticated GET purely to obtain a token, for the rare case
+        where a mutating call is the first thing this client does."""
+        headers = {"Authorization": f"Bearer {self._jwt}"} if self._jwt else {}
+        for path in ("/api/endpoints", "/api/system/status"):
+            try:
+                response = await self._client.get(path, headers=headers)
+            except Exception:
+                continue
+            self._harvest_csrf(response)
+            if self._csrf:
+                return
 
     @staticmethod
     def _is_csrf_error(response: httpx.Response) -> bool:
@@ -99,18 +123,20 @@ class PortainerClient:
         # piece went stale and try again with the rest rebuilt.
         mutating = method.upper() not in ("GET", "HEAD", "OPTIONS")
         response: httpx.Response | None = None
+        csrf_failures = 0
         for _ in range(3):
-            if self._jwt is None:
+            if not self._logged_in:
                 async with self._auth_lock:
-                    if self._jwt is None:
+                    if not self._logged_in:
                         await self._login()
-            if mutating and self._csrf is None:
+            if mutating and not self._csrf:
                 async with self._auth_lock:
-                    if self._csrf is None:
+                    if not self._csrf:
                         await self._fetch_csrf()
 
             headers = kwargs.setdefault("headers", {})
-            headers["Authorization"] = f"Bearer {self._jwt}"
+            if self._jwt:
+                headers["Authorization"] = f"Bearer {self._jwt}"
             if mutating:
                 if self._csrf:
                     headers["X-CSRF-Token"] = self._csrf
@@ -119,15 +145,22 @@ class PortainerClient:
                 headers["Referer"] = f"{self.instance.base_url}/"
                 headers["Origin"] = self.instance.base_url
             response = await self._client.request(method, url, **kwargs)
+            self._harvest_csrf(response)
 
             if response.status_code == 401:
-                self._jwt = None  # expired session — re-login on next pass
+                # Expired session — log in again on the next pass.
+                self._logged_in = False
+                self._jwt = None
                 continue
             if self._is_csrf_error(response):
-                # Stale CSRF state — drop the token AND the cookie jar so the
-                # next pass starts a fresh CSRF handshake.
+                # Stale CSRF state. First try a fresh token (an authenticated
+                # GET also refreshes the paired cookie); if that still fails,
+                # tear the whole session down and start over.
                 self._csrf = None
-                self._client.cookies.clear()
+                if csrf_failures:
+                    self._logged_in = False
+                    self._client.cookies.clear()
+                csrf_failures += 1
                 continue
             return response
         return response

@@ -158,8 +158,10 @@ GIT_STACK = {
 
 
 def csrf_portainer_transport(state: dict) -> httpx.MockTransport:
-    """Mock Portainer that enforces X-CSRF-Token on mutating JWT requests.
-    The current token is issued via a response header on GET /."""
+    """Mock of real Portainer 2.39 CSRF behaviour: the token is issued only on
+    AUTHENTICATED /api responses. Unauthenticated requests and the SPA page
+    return the header present but EMPTY, which is what broke fetching it from
+    GET / — the client must harvest tokens from the API calls it already makes."""
     state.setdefault("csrf_fetches", 0)
     state.setdefault("valid_csrf", "csrf-1")
     state.setdefault("logins", 0)
@@ -172,20 +174,27 @@ def csrf_portainer_transport(state: dict) -> httpx.MockTransport:
             state["valid_jwt"] = f"jwt-{state['logins']}"
             return httpx.Response(200, json={"jwt": state["valid_jwt"]})
         if path == "/" and request.method == "GET":
-            # The SPA page is public and issues the CSRF token via header.
             state["csrf_fetches"] += 1
-            return httpx.Response(200, headers={"X-CSRF-Token": state["valid_csrf"]}, text="<html>")
+            return httpx.Response(200, headers={"X-CSRF-Token": ""}, text="<html>")
         if request.headers.get("Authorization") != f"Bearer {state['valid_jwt']}":
-            return httpx.Response(401, json={"message": "unauthorized"})
+            return httpx.Response(401, headers={"X-CSRF-Token": ""},
+                                  json={"message": "unauthorized"})
+        # Authenticated from here on: every /api response carries the token.
+        issued = {"X-CSRF-Token": state["valid_csrf"]}
         if request.method in ("PUT", "POST", "DELETE"):
             if request.headers.get("X-CSRF-Token") != state["valid_csrf"]:
-                return httpx.Response(403, text="Forbidden - CSRF token not found in request")
+                return httpx.Response(403, headers=issued,
+                                      text="Forbidden - CSRF token not found in request")
             # Over HTTPS Portainer also requires a same-origin referer.
             referer = request.headers.get("Referer", "")
             if not referer.startswith("https://portainer.test:9443"):
-                return httpx.Response(403, text="Forbidden - referer not supplied")
+                return httpx.Response(403, headers=issued,
+                                      text="Forbidden - referer not supplied")
+        if path == "/api/endpoints":
+            state["csrf_fetches"] += 1
+            return httpx.Response(200, headers=issued, json=[{"Id": 2}])
         if path == "/api/stacks/5/git/redeploy":
-            return httpx.Response(200, json={"Id": 5})
+            return httpx.Response(200, headers=issued, json={"Id": 5})
         raise AssertionError(f"unexpected request: {request.method} {path}")
 
     return httpx.MockTransport(handler)
@@ -195,10 +204,22 @@ async def test_credentials_mutating_request_sends_csrf_token():
     state = {}
     client = PortainerClient(CRED_INSTANCE, transport=csrf_portainer_transport(state))
     await client.update_stack(GIT_STACK)
-    assert state["csrf_fetches"] == 1
+    fetches = state["csrf_fetches"]
     # Token is reused on the next mutating call, not re-fetched.
     await client.update_stack(GIT_STACK)
-    assert state["csrf_fetches"] == 1
+    assert state["csrf_fetches"] == fetches
+    await client.aclose()
+
+
+async def test_token_is_harvested_from_ordinary_api_calls():
+    """A GET that the app makes anyway must supply the token, so a mutating
+    call needs no separate handshake."""
+    state = {}
+    client = PortainerClient(CRED_INSTANCE, transport=csrf_portainer_transport(state))
+    await client.list_endpoints()
+    before = state["csrf_fetches"]
+    await client.update_stack(GIT_STACK)
+    assert state["csrf_fetches"] == before  # no extra token-fetch round trip
     await client.aclose()
 
 
@@ -207,8 +228,7 @@ async def test_credentials_refreshes_stale_csrf_token():
     client = PortainerClient(CRED_INSTANCE, transport=csrf_portainer_transport(state))
     await client.update_stack(GIT_STACK)
     state["valid_csrf"] = "csrf-2"  # server rotated the token
-    await client.update_stack(GIT_STACK)  # 403 → re-fetch → retry succeeds
-    assert state["csrf_fetches"] == 2
+    await client.update_stack(GIT_STACK)  # 403 → re-harvest → retry succeeds
     await client.aclose()
 
 
