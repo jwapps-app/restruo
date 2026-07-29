@@ -23,6 +23,7 @@ from .portainer import (
     container_is_down,
     container_name,
     extract_images,
+    is_self_critical_image,
     normalize_container,
     normalize_stack,
     resolve_image_name,
@@ -312,6 +313,10 @@ async def _stacks_for_instance(iid: int, name: str, client: PortainerClient) -> 
         own = stack_containers(stack, containers_by_endpoint.get(stack.get("EndpointId"), []))
         normalized["containersTotal"] = len(own)
         normalized["downNames"] = [container_name(c) for c in own if container_is_down(c)]
+        # Stacks running Portainer or Restruo can't be stopped from here.
+        normalized["selfCritical"] = any(
+            is_self_critical_image(c.get("Image", "")) for c in own
+        ) or any(is_self_critical_image(i) for i in images)
         result["stacks"].append(normalized)
 
     # Containers that live outside any Portainer stack.
@@ -366,6 +371,104 @@ async def _update_one(client: PortainerClient, stack: dict) -> dict:
         "durationMs": int((time.monotonic() - started) * 1000),
         "message": "Repulled and redeployed.",
     }
+
+
+async def _find_container(client: PortainerClient, cid: str) -> tuple[int, dict]:
+    for endpoint in await client.list_endpoints():
+        for container in await client.list_containers(endpoint["Id"]):
+            if container.get("Id") == cid:
+                return endpoint["Id"], container
+    raise HTTPException(status_code=404, detail=f"No container {cid[:12]} on this instance")
+
+
+def _timed(started: float, name: str, message: str, ok: bool = True) -> dict:
+    return {
+        "ok": ok,
+        "stack": name,
+        "durationMs": int((time.monotonic() - started) * 1000),
+        "message": message,
+    }
+
+
+async def _set_stack_state(request: Request, iid: int, sid: int, action: str):
+    """Start or stop a stack."""
+    client = _get_client(request, iid)
+    started = time.monotonic()
+    try:
+        stack = await client.get_stack(sid)
+    except PortainerError as exc:
+        if exc.status_code == 404:
+            raise HTTPException(status_code=404, detail=f"No stack with id {sid} on this instance")
+        raise HTTPException(status_code=502, detail=f"Could not fetch stack: {exc.message}")
+
+    name = stack.get("Name", f"stack {sid}")
+    if action == "stop":
+        try:
+            containers = stack_containers(
+                stack, await client.list_containers(stack["EndpointId"])
+            )
+        except Exception:
+            containers = []
+        if any(is_self_critical_image(c.get("Image", "")) for c in containers):
+            raise HTTPException(
+                status_code=400,
+                detail=f"“{name}” runs Portainer or Restruo itself — stopping it from here "
+                       "would cut off the connection needed to start it again.",
+            )
+    try:
+        await client.set_stack_state(sid, stack["EndpointId"], running=action == "start")
+    except Exception as exc:
+        message = exc.message if isinstance(exc, PortainerError) else str(exc)
+        return JSONResponse(status_code=502, content=_timed(started, name, message, ok=False))
+    return _timed(started, name, "Started." if action == "start" else "Stopped.")
+
+
+@app.post("/api/instances/{iid}/stacks/{sid}/start", dependencies=[Depends(require_auth)])
+async def start_stack(request: Request, iid: int, sid: int):
+    return await _set_stack_state(request, iid, sid, "start")
+
+
+@app.post("/api/instances/{iid}/stacks/{sid}/stop", dependencies=[Depends(require_auth)])
+async def stop_stack(request: Request, iid: int, sid: int):
+    return await _set_stack_state(request, iid, sid, "stop")
+
+
+async def _set_container_state(request: Request, iid: int, cid: str, action: str):
+    """Start or stop a standalone container."""
+    client = _get_client(request, iid)
+    started = time.monotonic()
+    try:
+        endpoint_id, container = await _find_container(client, cid)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        message = exc.message if isinstance(exc, PortainerError) else str(exc)
+        raise HTTPException(status_code=502, detail=f"Could not find container: {message}")
+
+    name = container_name(container)
+    image = await resolve_image_name(client, endpoint_id, container)
+    if action == "stop" and is_self_critical_image(image):
+        raise HTTPException(
+            status_code=400,
+            detail=f"“{name}” is Portainer or Restruo itself — stopping it from here would "
+                   "cut off the connection needed to start it again.",
+        )
+    try:
+        await client.set_container_state(endpoint_id, cid, running=action == "start")
+    except Exception as exc:
+        message = exc.message if isinstance(exc, PortainerError) else str(exc)
+        return JSONResponse(status_code=502, content=_timed(started, name, message, ok=False))
+    return _timed(started, name, "Started." if action == "start" else "Stopped.")
+
+
+@app.post("/api/instances/{iid}/containers/{cid}/start", dependencies=[Depends(require_auth)])
+async def start_container(request: Request, iid: int, cid: str):
+    return await _set_container_state(request, iid, cid, "start")
+
+
+@app.post("/api/instances/{iid}/containers/{cid}/stop", dependencies=[Depends(require_auth)])
+async def stop_container(request: Request, iid: int, cid: str):
+    return await _set_container_state(request, iid, cid, "stop")
 
 
 @app.post("/api/instances/{iid}/stacks/{sid}/update", dependencies=[Depends(require_auth)])

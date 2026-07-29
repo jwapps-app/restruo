@@ -141,6 +141,44 @@ async def test_resolve_image_name_recovers_repo_from_digest():
     assert requests == []
 
 
+async def test_set_stack_state_start_and_stop():
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(f"{request.method} {request.url.path}?{request.url.params}")
+        return httpx.Response(200, json={"Id": 7})
+
+    client, _ = make_client(handler)
+    await client.set_stack_state(7, 2, running=False)
+    await client.set_stack_state(7, 2, running=True)
+    await client.aclose()
+    assert seen == [
+        "POST /api/stacks/7/stop?endpointId=2",
+        "POST /api/stacks/7/start?endpointId=2",
+    ]
+
+
+async def test_set_container_state_tolerates_already_in_state():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/endpoints/2/docker/containers/abc/stop"
+        # Docker answers 304 when the container is already stopped.
+        return httpx.Response(304)
+
+    client, _ = make_client(handler)
+    await client.set_container_state(2, "abc", running=False)  # must not raise
+    await client.aclose()
+
+
+def test_is_self_critical_image():
+    from app.portainer import is_self_critical_image
+
+    assert is_self_critical_image("portainer/portainer-ce:latest") is True
+    assert is_self_critical_image("portainer/portainer-ee:2.39") is True
+    assert is_self_critical_image("ghcr.io/jwapps-app/restruo:latest") is True
+    assert is_self_critical_image("jellyfin/jellyfin:latest") is False
+    assert is_self_critical_image("") is False
+
+
 async def test_recreate_container_uses_portainer_recreate_action():
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "POST"

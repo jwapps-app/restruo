@@ -24,6 +24,8 @@ separately.
   only the flagged items.
 - **Red dot for trouble** — containers that are stopped, or running but failing their
   healthcheck.
+- **Start / stop** per stack and container, so you can bring something back without
+  logging into that machine's Portainer.
 - **Cleans up after itself**: prune unused images (the ones your `:latest` updates leave
   behind), networks, and — if you explicitly ask — unused volumes.
 - **Installs as a web app.** Add it to your phone's home screen; a 30-day session means a
@@ -113,8 +115,10 @@ performs as a rolling service update.
 
 ## Updating Portainer itself
 
-Restruo refuses to update a `portainer/portainer-*` container, and shows a disabled
-button instead. Portainer dies the moment it stops its own container, so an API-driven
+Restruo refuses to update — or stop — a `portainer/portainer-*` container, and shows
+disabled buttons instead. (Stopping Portainer through its own API is worse than
+updating: it kills the connection Restruo would need to start it again. The same guard
+covers Restruo's own container.) Portainer dies the moment it stops its own container, so an API-driven
 recreate can never finish — it just leaves Portainer stopped with the new image pulled
 but unused. (If that happens to you by other means: nothing is damaged, just start the
 container again.)
@@ -154,7 +158,9 @@ cookie or HTTP basic, so `curl -u` works).
 | POST | `/api/instances/test` | Test a connection without saving |
 | GET | `/api/stacks` | All stacks and standalone containers, with state |
 | POST | `/api/instances/{iid}/stacks/{sid}/update` | Repull + redeploy one stack |
+| POST | `/api/instances/{iid}/stacks/{sid}/start`, `/stop` | Start or stop a stack |
 | POST | `/api/instances/{iid}/containers/{cid}/update` | Repull + recreate one container |
+| POST | `/api/instances/{iid}/containers/{cid}/start`, `/stop` | Start or stop a container |
 | POST | `/api/instances/{iid}/prune` | Remove unused images/networks/volumes |
 | GET | `/api/updates` | Cached update-check results |
 | POST | `/api/check-updates` | Run an update check now |

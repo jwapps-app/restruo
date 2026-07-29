@@ -71,7 +71,9 @@
     background: var(--accent); border-color: var(--accent);
     color: var(--accent-text); font-weight: 600;
   }
-  .update-btn:disabled { opacity: .45; cursor: not-allowed; }
+  .update-btn:disabled, .power-btn:disabled { opacity: .45; cursor: not-allowed; }
+  .power-btn { margin-left: 6px; padding: 7px 10px; }
+  .power-btn.start { color: var(--ok); border-color: var(--ok); }
   .count { color: var(--muted); font-size: 13px; }
   .img-line { display: block; }
   .img-line.upd { color: var(--accent); font-weight: 600; }
@@ -282,6 +284,17 @@
     return `<span class="img-line unk" title="${esc(img.detail || "Could not check")}">${esc(img.image)} <span class="img-note">?</span></span>`;
   }
 
+  function powerBtn(o) {
+    // Stopping Portainer (or Restruo) through Portainer's own API would kill
+    // the connection needed to start it again — the server refuses it too.
+    if (o.protected)
+      return `<button class="power-btn" disabled title="Can't be stopped from here — it's what Restruo talks to">${o.running ? "Stop" : "Start"}</button>`;
+    const act = o.running ? "stop" : "start";
+    return `<button class="power-btn${o.running ? "" : " start"}" data-power="${act}"
+      data-kind="${o.kind}" data-iid="${o.iid}" data-id="${esc(String(o.id))}"
+      data-name="${esc(o.name)}">${o.running ? "Stop" : "Start"}</button>`;
+  }
+
   function renderImagesCell(stack, iid) {
     const info = updateInfoFor(iid, stack.id);
     if (!info || !info.images.length) return esc(stack.images.join(", ") || "—");
@@ -354,6 +367,8 @@
             <td>
               <button class="update-btn${hasUpd ? " has-upd" : ""}" data-kind="stack"
                 data-iid="${iid}" data-sid="${s.id}" data-name="${esc(s.name)}">${hasUpd ? "⬆ Update" : "Update"}</button>
+              ${powerBtn({ kind: "stack", iid, id: s.id, name: s.name,
+                           running: s.status !== "inactive", protected: s.selfCritical })}
               <span class="result-msg" id="msg-${iid}-${s.id}"></span>
             </td>
           </tr>`;
@@ -378,6 +393,8 @@
                 ? '<button class="update-btn" disabled title="Portainer can\'t update itself — update it from the host (SSH or your NAS\'s container manager); see the README">Update</button>'
                 : `<button class="update-btn${hasUpd ? " has-upd" : ""}" data-kind="container"
                 data-iid="${iid}" data-cid="${esc(c.id)}" data-name="${esc(c.name)}">${hasUpd ? "⬆ Update" : "Update"}</button>`}
+              ${powerBtn({ kind: "container", iid, id: c.id, name: c.name,
+                           running: !c.down || c.state === "running", protected: isPortainer })}
               <span class="result-msg" id="msg-${iid}-${esc(c.id)}"></span>
             </td>
           </tr>`;
@@ -709,7 +726,48 @@
     btn.textContent = "Clean up";
   }
 
+  async function runPower(btn) {
+    const { power, kind, iid, id, name } = btn.dataset;
+    const msg = document.getElementById(`msg-${iid}-${id}`);
+    const url = `/api/instances/${iid}/${kind === "container" ? "containers" : "stacks"}/${id}/${power}`;
+    btn.disabled = true;
+    btn.innerHTML = `<span class="spinner"></span>${power === "stop" ? "Stopping…" : "Starting…"}`;
+    if (msg) { msg.textContent = ""; msg.className = "result-msg"; }
+    busyCount++;
+    try {
+      const res = await fetch(url, { method: "POST" });
+      const body = await res.json().catch(() => ({}));
+      const ok = res.ok && body.ok;
+      btn.innerHTML = ok ? "✅ Done" : "❌ Failed";
+      if (msg && !ok) {
+        msg.textContent = body.message || body.detail || `HTTP ${res.status}`;
+        msg.className = "result-msg err";
+      }
+      // Re-read real state so the button flips and the red dot follows.
+      if (ok) setTimeout(refresh, 1500);
+      else setTimeout(() => { btn.disabled = false; btn.textContent = power === "stop" ? "Stop" : "Start"; }, 4000);
+    } catch (err) {
+      btn.innerHTML = "❌ Failed";
+      if (msg) { msg.textContent = err.message; msg.className = "result-msg err"; }
+      setTimeout(() => { btn.disabled = false; btn.textContent = power === "stop" ? "Stop" : "Start"; }, 4000);
+    } finally {
+      busyCount--;
+    }
+  }
+
   document.addEventListener("click", async (e) => {
+    const powerButton = e.target.closest(".power-btn");
+    if (powerButton && powerButton.dataset.power) {
+      const { power, name } = powerButton.dataset;
+      if (power === "stop") {
+        const yes = await confirmModal(`Stop “${name}”?`,
+          "Its containers will shut down and stay down until you start them again.",
+          { okText: "Stop" });
+        if (!yes) return;
+      }
+      runPower(powerButton);  // starting is harmless — no confirmation
+      return;
+    }
     const cleanupBtn = e.target.closest(".cleanup-btn");
     if (cleanupBtn) {
       const inst = data.find((i) => i.instance.id === Number(cleanupBtn.dataset.iid));

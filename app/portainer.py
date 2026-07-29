@@ -259,6 +259,36 @@ class PortainerClient:
             self._check(response)
         return response.json()
 
+    async def set_stack_state(self, stack_id: int, endpoint_id: int, running: bool) -> dict:
+        """Start or stop every service in a stack."""
+        action = "start" if running else "stop"
+        response = await self._request(
+            "POST",
+            f"/api/stacks/{stack_id}/{action}",
+            params={"endpointId": endpoint_id},
+            timeout=REDEPLOY_TIMEOUT,
+        )
+        self._check(response)
+        try:
+            return response.json()
+        except ValueError:
+            return {}
+
+    async def set_container_state(
+        self, endpoint_id: int, container_id: str, running: bool
+    ) -> dict:
+        """Start or stop one container via Portainer's Docker proxy."""
+        action = "start" if running else "stop"
+        response = await self._request(
+            "POST",
+            f"/api/endpoints/{endpoint_id}/docker/containers/{container_id}/{action}",
+            timeout=REDEPLOY_TIMEOUT,
+        )
+        # 304 means it was already in that state — not an error worth surfacing.
+        if response.status_code != 304:
+            self._check(response)
+        return {}
+
     async def recreate_container(self, endpoint_id: int, container_id: int | str) -> dict:
         """Portainer's own recreate action: pulls the image fresh and recreates
         the container with its existing configuration (same as the UI's
@@ -381,6 +411,17 @@ def stack_containers(stack: dict, containers: list[dict]) -> list[dict]:
                 labels.get("com.docker.stack.namespace") == name:
             out.append(container)
     return out
+
+
+def is_self_critical_image(image: str) -> bool:
+    """Images this tool must never stop through its own control path.
+
+    Stopping Portainer through Portainer's API is unrecoverable from here —
+    it kills the very API needed to start it again. Restruo stopping itself is
+    recoverable (from Portainer) but still removes the UI mid-click.
+    """
+    name = (image or "").lower()
+    return "portainer/portainer" in name or "restruo" in name
 
 
 def container_is_down(container: dict) -> bool:
