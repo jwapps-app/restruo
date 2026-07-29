@@ -301,23 +301,37 @@
     return info.images.map(imgLine).join("");
   }
 
+  // Modals are queued: several instances can finish a cleanup at once, and a
+  // second dialog must not overwrite one still on screen (which would lose its
+  // result). opts.extraHtml renders inside the dialog and its checkbox states
+  // come back on the resolved value.
+  let modalChain = Promise.resolve();
+
   function confirmModal(title, text, opts = {}) {
-    return new Promise((resolve) => {
+    const show = () => new Promise((resolve) => {
       $("#modal-title").textContent = title;
       $("#modal-text").textContent = text;
+      $("#modal-extra").innerHTML = opts.extraHtml || "";
       $("#modal-confirm").textContent = opts.okText || "Update";
       $("#modal-cancel").style.display = opts.okOnly ? "none" : "";
       const backdrop = $("#modal-backdrop");
       backdrop.classList.add("open");
       const done = (answer) => {
+        const checks = {};
+        $("#modal-extra").querySelectorAll("input[type=checkbox]")
+          .forEach((cb) => { checks[cb.id] = cb.checked; });
         backdrop.classList.remove("open");
+        $("#modal-extra").innerHTML = "";
         $("#modal-confirm").onclick = $("#modal-cancel").onclick = backdrop.onclick = null;
-        resolve(answer);
+        resolve(opts.extraHtml ? { confirmed: answer, checks } : answer);
       };
       $("#modal-confirm").onclick = () => done(true);
       $("#modal-cancel").onclick = () => done(false);
       backdrop.onclick = (e) => { if (e.target === backdrop) done(false); };
     });
+    const shown = modalChain.then(show);
+    modalChain = shown.catch(() => {});
+    return shown;
   }
 
   function render() {
@@ -679,27 +693,28 @@
   }
 
   async function runCleanup(btn, inst) {
-    $("#modal-extra").innerHTML = `
+    const name = inst.instance.name;
+    const answer = await confirmModal(`Clean up “${name}”?`,
+      "Removes Docker leftovers. Running stacks and containers are never touched.",
+      { okText: "Clean up", extraHtml: `
       <label class="chk"><input type="checkbox" id="cl-images" checked>
         <span>Unused images — anything no container uses, including old versions of updated images</span></label>
       <label class="chk"><input type="checkbox" id="cl-networks" checked>
         <span>Unused networks</span></label>
       <label class="chk"><input type="checkbox" id="cl-volumes">
-        <span>Unused volumes — <span class="danger">permanently deletes the data</span> in volumes no container references</span></label>`;
-    const yes = await confirmModal(`Clean up “${inst.instance.name}”?`,
-      "Removes Docker leftovers. Running stacks and containers are never touched.",
-      { okText: "Clean up" });
-    const opts = yes && {
-      images: $("#cl-images").checked,
-      networks: $("#cl-networks").checked,
-      volumes: $("#cl-volumes").checked,
+        <span>Unused volumes — <span class="danger">permanently deletes the data</span> in volumes no container references</span></label>` });
+    const opts = answer.confirmed && {
+      images: answer.checks["cl-images"],
+      networks: answer.checks["cl-networks"],
+      volumes: answer.checks["cl-volumes"],
     };
-    $("#modal-extra").innerHTML = "";
     if (!opts || (!opts.images && !opts.networks && !opts.volumes)) return;
 
     btn.disabled = true;
     btn.innerHTML = '<span class="spinner"></span>Cleaning…';
     busyCount++;
+    let title;
+    let summary;
     try {
       const res = await fetch(`/api/instances/${inst.instance.id}/prune`, {
         method: "POST",
@@ -713,17 +728,20 @@
       if (opts.images) parts.push(`${body.images} image${body.images === 1 ? "" : "s"}`);
       if (opts.networks) parts.push(`${body.networks} network${body.networks === 1 ? "" : "s"}`);
       if (opts.volumes) parts.push(`${body.volumes} volume${body.volumes === 1 ? "" : "s"}`);
-      const summary = `Freed ${fmtBytes(body.spaceReclaimed)} — removed ${parts.join(", ")}.` +
+      title = body.ok ? `Cleanup finished — ${name}` : `Cleanup finished with errors — ${name}`;
+      summary = `Freed ${fmtBytes(body.spaceReclaimed)} — removed ${parts.join(", ")}.` +
         (body.errors.length ? `\n\nProblems: ${body.errors.join("; ")}` : "");
-      await confirmModal(body.ok ? "Cleanup finished" : "Cleanup finished with errors",
-        summary, { okOnly: true, okText: "OK" });
     } catch (err) {
-      await confirmModal("Cleanup failed", err.message, { okOnly: true, okText: "OK" });
-    } finally {
-      busyCount--;
+      title = `Cleanup failed — ${name}`;
+      summary = err.message;
     }
+    // Restore the button as soon as the work is done: the result dialog may sit
+    // in the queue behind another instance's, and a spinner waiting on someone
+    // else's dialog looks like a hang.
+    busyCount--;
     btn.disabled = false;
     btn.textContent = "Clean up";
+    await confirmModal(title, summary, { okOnly: true, okText: "OK" });
   }
 
   async function runPower(btn) {
