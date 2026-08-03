@@ -707,17 +707,27 @@
 
   async function runCleanup(btn, inst) {
     const name = inst.instance.name;
+    // Stopping a stack removes its containers, so its images look unused.
+    // Name them, because "all unused images" would delete exactly those.
+    const stopped = (inst.stacks || []).filter((s) => s.status === "inactive").map((s) => s.name);
+    const stoppedWarning = stopped.length
+      ? `<div class="chk"><span class="danger">⚠ ${stopped.length} stopped stack${stopped.length === 1 ? "" : "s"} on this instance (${esc(stopped.join(", "))}). Stopping a stack removes its containers, so its images and volumes look unused — the two ticked-off options below would delete them.</span></div>`
+      : "";
     const answer = await confirmModal(`Clean up “${name}”?`,
       "Removes Docker leftovers. Running stacks and containers are never touched.",
       { okText: "Clean up", extraHtml: `
       <label class="chk"><input type="checkbox" id="cl-images" checked>
-        <span>Unused images — anything no container uses, including old versions of updated images</span></label>
+        <span>Leftover images — the old versions left behind by updates</span></label>
       <label class="chk"><input type="checkbox" id="cl-networks" checked>
         <span>Unused networks</span></label>
+      ${stoppedWarning}
+      <label class="chk"><input type="checkbox" id="cl-all-images">
+        <span>Also every image no container uses — <span class="danger">includes stopped stacks</span>, which then need a re-pull before they can start</span></label>
       <label class="chk"><input type="checkbox" id="cl-volumes">
-        <span>Unused volumes — <span class="danger">permanently deletes the data</span> in volumes no container references</span></label>` });
+        <span>Unused volumes — <span class="danger">permanently deletes the data</span> in them, stopped stacks included</span></label>` });
     const opts = answer.confirmed && {
-      images: answer.checks["cl-images"],
+      images: answer.checks["cl-images"] || answer.checks["cl-all-images"],
+      allImages: answer.checks["cl-all-images"],
       networks: answer.checks["cl-networks"],
       volumes: answer.checks["cl-volumes"],
     };

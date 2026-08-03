@@ -192,16 +192,22 @@ async def test_recreate_container_uses_portainer_recreate_action():
     assert len(requests) == 1
 
 
-async def test_prune_images_removes_all_unused_not_just_dangling():
+async def test_prune_images_defaults_to_dangling_only():
+    """Stopping a stack removes its containers, so its images look unused.
+    The default must not delete them — only untagged update leftovers."""
+    seen = []
+
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "POST"
         assert request.url.path == "/api/endpoints/2/docker/images/prune"
-        assert json.loads(request.url.params["filters"]) == {"dangling": ["false"]}
+        seen.append(json.loads(request.url.params["filters"]))
         return httpx.Response(200, json={"ImagesDeleted": [{}, {}], "SpaceReclaimed": 123})
 
     client, _ = make_client(handler)
     pruned = await client.prune_images(2)
+    await client.prune_images(2, all_unused=True)
     await client.aclose()
+    assert seen == [{"dangling": ["true"]}, {"dangling": ["false"]}]
     assert pruned["SpaceReclaimed"] == 123
 
 

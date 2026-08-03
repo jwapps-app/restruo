@@ -50,23 +50,59 @@ class PortainerClient:
     def __init__(self, instance, transport: httpx.AsyncBaseTransport | None = None):
         self.instance = instance
         self._auth_type = getattr(instance, "auth_type", "api_key")
-        headers = {}
+        self._headers = {}
         if self._auth_type == "api_key":
-            headers["X-API-Key"] = instance.api_key
-        if transport is None:
-            # retries covers connect-level failures — after a machine reboots,
-            # the first attempt can land on a socket that died silently.
-            transport = httpx.AsyncHTTPTransport(verify=instance.verify_tls, retries=2)
-        self._client = httpx.AsyncClient(
-            base_url=instance.base_url,
-            headers=headers,
-            timeout=READ_TIMEOUT,
-            transport=transport,
-        )
+            self._headers["X-API-Key"] = instance.api_key
+        self._injected_transport = transport
+        self._client = self._new_client()
         self._jwt: str | None = None
         self._csrf: str | None = None
         self._logged_in = False
         self._auth_lock = asyncio.Lock()
+
+    def _new_client(self) -> httpx.AsyncClient:
+        transport = self._injected_transport
+        if transport is None:
+            # retries covers connect-level failures — after a machine reboots,
+            # the first attempt can land on a socket that died silently.
+            transport = httpx.AsyncHTTPTransport(
+                verify=self.instance.verify_tls, retries=2
+            )
+        return httpx.AsyncClient(
+            base_url=self.instance.base_url,
+            headers=self._headers,
+            timeout=READ_TIMEOUT,
+            transport=transport,
+        )
+
+    async def _reconnect(self) -> None:
+        """Throw away the connection pool and the session.
+
+        When the machine (or its Docker VM) goes away and comes back, the pool
+        can hold sockets that are dead but not closed: every request picks one,
+        waits out the timeout and fails, so the instance stays 'unreachable'
+        long after it is back. Rebuilding is what re-saving the instance used to
+        do by hand.
+        """
+        old = self._client
+        self._client = self._new_client()
+        self._jwt = None
+        self._csrf = None
+        self._logged_in = False
+        try:
+            await old.aclose()
+        except Exception:
+            pass
+
+    async def _send(self, method: str, url: str, **kwargs) -> httpx.Response:
+        try:
+            return await self._client.request(method, url, **kwargs)
+        except httpx.TransportError:
+            # Connection-level failure: rebuild the pool and give it one more
+            # go, so a machine that just came back recovers on this poll rather
+            # than needing the instance re-saved.
+            await self._reconnect()
+            return await self._client.request(method, url, **kwargs)
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -82,8 +118,8 @@ class PortainerClient:
             self._csrf = token
 
     async def _login(self) -> None:
-        response = await self._client.post(
-            "/api/auth",
+        response = await self._send(
+            "POST", "/api/auth",
             json={"Username": self.instance.username, "Password": self.instance.password},
         )
         self._check(response)
@@ -102,7 +138,7 @@ class PortainerClient:
         headers = {"Authorization": f"Bearer {self._jwt}"} if self._jwt else {}
         for path in ("/api/endpoints", "/api/system/status"):
             try:
-                response = await self._client.get(path, headers=headers)
+                response = await self._send("GET", path, headers=headers)
             except Exception:
                 continue
             self._harvest_csrf(response)
@@ -115,7 +151,7 @@ class PortainerClient:
 
     async def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
         if self._auth_type != "credentials":
-            return await self._client.request(method, url, **kwargs)
+            return await self._send(method, url, **kwargs)
 
         # A Portainer restart invalidates the JWT, the CSRF token, AND the CSRF
         # cookie at once, and they can only be re-established in sequence. Run
@@ -144,7 +180,7 @@ class PortainerClient:
                 # same-origin Referer ("Forbidden - referer not supplied").
                 headers["Referer"] = f"{self.instance.base_url}/"
                 headers["Origin"] = self.instance.base_url
-            response = await self._client.request(method, url, **kwargs)
+            response = await self._send(method, url, **kwargs)
             self._harvest_csrf(response)
 
             if response.status_code == 401:
@@ -214,13 +250,22 @@ class PortainerClient:
         self._check(response)
         return response.json()
 
-    async def prune_images(self, endpoint_id: int) -> dict:
-        """Remove ALL unused images (dangling=false), not just untagged layers —
-        this is what reclaims space from superseded :latest pulls."""
+    async def prune_images(self, endpoint_id: int, all_unused: bool = False) -> dict:
+        """Remove unused images.
+
+        Default (dangling only) removes untagged layers — which includes the
+        old image a re-pull leaves behind, since the tag moves to the new one.
+        That reclaims update leftovers without touching anything nameable.
+
+        all_unused removes every image no container references. Stopping a
+        stack in Portainer REMOVES its containers, so a stopped stack's images
+        look unused and get deleted — the stack then can't start until they are
+        pulled again. Callers must make that consequence explicit.
+        """
         response = await self._request(
             "POST",
             f"/api/endpoints/{endpoint_id}/docker/images/prune",
-            params={"filters": json.dumps({"dangling": ["false"]})},
+            params={"filters": json.dumps({"dangling": ["false" if all_unused else "true"]})},
             timeout=REDEPLOY_TIMEOUT,
         )
         self._check(response)

@@ -560,6 +560,8 @@ async def update_container(request: Request, iid: int, cid: str):
 
 class PruneRequest(BaseModel):
     images: bool = True
+    # Off by default: it deletes the images of stopped stacks too.
+    allImages: bool = False
     networks: bool = True
     volumes: bool = False
 
@@ -585,7 +587,7 @@ async def prune_instance(request: Request, iid: int, body: PruneRequest):
         endpoint_id = endpoint["Id"]
         if body.images:
             try:
-                pruned = await client.prune_images(endpoint_id)
+                pruned = await client.prune_images(endpoint_id, all_unused=body.allImages)
                 summary["images"] += len(pruned.get("ImagesDeleted") or [])
                 summary["spaceReclaimed"] += pruned.get("SpaceReclaimed") or 0
             except Exception as exc:

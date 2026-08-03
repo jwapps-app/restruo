@@ -256,6 +256,30 @@ async def test_credentials_refreshes_stale_csrf_token():
     await client.aclose()
 
 
+async def test_recovers_when_the_machine_comes_back():
+    """A host that vanishes (reboot, Docker VM restart) can leave dead sockets
+    in the pool. The next poll must rebuild and succeed, not stay unreachable
+    until the instance is re-saved by hand."""
+    api_key_instance = InstanceRecord(
+        id=2, name="Token", base_url="https://portainer.test:9443", verify_tls=True,
+        auth_type="api_key", api_key="ptr_x",
+    )
+    for auth_instance in (api_key_instance, CRED_INSTANCE):
+        state = {"calls": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            state["calls"] += 1
+            if state["calls"] == 1:
+                raise httpx.ConnectError("connection lost", request=request)
+            if request.url.path == "/api/auth":
+                return httpx.Response(200, json={"jwt": "jwt-1"})
+            return httpx.Response(200, json=[{"Id": 2}])
+
+        client = PortainerClient(auth_instance, transport=httpx.MockTransport(handler))
+        assert await client.list_endpoints() == [{"Id": 2}]
+        await client.aclose()
+
+
 async def test_credentials_recover_from_portainer_restart():
     """A restart invalidates the JWT, CSRF token, and CSRF cookie at once —
     the client must rebuild the whole session inside one request."""

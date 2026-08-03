@@ -26,8 +26,10 @@ separately.
   healthcheck.
 - **Start / stop** per stack and container, so you can bring something back without
   logging into that machine's Portainer.
-- **Cleans up after itself**: prune unused images (the ones your `:latest` updates leave
-  behind), networks, and — if you explicitly ask — unused volumes.
+- **Cleans up after itself**: prune the leftover images your `:latest` updates leave
+  behind, plus unused networks, and — only if you explicitly ask — every unused image
+  or unused volumes. (Careful with those two: stopping a stack removes its containers,
+  so its images look unused.)
 - **Installs as a web app.** Add it to your phone's home screen; a 30-day session means a
   force-closed app reopens signed in.
 - Instances are added from a settings page — no config files, no restarts.
@@ -137,6 +139,21 @@ docker run -d --name portainer --restart=always \
 ```
 
 Portainer's own config lives in its data volume and survives the recreate.
+
+## Cleaning up
+
+**Clean up** (per instance) prunes, by default, only *dangling* images — the untagged
+old versions a re-pull leaves behind, which is where update leftovers accumulate — plus
+unused networks. Two options are off by default because they can destroy something you
+still want:
+
+- **Every image no container uses.** Stopping a stack in Portainer *removes* its
+  containers, so a stopped stack's images count as unused and get deleted. That stack
+  then can't start until the images are pulled again — a problem if the machine is
+  offline, the tag has moved on, or the image was built locally. Restruo names any
+  stopped stacks in the confirmation before you tick this.
+- **Unused volumes.** Permanently deletes the data in any volume no container
+  references — which, for the same reason, includes the volumes of stopped stacks.
 
 ## Security
 
