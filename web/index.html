@@ -35,6 +35,11 @@
     padding: 14px 20px; border-bottom: 1px solid var(--border);
     background: var(--panel); position: sticky; top: 0; z-index: 5;
   }
+  #home {
+    display: flex; align-items: center; gap: 10px; cursor: pointer;
+    border-radius: 8px; padding: 2px 6px; margin: -2px -6px;
+  }
+  #home:hover { background: var(--bg); }
   header h1 { font-size: 18px; margin: 0; }
   header h1 span { color: var(--muted); font-weight: 400; font-size: 13px; margin-left: 8px; }
   #search {
@@ -125,6 +130,11 @@
   }
   .inst-row:first-child { border-top: none; }
   .inst-row .inst-name { font-weight: 600; }
+  .inst-move {
+    padding: 2px 8px; font-size: 12px; line-height: 1.4; min-width: 26px;
+  }
+  .inst-order { display: flex; flex-direction: column; gap: 2px; }
+  #build-line { color: var(--muted); font-size: 12px; }
   .inst-row .inst-url { color: var(--muted); font-size: 13px; flex: 1; overflow-wrap: anywhere; }
   #inst-form label { display: block; margin: 10px 0 4px; font-size: 13px; color: var(--muted); }
   #inst-form input[type="text"], #inst-form input[type="url"],
@@ -172,8 +182,10 @@
 </head>
 <body>
 <header>
-  <img src="/icon.svg" alt="" width="26" height="26" style="border-radius:6px">
-  <h1 id="title">Restruo <span>Portainer stack updater</span></h1>
+  <div id="home" title="Back to dashboard">
+    <img src="/icon.svg" alt="" width="26" height="26" style="border-radius:6px">
+    <h1 id="title">Restruo <span>Portainer stack updater</span></h1>
+  </div>
   <input id="search" type="search" placeholder="Filter stacks…">
   <button id="settings-btn" title="Manage Portainer instances">⚙ Instances</button>
   <button id="refresh" class="primary" title="Reload stacks and scan registries for updates">Refresh</button>
@@ -229,6 +241,7 @@
     </div>
     <div style="display:flex; gap:10px; align-items:center; justify-content:space-between;">
       <button id="settings-close">← Back to dashboard</button>
+      <span id="build-line"></span>
       <button id="signout-btn" style="display:none">Sign out</button>
     </div>
   </div>
@@ -907,8 +920,15 @@
         list.innerHTML = '<p class="count">No instances yet — add your first Portainer below.</p>';
         return;
       }
-      list.innerHTML = insts.map((i) => `
+      // This order is the dashboard's order.
+      list.innerHTML = insts.map((i, n) => `
         <div class="inst-row">
+          <span class="inst-order">
+            <button class="inst-move" data-id="${i.id}" data-dir="up"
+              ${n === 0 ? "disabled" : ""} title="Move up" aria-label="Move up">▲</button>
+            <button class="inst-move" data-id="${i.id}" data-dir="down"
+              ${n === insts.length - 1 ? "disabled" : ""} title="Move down" aria-label="Move down">▼</button>
+          </span>
           <span class="inst-name">${esc(i.name)}</span>
           <span class="type-tag">${i.authType === "credentials" ? "user/pass" : "API token"}</span>
           ${i.reachable ? '<span class="badge ok">● reachable</span>'
@@ -917,6 +937,16 @@
           <button class="inst-edit" data-id="${i.id}">Edit</button>
           <button class="inst-del" data-id="${i.id}" data-name="${esc(i.name)}">Delete</button>
         </div>`).join("");
+      list.querySelectorAll(".inst-move").forEach((btn) =>
+        btn.addEventListener("click", async () => {
+          btn.disabled = true;
+          await fetch(`/api/instances/${btn.dataset.id}/move`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ direction: btn.dataset.dir }),
+          }).catch(() => {});
+          loadInstances();
+        }));
       list.querySelectorAll(".inst-edit").forEach((btn) =>
         btn.addEventListener("click", () =>
           fillForm(insts.find((i) => i.id === Number(btn.dataset.id)))));
@@ -987,6 +1017,11 @@
   $("#f-cancel").addEventListener("click", () => fillForm(null));
   $("#settings-btn").addEventListener("click", () => showSettings(true));
   $("#settings-close").addEventListener("click", () => showSettings(false));
+  $("#home").addEventListener("click", () => {
+    if ($("#view-login").style.display !== "none") return;  // not signed in yet
+    showSettings(false);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  });
   $("#signout-btn").addEventListener("click", async () => {
     try { await fetch("/api/logout", { method: "POST" }); } catch (err) { /* cookie may already be gone */ }
     showLogin(true);
@@ -1004,8 +1039,13 @@
     if (cfg && cfg.title) {
       document.title = cfg.title;
       $("#login-title").textContent = cfg.title;
-      const ver = cfg.version && cfg.version !== "dev" ? cfg.version.slice(0, 7) : cfg.version || "";
-      $("#title").innerHTML = `${esc(cfg.title)} <span title="Running build ${esc(cfg.version || "")}">Portainer stack updater${ver ? " · " + esc(ver) : ""}</span>`;
+      $("#title").innerHTML = `${esc(cfg.title)} <span>Portainer stack updater</span>`;
+    }
+    // The running build lives on the settings page, out of the way.
+    if (cfg && cfg.version) {
+      const ver = cfg.version === "dev" ? "dev" : cfg.version.slice(0, 7);
+      $("#build-line").textContent = `build ${ver}`;
+      $("#build-line").title = cfg.version;
     }
   }).catch(() => {});
 

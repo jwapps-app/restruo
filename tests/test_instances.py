@@ -52,6 +52,30 @@ async def test_store_crud_and_persistence(tmp_path):
     assert store.list() == []
 
 
+async def test_store_move_reorders_and_persists(tmp_path):
+    path = tmp_path / "instances.json"
+    store = InstanceStore(path)
+    for name in ("A", "B", "C"):
+        await store.add({
+            "name": name, "base_url": f"https://{name}.test",
+            "auth_type": "api_key", "api_key": "k",
+        })
+    assert [r.name for r in store.list()] == ["A", "B", "C"]
+
+    assert await store.move(3, "up") is True
+    assert [r.name for r in store.list()] == ["A", "C", "B"]
+    assert await store.move(1, "down") is True
+    assert [r.name for r in store.list()] == ["C", "A", "B"]
+
+    # Ends refuse to move past the edge, and unknown ids are rejected.
+    assert await store.move(3, "up") is False   # C is already first
+    assert await store.move(2, "down") is False  # B is already last
+    assert await store.move(99, "up") is False
+
+    # Order survives a restart — it's the display order.
+    assert [r.name for r in InstanceStore(path).list()] == ["C", "A", "B"]
+
+
 async def test_store_file_is_owner_only(tmp_path):
     path = tmp_path / "instances.json"
     store = InstanceStore(path)

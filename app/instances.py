@@ -111,6 +111,23 @@ class InstanceStore:
             self._save()
             return record
 
+    async def move(self, iid: int, direction: str) -> bool:
+        """Shift one instance up or down. Stored order is display order."""
+        async with self._lock:
+            record = self.get(iid)
+            if record is None:
+                return False
+            index = self._records.index(record)
+            target = index - 1 if direction == "up" else index + 1
+            if not 0 <= target < len(self._records):
+                return False  # already at the end
+            self._records[index], self._records[target] = (
+                self._records[target],
+                self._records[index],
+            )
+            self._save()
+            return True
+
     async def delete(self, iid: int) -> bool:
         async with self._lock:
             existing = self.get(iid)

@@ -242,6 +242,24 @@ async def edit_instance(request: Request, iid: int, body: InstanceInput):
     return record.public()
 
 
+class MoveInput(BaseModel):
+    direction: str
+
+
+@app.post("/api/instances/{iid}/move", dependencies=[Depends(require_auth)])
+async def move_instance(request: Request, iid: int, body: MoveInput):
+    """Reorder an instance. Stored order drives the dashboard and this list."""
+    if body.direction not in ("up", "down"):
+        raise HTTPException(status_code=422, detail="direction must be 'up' or 'down'")
+    store: InstanceStore = request.app.state.store
+    if store.get(iid) is None:
+        raise HTTPException(status_code=404, detail=f"No instance with id {iid}")
+    # No client rebuild needed: the manager reads store order on every call, so
+    # sessions and CSRF tokens survive a reorder.
+    await store.move(iid, body.direction)
+    return [r.public() for r in store.list()]
+
+
 @app.delete("/api/instances/{iid}", dependencies=[Depends(require_auth)])
 async def delete_instance(request: Request, iid: int):
     if not await request.app.state.store.delete(iid):
