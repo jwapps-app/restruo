@@ -90,6 +90,10 @@
   td.images { color: var(--muted); font-size: 13px; max-width: 320px; overflow-wrap: anywhere; }
   td.when { color: var(--muted); font-size: 13px; white-space: nowrap; }
   .type-tag { font-size: 12px; background: var(--badge-bg); border-radius: 6px; padding: 2px 7px; }
+  .env-tag {
+    font-size: 12px; color: var(--muted); background: var(--badge-bg);
+    border-radius: 6px; padding: 2px 7px; font-weight: 400; margin-left: 6px;
+  }
   .unreachable-note { padding: 12px 16px; color: var(--err); border-top: 1px solid var(--border); font-size: 14px; }
   .result-msg { font-size: 12px; display: block; margin-top: 4px; max-width: 260px; overflow-wrap: anywhere; }
   .result-msg.ok { color: var(--ok); }
@@ -353,13 +357,20 @@
     root.innerHTML = "";
     for (const inst of data) {
       const iid = inst.instance.id;
+      // Only worth labelling when this Portainer manages more than one.
+      const multiEnv = (inst.environments || 1) > 1;
       const byName = (a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
+      // With several environments, group by environment then sort within it.
+      const byPlace = (a, b) =>
+        (multiEnv && (a.environment || "").localeCompare(b.environment || "")) || byName(a, b);
       const stacks = inst.stacks.filter((s) =>
         !filter || s.name.toLowerCase().includes(filter) ||
-        s.images.some((i) => i.toLowerCase().includes(filter))).sort(byName);
+        (s.environment || "").toLowerCase().includes(filter) ||
+        s.images.some((i) => i.toLowerCase().includes(filter))).sort(byPlace);
       const ctrs = (inst.containers || []).filter((c) =>
         !filter || c.name.toLowerCase().includes(filter) ||
-        c.image.toLowerCase().includes(filter)).sort(byName);
+        (c.environment || "").toLowerCase().includes(filter) ||
+        c.image.toLowerCase().includes(filter)).sort(byPlace);
       if (filter && stacks.length === 0 && ctrs.length === 0 && inst.reachable) continue;
 
       const section = document.createElement("section");
@@ -376,6 +387,8 @@
       } else if (stacks.length === 0 && ctrs.length === 0) {
         body = '<div class="stack-body unreachable-note" style="color:var(--muted)">No stacks or standalone containers.</div>';
       } else {
+        const envTag = (row) => multiEnv && row.environment
+          ? ` <span class="env-tag" title="Portainer environment">${esc(row.environment)}</span>` : "";
         const stackRow = (s) => {
           const info = updateInfoFor(iid, s.id);
           const hasUpd = !!(info && info.updatesAvailable);
@@ -387,7 +400,7 @@
               ? ` <span class="badge err" title="${esc(s.downNames.join(", "))}">● ${s.downNames.length} down</span>` : "");
           return `
           <tr>
-            <td><strong>${esc(s.name)}</strong>${downBadge}${updBadge}</td>
+            <td><strong>${esc(s.name)}</strong>${envTag(s)}${downBadge}${updBadge}</td>
             <td class="hide-sm"><span class="type-tag">${esc(s.git ? s.type + " · git" : s.type)}</span></td>
             <td class="images hide-sm">${renderImagesCell(s, iid)}</td>
             <td class="when hide-sm">${fmtWhen(s.updatedAt)}</td>
@@ -411,7 +424,7 @@
             ? ` <span class="badge err" title="${esc(c.statusText || c.state)}">● down</span>` : "";
           return `
           <tr>
-            <td><strong>${esc(c.name)}</strong>${downBadge}${hasUpd ? ' <span class="badge upd">⬆ update</span>' : ""}</td>
+            <td><strong>${esc(c.name)}</strong>${envTag(c)}${downBadge}${hasUpd ? ' <span class="badge upd">⬆ update</span>' : ""}</td>
             <td class="hide-sm"><span class="type-tag">container</span></td>
             <td class="images hide-sm">${imagesCell}</td>
             <td class="when hide-sm"${c.down ? ' style="color:var(--err)"' : ""}>${esc(c.state)}</td>
@@ -426,11 +439,12 @@
             </td>
           </tr>`;
         };
-        // One combined A–Z list — stacks and containers interleaved.
+        // One combined list — stacks and containers interleaved, A–Z, and
+        // grouped by environment when this Portainer manages several.
         const rows = [
-          ...stacks.map((s) => ({ name: s.name, html: () => stackRow(s) })),
-          ...ctrs.map((c) => ({ name: c.name, html: () => ctrRow(c) })),
-        ].sort(byName).map((r) => r.html()).join("");
+          ...stacks.map((s) => ({ name: s.name, environment: s.environment, html: () => stackRow(s) })),
+          ...ctrs.map((c) => ({ name: c.name, environment: c.environment, html: () => ctrRow(c) })),
+        ].sort(byPlace).map((r) => r.html()).join("");
         body = `<div class="stack-body"><table>
           <thead><tr><th>Stack / container</th><th class="hide-sm">Type</th><th class="hide-sm">Images</th>
           <th class="hide-sm">Updated</th><th></th></tr></thead>

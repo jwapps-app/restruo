@@ -314,16 +314,20 @@ async def _stacks_for_instance(iid: int, name: str, client: PortainerClient) -> 
             return []
 
     containers_by_endpoint: dict[int, list[dict]] = {}
+    # One Portainer can manage several environments (agents, remote hosts) —
+    # keep their names so each row can say where it actually runs.
+    environments: dict[int, str] = {}
     try:
         for endpoint in await client.list_endpoints():
+            endpoint_id = endpoint["Id"]
+            environments[endpoint_id] = endpoint.get("Name") or f"env {endpoint_id}"
             try:
-                containers_by_endpoint[endpoint["Id"]] = await client.list_containers(
-                    endpoint["Id"]
-                )
+                containers_by_endpoint[endpoint_id] = await client.list_containers(endpoint_id)
             except Exception:
                 pass
     except Exception:
         pass
+    result["environments"] = len(environments)
 
     image_lists = await asyncio.gather(*(images_for(stack) for stack in stacks))
     for stack, images in zip(stacks, image_lists):
@@ -331,6 +335,7 @@ async def _stacks_for_instance(iid: int, name: str, client: PortainerClient) -> 
         own = stack_containers(stack, containers_by_endpoint.get(stack.get("EndpointId"), []))
         normalized["containersTotal"] = len(own)
         normalized["downNames"] = [container_name(c) for c in own if container_is_down(c)]
+        normalized["environment"] = environments.get(stack.get("EndpointId"), "")
         # Stacks running Portainer or Restruo can't be stopped from here.
         normalized["selfCritical"] = any(
             is_self_critical_image(c.get("Image", "")) for c in own
@@ -343,6 +348,7 @@ async def _stacks_for_instance(iid: int, name: str, client: PortainerClient) -> 
         for c in standalone_containers(containers, stack_names):
             normalized = normalize_container(c, endpoint_id)
             normalized["image"] = await resolve_image_name(client, endpoint_id, c)
+            normalized["environment"] = environments.get(endpoint_id, "")
             result["containers"].append(normalized)
     return result
 
