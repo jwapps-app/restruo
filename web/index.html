@@ -359,18 +359,17 @@
       const iid = inst.instance.id;
       // Only worth labelling when this Portainer manages more than one.
       const multiEnv = (inst.environments || 1) > 1;
+      // Always by name: the environment is a label, not a grouping — a list
+      // that isn't strictly A–Z is hard to scan.
       const byName = (a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
-      // With several environments, group by environment then sort within it.
-      const byPlace = (a, b) =>
-        (multiEnv && (a.environment || "").localeCompare(b.environment || "")) || byName(a, b);
       const stacks = inst.stacks.filter((s) =>
         !filter || s.name.toLowerCase().includes(filter) ||
         (s.environment || "").toLowerCase().includes(filter) ||
-        s.images.some((i) => i.toLowerCase().includes(filter))).sort(byPlace);
+        s.images.some((i) => i.toLowerCase().includes(filter))).sort(byName);
       const ctrs = (inst.containers || []).filter((c) =>
         !filter || c.name.toLowerCase().includes(filter) ||
         (c.environment || "").toLowerCase().includes(filter) ||
-        c.image.toLowerCase().includes(filter)).sort(byPlace);
+        c.image.toLowerCase().includes(filter)).sort(byName);
       if (filter && stacks.length === 0 && ctrs.length === 0 && inst.reachable) continue;
 
       const section = document.createElement("section");
@@ -439,12 +438,11 @@
             </td>
           </tr>`;
         };
-        // One combined list — stacks and containers interleaved, A–Z, and
-        // grouped by environment when this Portainer manages several.
+        // One combined A–Z list — stacks and containers interleaved.
         const rows = [
-          ...stacks.map((s) => ({ name: s.name, environment: s.environment, html: () => stackRow(s) })),
-          ...ctrs.map((c) => ({ name: c.name, environment: c.environment, html: () => ctrRow(c) })),
-        ].sort(byPlace).map((r) => r.html()).join("");
+          ...stacks.map((s) => ({ name: s.name, html: () => stackRow(s) })),
+          ...ctrs.map((c) => ({ name: c.name, html: () => ctrRow(c) })),
+        ].sort(byName).map((r) => r.html()).join("");
         body = `<div class="stack-body"><table>
           <thead><tr><th>Stack / container</th><th class="hide-sm">Type</th><th class="hide-sm">Images</th>
           <th class="hide-sm">Updated</th><th></th></tr></thead>
