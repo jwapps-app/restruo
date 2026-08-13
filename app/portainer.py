@@ -75,7 +75,7 @@ class PortainerClient:
             transport=transport,
         )
 
-    async def _reconnect(self) -> None:
+    async def reconnect(self) -> None:
         """Throw away the connection pool and the session.
 
         When the machine (or its Docker VM) goes away and comes back, the pool
@@ -101,7 +101,7 @@ class PortainerClient:
             # Connection-level failure: rebuild the pool and give it one more
             # go, so a machine that just came back recovers on this poll rather
             # than needing the instance re-saved.
-            await self._reconnect()
+            await self.reconnect()
             return await self._client.request(method, url, **kwargs)
 
     async def aclose(self) -> None:

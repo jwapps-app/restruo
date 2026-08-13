@@ -209,8 +209,10 @@ async def list_instances(request: Request):
             await client.list_endpoints()
         except PortainerError as exc:
             entry.update(reachable=False, error=exc.message)
+            await client.reconnect()
         except Exception as exc:
             entry.update(reachable=False, error=str(exc))
+            await client.reconnect()
         return entry
 
     return await asyncio.gather(
@@ -302,9 +304,13 @@ async def _stacks_for_instance(iid: int, name: str, client: PortainerClient) -> 
         stacks = await client.list_stacks()
     except PortainerError as exc:
         result.update(reachable=False, error=exc.message)
+        # Whatever went wrong, start the next poll from a clean connection and
+        # a fresh login — the same reset that re-saving the instance performs.
+        await client.reconnect()
         return result
     except Exception as exc:
         result.update(reachable=False, error=str(exc))
+        await client.reconnect()
         return result
 
     async def images_for(stack: dict) -> list[str]:

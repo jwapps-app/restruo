@@ -449,11 +449,15 @@
           <tbody>${rows}</tbody></table></div>`;
       }
 
-      const updInst = updates.instances.find((u) => u.instance.id === iid);
-      const instUpdCount = updInst
-        ? updInst.stacks.reduce((n, s) => n + (s.updatesAvailable || 0), 0) +
-          (updInst.containers || []).filter((c) => c.status === "update-available").length
-        : 0;
+      // Count from the rows that actually exist, not straight from the cached
+      // check: an entry for a stack that has since been recreated (new id) or
+      // a container on an environment that didn't enumerate this round would
+      // otherwise be counted here with no row able to show it.
+      const instUpdCount =
+        inst.stacks.reduce(
+          (n, s) => n + ((updateInfoFor(iid, s.id) || {}).updatesAvailable || 0), 0) +
+        (inst.containers || []).filter(
+          (c) => (updateInfoForCtr(iid, c.id) || {}).status === "update-available").length;
       const instDownCount =
         inst.stacks.reduce((n, s) =>
           n + (s.status === "inactive" ? 1 : (s.downNames || []).length), 0) +
@@ -639,7 +643,9 @@
     clearTimeout(refreshTimer);
     if (!refreshBase) return;
     if (data.some((i) => !i.reachable)) {
-      retryDelay = Math.min(retryDelay ? retryDelay * 2 : 10, refreshBase);
+      // Cap at 30s: something that just came back shouldn't sit greyed out for
+      // minutes because the backoff had grown to the full interval.
+      retryDelay = Math.min(retryDelay ? retryDelay * 2 : 10, 30, refreshBase);
     } else {
       retryDelay = null;
     }
