@@ -84,6 +84,7 @@ Everything is optional except the password.
 | `RESTRUO_TITLE` | `Restruo` | Dashboard title |
 | `RESTRUO_FLOATING_TAGS` | `latest` | Comma-separated tags treated as rolling for update checks — e.g. `latest,release` if you run Immich |
 | `RESTRUO_REFRESH_SECONDS` | `180` | How often an open dashboard re-reads container state. `0` disables |
+| `RESTRUO_REGISTRY_AUTH` | — | Logins for private registries, `host=user:token` (comma-separate several) — e.g. `ghcr.io=me:ghp_…` with a `read:packages` token |
 
 For the rest (update-check interval, disabling auth, pre-seeding instances) mount a YAML
 file at `/config/config.yaml` — see [`config.example.yaml`](config.example.yaml).
@@ -110,8 +111,12 @@ performs as a rolling service update.
 - The comparison uses the digest of the image the container is *actually running*, not
   what the local tag points at — those drift apart when something re-pulls a tag without
   recreating the container.
-- Works anonymously against Docker Hub, ghcr.io, lscr.io and other v2 registries. Locally
-  built images and private registries show as not checkable.
+- Works anonymously against Docker Hub, ghcr.io, lscr.io and other v2 registries. An
+  image with no repo digest was never pulled from a registry (built on the box, or made
+  by the NAS itself) and is labelled **local** — there is nothing to compare it to.
+  Images in a registry that refuses anonymous access are labelled **private**; give
+  Restruo a login with `RESTRUO_REGISTRY_AUTH` and they get checked like anything else.
+  Neither counts as a failed check.
 - Runs every 6 hours (configurable) and whenever you hit **Refresh**, which reloads
   container state immediately and scans registries in the background.
 

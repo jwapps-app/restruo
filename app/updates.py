@@ -18,7 +18,7 @@ from .portainer import (
     stack_images,
     standalone_containers,
 )
-from .registry import RegistryClient, parse_image_ref
+from .registry import RegistryClient, RegistryError, parse_image_ref
 
 logger = logging.getLogger("restruo.updates")
 
@@ -26,6 +26,8 @@ STATUS_UPDATE_AVAILABLE = "update-available"
 STATUS_UP_TO_DATE = "up-to-date"
 STATUS_PINNED = "pinned"
 STATUS_UNKNOWN = "unknown"
+STATUS_LOCAL = "local"
+STATUS_PRIVATE = "private"
 
 
 class UpdateChecker:
@@ -119,11 +121,9 @@ class UpdateChecker:
         if ref.pinned_digest or ref.tag not in self.floating_tags:
             return {"image": raw, "status": STATUS_PINNED}
 
-        try:
-            remote_digest = await self._remote_digest(ref)
-        except Exception as exc:
-            return {"image": raw, "status": STATUS_UNKNOWN, "detail": f"registry: {exc}"}
-
+        # Local first: an image with no repo digest never came from a registry
+        # (built on the box, or created by the NAS itself), so there is nothing
+        # to compare against and no point asking a registry about it.
         local_digests = await self._running_digests(client, endpoint_id, raw, containers)
         if local_digests is None:
             # No matching container found — fall back to what the tag points at.
@@ -136,8 +136,19 @@ class UpdateChecker:
                 return {"image": raw, "status": STATUS_UNKNOWN, "detail": f"local image: {exc}"}
 
         if not local_digests:
-            # Locally built image with no repo digest — nothing to compare.
-            return {"image": raw, "status": STATUS_UNKNOWN, "detail": "no local repo digest"}
+            return {"image": raw, "status": STATUS_LOCAL,
+                    "detail": "built or loaded locally — not published to a registry"}
+
+        try:
+            remote_digest = await self._remote_digest(ref)
+        except RegistryError as exc:
+            if exc.status_code in (401, 403):
+                return {"image": raw, "status": STATUS_PRIVATE,
+                        "detail": f"{ref.registry} needs credentials for this image — "
+                                  "set RESTRUO_REGISTRY_AUTH"}
+            return {"image": raw, "status": STATUS_UNKNOWN, "detail": f"registry: {exc}"}
+        except Exception as exc:
+            return {"image": raw, "status": STATUS_UNKNOWN, "detail": f"registry: {exc}"}
 
         if remote_digest in local_digests:
             return {"image": raw, "status": STATUS_UP_TO_DATE}

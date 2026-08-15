@@ -299,6 +299,10 @@
       return `<span class="img-line" title="Pinned to a specific version — not checked">${esc(img.image)} <span class="img-note">pinned</span></span>`;
     if (img.status === "up-to-date")
       return `<span class="img-line" title="Up to date with the registry">${esc(img.image)}</span>`;
+    if (img.status === "local")
+      return `<span class="img-line" title="${esc(img.detail || "Not from a registry")}">${esc(img.image)} <span class="img-note">local</span></span>`;
+    if (img.status === "private")
+      return `<span class="img-line unk" title="${esc(img.detail || "Private registry")}">${esc(img.image)} <span class="img-note">private</span></span>`;
     return `<span class="img-line unk" title="${esc(img.detail || "Could not check")}">${esc(img.image)} <span class="img-note">?</span></span>`;
   }
 
@@ -393,6 +397,8 @@
         // reach) is neither down nor out of date — but it IS unmonitored, and
         // the Images column that says so is hidden on phones.
         const unknownBadge = (images) => {
+          // "local" and "private" are inherent properties, not failures — only
+          // count checks that actually broke.
           const unknown = (images || []).filter((i) => i.status === "unknown");
           if (!unknown.length) return "";
           const why = unknown.map((i) => `${i.image}: ${i.detail || "could not check"}`).join("\n");

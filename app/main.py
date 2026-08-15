@@ -66,7 +66,10 @@ async def lifespan(app: FastAPI):
     app.state.manager = manager
     app.state.sessions = SessionManager(store.path.parent / "session_secret")
 
-    app.state.registry = RegistryClient()
+    app.state.registry = RegistryClient(credentials={
+        host: (creds.split(":", 1)[0], creds.split(":", 1)[1])
+        for host, creds in config.updates.registry_auth.items()
+    })
     app.state.checker = UpdateChecker(
         manager.items,
         app.state.registry,

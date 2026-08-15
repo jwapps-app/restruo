@@ -377,3 +377,99 @@ async def test_running_container_current_is_up_to_date():
     assert by_image["registry.test/acme/web:latest"] == "up-to-date"
     await portainer.aclose()
     await registry.aclose()
+
+
+async def local_only_transport() -> httpx.MockTransport:
+    """A Synology-made image: present locally, never pulled from a registry."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/stacks":
+            return httpx.Response(200, json=[STACK])
+        if path == "/api/stacks/1/file":
+            return httpx.Response(200, json={
+                "StackFileContent": "services:\n  v:\n    image: synology/docviewer:latest\n"})
+        if path == "/api/endpoints":
+            return httpx.Response(200, json=[{"Id": 2}])
+        if path == "/api/endpoints/2/docker/containers/json":
+            return httpx.Response(200, json=[])
+        if path.startswith("/api/endpoints/2/docker/images/"):
+            return httpx.Response(200, json={"RepoTags": ["synology/docviewer:latest"],
+                                             "RepoDigests": []})
+        raise AssertionError(f"unexpected: {request.url}")
+    return httpx.MockTransport(handler)
+
+
+async def test_locally_built_images_are_not_reported_as_failures():
+    """No repo digest means it never came from a registry — nothing to check,
+    and no registry request should be made at all."""
+    registry_calls = []
+
+    def registry_handler(request: httpx.Request) -> httpx.Response:
+        registry_calls.append(str(request.url))
+        return httpx.Response(200, headers={"Docker-Content-Digest": NEW_DIGEST})
+
+    portainer = PortainerClient(INSTANCE, transport=await local_only_transport())
+    registry = RegistryClient(transport=httpx.MockTransport(registry_handler))
+    checker = UpdateChecker(lambda: [(0, portainer)], registry, interval_hours=6)
+    snapshot = await checker.check_all()
+    image = snapshot["instances"][0]["stacks"][0]["images"][0]
+    assert image["status"] == "local"
+    assert registry_calls == []  # didn't bother the registry
+    await portainer.aclose()
+    await registry.aclose()
+
+
+async def test_private_registry_is_reported_distinctly():
+    def portainer_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/stacks":
+            return httpx.Response(200, json=[STACK])
+        if path == "/api/stacks/1/file":
+            return httpx.Response(200, json={
+                "StackFileContent": "services:\n  a:\n    image: ghcr.io/acme/private:latest\n"})
+        if path == "/api/endpoints":
+            return httpx.Response(200, json=[{"Id": 2}])
+        if path == "/api/endpoints/2/docker/containers/json":
+            return httpx.Response(200, json=[])
+        if path.startswith("/api/endpoints/2/docker/images/"):
+            return httpx.Response(200, json={
+                "RepoDigests": [f"ghcr.io/acme/private@{OLD_DIGEST}"]})
+        raise AssertionError(f"unexpected: {request.url}")
+
+    def registry_handler(request: httpx.Request) -> httpx.Response:
+        if "token" in str(request.url):
+            return httpx.Response(200, json={"token": "anon"})
+        return httpx.Response(403, headers={
+            "WWW-Authenticate": 'Bearer realm="https://ghcr.io/token",service="ghcr.io"'})
+
+    portainer = PortainerClient(INSTANCE, transport=httpx.MockTransport(portainer_handler))
+    registry = RegistryClient(transport=httpx.MockTransport(registry_handler))
+    checker = UpdateChecker(lambda: [(0, portainer)], registry, interval_hours=6)
+    snapshot = await checker.check_all()
+    image = snapshot["instances"][0]["stacks"][0]["images"][0]
+    assert image["status"] == "private"
+    assert "credentials" in image["detail"]
+    await portainer.aclose()
+    await registry.aclose()
+
+
+async def test_registry_credentials_are_sent_when_configured():
+    seen_auth = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "token" in str(request.url):
+            seen_auth["header"] = request.headers.get("authorization")
+            return httpx.Response(200, json={"token": "scoped"})
+        if request.headers.get("Authorization") == "Bearer scoped":
+            return httpx.Response(200, headers={"Docker-Content-Digest": NEW_DIGEST})
+        return httpx.Response(401, headers={
+            "WWW-Authenticate": 'Bearer realm="https://ghcr.io/token",service="ghcr.io"'})
+
+    registry = RegistryClient(
+        transport=httpx.MockTransport(handler),
+        credentials={"ghcr.io": ("me", "ghp_secret")},
+    )
+    digest = await registry.get_remote_digest(parse_image_ref("ghcr.io/acme/private:latest"))
+    await registry.aclose()
+    assert digest == NEW_DIGEST
+    assert seen_auth["header"].startswith("Basic ")  # credentials were used

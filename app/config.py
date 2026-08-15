@@ -57,6 +57,17 @@ def _floating_tags_default() -> list[str]:
     return [tag.strip() for tag in raw.split(",") if tag.strip()]
 
 
+def _registry_auth_default() -> dict[str, str]:
+    """RESTRUO_REGISTRY_AUTH="ghcr.io=user:token,registry.lan=user:pw" — logins
+    used when checking private images for updates."""
+    out: dict[str, str] = {}
+    for entry in os.environ.get("RESTRUO_REGISTRY_AUTH", "").split(","):
+        host, _, creds = entry.strip().partition("=")
+        if host and ":" in creds:
+            out[host] = creds
+    return out
+
+
 class UpdatesConfig(BaseModel):
     enabled: bool = True
     interval_hours: float = Field(default=6, gt=0)
@@ -64,6 +75,8 @@ class UpdatesConfig(BaseModel):
     # is considered pinned. Some projects use rolling tags besides latest,
     # e.g. immich's :release.
     floating_tags: list[str] = Field(default_factory=_floating_tags_default)
+    # host -> "username:token"
+    registry_auth: dict[str, str] = Field(default_factory=_registry_auth_default)
 
 
 class AppConfig(BaseModel):

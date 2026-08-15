@@ -29,7 +29,9 @@ _CHALLENGE_FIELD_RE = re.compile(r'(\w+)="([^"]*)"')
 
 
 class RegistryError(Exception):
-    pass
+    def __init__(self, message: str, status_code: int | None = None):
+        self.status_code = status_code
+        super().__init__(message)
 
 
 @dataclass(frozen=True)
@@ -74,10 +76,17 @@ def parse_image_ref(raw: str) -> ImageRef | None:
 
 
 class RegistryClient:
-    def __init__(self, transport: httpx.AsyncBaseTransport | None = None):
+    def __init__(
+        self,
+        transport: httpx.AsyncBaseTransport | None = None,
+        credentials: dict[str, tuple[str, str]] | None = None,
+    ):
         kwargs = {} if transport is None else {"transport": transport}
         self._client = httpx.AsyncClient(timeout=REGISTRY_TIMEOUT, **kwargs)
         self._tokens: dict[tuple[str, str], str] = {}
+        # Per-registry login, so private images can be checked too. Keyed by the
+        # name as written in the image (ghcr.io, docker.io, …).
+        self._credentials = credentials or {}
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -106,7 +115,8 @@ class RegistryClient:
 
         if response.status_code != 200:
             raise RegistryError(
-                f"{host} returned {response.status_code} for {ref.repository}:{ref.tag}"
+                f"{host} returned {response.status_code} for {ref.repository}:{ref.tag}",
+                status_code=response.status_code,
             )
         digest = response.headers.get("docker-content-digest")
         if not digest:
@@ -121,9 +131,14 @@ class RegistryClient:
         params = {"scope": fields.get("scope") or f"repository:{ref.repository}:pull"}
         if fields.get("service"):
             params["service"] = fields["service"]
-        response = await self._client.get(realm, params=params)
+        # With credentials the token comes back scoped to private repos too.
+        auth = self._credentials.get(ref.registry)
+        response = await self._client.get(realm, params=params, auth=auth)
         if response.status_code != 200:
-            raise RegistryError(f"token request to {realm} failed ({response.status_code})")
+            raise RegistryError(
+                f"token request to {realm} failed ({response.status_code})",
+                status_code=response.status_code,
+            )
         body = response.json()
         token = body.get("token") or body.get("access_token")
         if not token:
