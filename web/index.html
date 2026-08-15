@@ -72,6 +72,7 @@
   .badge.ok { color: var(--ok); }
   .badge.err { color: var(--err); }
   .badge.upd { color: var(--accent); font-weight: 600; }
+  .badge.unk { color: var(--warn); cursor: help; }
   .update-btn.has-upd, .update-all-btn.has-upd {
     background: var(--accent); border-color: var(--accent);
     color: var(--accent-text); font-weight: 600;
@@ -388,6 +389,15 @@
       } else {
         const envTag = (row) => multiEnv && row.environment
           ? ` <span class="env-tag" title="Portainer environment">${esc(row.environment)}</span>` : "";
+        // An image whose check failed (usually an environment we couldn't
+        // reach) is neither down nor out of date — but it IS unmonitored, and
+        // the Images column that says so is hidden on phones.
+        const unknownBadge = (images) => {
+          const unknown = (images || []).filter((i) => i.status === "unknown");
+          if (!unknown.length) return "";
+          const why = unknown.map((i) => `${i.image}: ${i.detail || "could not check"}`).join("\n");
+          return ` <span class="badge unk" title="${esc(why)}">? unchecked</span>`;
+        };
         const stackRow = (s) => {
           const info = updateInfoFor(iid, s.id);
           const hasUpd = !!(info && info.updatesAvailable);
@@ -399,7 +409,7 @@
               ? ` <span class="badge err" title="${esc(s.downNames.join(", "))}">● ${s.downNames.length} down</span>` : "");
           return `
           <tr>
-            <td><strong>${esc(s.name)}</strong>${envTag(s)}${downBadge}${updBadge}</td>
+            <td><strong>${esc(s.name)}</strong>${envTag(s)}${downBadge}${updBadge}${unknownBadge(info && info.images)}</td>
             <td class="hide-sm"><span class="type-tag">${esc(s.git ? s.type + " · git" : s.type)}</span></td>
             <td class="images hide-sm">${renderImagesCell(s, iid)}</td>
             <td class="when hide-sm">${fmtWhen(s.updatedAt)}</td>
@@ -423,7 +433,7 @@
             ? ` <span class="badge err" title="${esc(c.statusText || c.state)}">● down</span>` : "";
           return `
           <tr>
-            <td><strong>${esc(c.name)}</strong>${envTag(c)}${downBadge}${hasUpd ? ' <span class="badge upd">⬆ update</span>' : ""}</td>
+            <td><strong>${esc(c.name)}</strong>${envTag(c)}${downBadge}${hasUpd ? ' <span class="badge upd">⬆ update</span>' : ""}${unknownBadge(cInfo ? [cInfo] : null)}</td>
             <td class="hide-sm"><span class="type-tag">container</span></td>
             <td class="images hide-sm">${imagesCell}</td>
             <td class="when hide-sm"${c.down ? ' style="color:var(--err)"' : ""}>${esc(c.state)}</td>
@@ -458,6 +468,11 @@
           (n, s) => n + ((updateInfoFor(iid, s.id) || {}).updatesAvailable || 0), 0) +
         (inst.containers || []).filter(
           (c) => (updateInfoForCtr(iid, c.id) || {}).status === "update-available").length;
+      const instUnknownCount =
+        inst.stacks.reduce((n, st) => n + (((updateInfoFor(iid, st.id) || {}).images || [])
+          .some((i) => i.status === "unknown") ? 1 : 0), 0) +
+        (inst.containers || []).filter(
+          (c) => (updateInfoForCtr(iid, c.id) || {}).status === "unknown").length;
       const instDownCount =
         inst.stacks.reduce((n, s) =>
           n + (s.status === "inactive" ? 1 : (s.downNames || []).length), 0) +
@@ -470,6 +485,7 @@
           <span class="count">${inst.stacks.length} stack${inst.stacks.length === 1 ? "" : "s"}${ctrCount ? ` · ${ctrCount} container${ctrCount === 1 ? "" : "s"}` : ""}</span>
           ${instDownCount ? `<span class="badge err">● ${instDownCount} down</span>` : ""}
           ${instUpdCount ? `<span class="badge upd">⬆ ${instUpdCount} update${instUpdCount === 1 ? "" : "s"}</span>` : ""}
+          ${instUnknownCount ? `<span class="badge unk" title="Couldn't check these for updates — usually an environment Restruo can't reach">? ${instUnknownCount} unchecked</span>` : ""}
           ${badge}
           ${inst.reachable ? `<button class="cleanup-btn" data-iid="${iid}" title="Remove unused images, networks, and optionally volumes">Clean up</button>` : ""}
           ${inst.reachable && (inst.stacks.length || ctrCount) ?
