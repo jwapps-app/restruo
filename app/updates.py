@@ -12,10 +12,10 @@ import time
 from .notifiers import Notifier, UpdateEvent
 from .portainer import (
     PortainerClient,
-    extract_images,
     normalize_container,
     resolve_image_name,
     stack_containers,
+    stack_images,
     standalone_containers,
 )
 from .registry import RegistryClient, parse_image_ref
@@ -186,9 +186,10 @@ class UpdateChecker:
                 stack, await containers_for(stack["EndpointId"])
             )
             try:
-                images = extract_images(await client.get_stack_file(stack["Id"]))
+                content = await client.get_stack_file(stack["Id"])
             except Exception:
-                images = []
+                content = ""
+            images = stack_images(stack, content, own_containers)
             checked = list(await asyncio.gather(
                 *(check_image_bounded(stack["EndpointId"], raw, own_containers)
                   for raw in images)

@@ -22,12 +22,12 @@ from .portainer import (
     PortainerError,
     container_is_down,
     container_name,
-    extract_images,
     is_self_critical_image,
     normalize_container,
     normalize_stack,
     resolve_image_name,
     stack_containers,
+    stack_images,
     standalone_containers,
 )
 from .registry import RegistryClient
@@ -313,11 +313,12 @@ async def _stacks_for_instance(iid: int, name: str, client: PortainerClient) -> 
         await client.reconnect()
         return result
 
-    async def images_for(stack: dict) -> list[str]:
+    async def images_for(stack: dict, own: list[dict]) -> list[str]:
         try:
-            return extract_images(await client.get_stack_file(stack["Id"]))
+            content = await client.get_stack_file(stack["Id"])
         except Exception:
             return []
+        return stack_images(stack, content, own)
 
     containers_by_endpoint: dict[int, list[dict]] = {}
     # One Portainer can manage several environments (agents, remote hosts) —
@@ -335,10 +336,15 @@ async def _stacks_for_instance(iid: int, name: str, client: PortainerClient) -> 
         pass
     result["environments"] = len(environments)
 
-    image_lists = await asyncio.gather(*(images_for(stack) for stack in stacks))
-    for stack, images in zip(stacks, image_lists):
+    owned = [
+        stack_containers(stack, containers_by_endpoint.get(stack.get("EndpointId"), []))
+        for stack in stacks
+    ]
+    image_lists = await asyncio.gather(
+        *(images_for(stack, own) for stack, own in zip(stacks, owned))
+    )
+    for stack, images, own in zip(stacks, image_lists, owned):
         normalized = normalize_stack(stack, images)
-        own = stack_containers(stack, containers_by_endpoint.get(stack.get("EndpointId"), []))
         normalized["containersTotal"] = len(own)
         normalized["downNames"] = [container_name(c) for c in own if container_is_down(c)]
         normalized["environment"] = environments.get(stack.get("EndpointId"), "")

@@ -291,3 +291,50 @@ def test_normalize_stack():
         "images": ["nginx:1.27"],
         "updatedAt": 1751400000,
     }
+
+
+def test_interpolates_compose_variables_in_images():
+    """Stack files routinely use ${VAR} — the raw text alone can't be checked."""
+    from app.portainer import stack_images
+
+    content = (
+        "services:\n"
+        "  backend:\n"
+        "    image: ${IMAGE_PREFIX}-backend:${IMAGE_TAG:-latest}\n"
+        "  frontend:\n"
+        "    image: ${IMAGE_PREFIX}-frontend:${IMAGE_TAG:-latest}\n"
+        "  db:\n"
+        "    image: postgres:16-alpine\n"
+    )
+    stack = {"Name": "app", "Env": [{"name": "IMAGE_PREFIX", "value": "ghcr.io/acme/app"}]}
+    # IMAGE_TAG is unset, so its :- default applies.
+    assert stack_images(stack, content, []) == [
+        "ghcr.io/acme/app-backend:latest",
+        "ghcr.io/acme/app-frontend:latest",
+        "postgres:16-alpine",
+    ]
+
+    # Explicit tag wins over the default.
+    stack_tagged = {"Name": "app", "Env": [
+        {"name": "IMAGE_PREFIX", "value": "ghcr.io/acme/app"},
+        {"name": "IMAGE_TAG", "value": "v2"},
+    ]}
+    assert stack_images(stack_tagged, content, [])[0] == "ghcr.io/acme/app-backend:v2"
+
+
+def test_falls_back_to_running_images_when_variables_are_unknown():
+    """Variables defined outside Portainer can't be resolved — but the stack's
+    containers know exactly what they are running."""
+    from app.portainer import stack_images
+
+    content = "services:\n  app:\n    image: ${SOMETHING_EXTERNAL}:latest\n"
+    stack = {"Name": "app", "Env": []}
+    containers = [{"Image": "ghcr.io/acme/real-app:latest"}]
+    assert stack_images(stack, content, containers) == ["ghcr.io/acme/real-app:latest"]
+
+
+def test_plain_images_are_untouched():
+    from app.portainer import stack_images
+
+    content = "services:\n  web:\n    image: nginx:latest\n"
+    assert stack_images({"Name": "w", "Env": []}, content, []) == ["nginx:latest"]

@@ -46,6 +46,70 @@ def extract_images(stack_file_content: str) -> list[str]:
     return list(seen)
 
 
+# ${VAR}, ${VAR:-default}, ${VAR-default}, ${VAR:?msg}, ${VAR?msg}, $VAR
+_INTERPOLATE_RE = re.compile(
+    r"\$\{([A-Za-z_]\w*)(?::?[-?]([^}]*))?\}|\$([A-Za-z_]\w*)"
+)
+
+
+def stack_env(stack: dict) -> dict[str, str]:
+    """The stack's environment variables, as compose would see them."""
+    env = {}
+    for item in stack.get("Env") or []:
+        name = item.get("name")
+        if name:
+            env[name] = item.get("value") or ""
+    return env
+
+
+def interpolate(value: str, env: dict[str, str]) -> str | None:
+    """Resolve compose-style variables in an image reference.
+
+    Stack files routinely read `${IMAGE_PREFIX}-backend:${IMAGE_TAG:-latest}`;
+    the raw file alone says nothing about what is actually running. Returns None
+    if a variable has neither a value nor a default — substituting empty text
+    would silently produce a nonsense reference like ":latest".
+    """
+    unresolved = False
+
+    def replace(match: re.Match) -> str:
+        nonlocal unresolved
+        name = match.group(1) or match.group(3)
+        default = match.group(2)
+        if env.get(name):
+            return env[name]
+        if default is not None:
+            return default
+        unresolved = True
+        return ""
+
+    resolved = _INTERPOLATE_RE.sub(replace, value or "")
+    return None if unresolved else resolved
+
+
+def stack_images(stack: dict, file_content: str, containers: list[dict]) -> list[str]:
+    """Images a stack uses, resolved as far as we can manage.
+
+    Compose variables are substituted from the stack's own environment; if any
+    are still unresolved (defined outside Portainer, say) fall back to what the
+    stack's containers are actually running, which is the ground truth anyway.
+    """
+    env = stack_env(stack)
+    declared = extract_images(file_content)
+    images = [interpolate(image, env) for image in declared]
+    if all(image is not None for image in images):
+        return images
+
+    resolved = [image for image in images if image is not None]
+    for container in containers:
+        image = container.get("Image") or ""
+        if image and image not in resolved:
+            resolved.append(image)
+    # Nothing to fall back on (a stopped stack, say) — keep the raw references
+    # so the row still shows something recognisable.
+    return resolved or declared
+
+
 class PortainerClient:
     def __init__(self, instance, transport: httpx.AsyncBaseTransport | None = None):
         self.instance = instance
