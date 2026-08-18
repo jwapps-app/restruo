@@ -84,10 +84,10 @@ Everything is optional except the password.
 | `RESTRUO_TITLE` | `Restruo` | Dashboard title |
 | `RESTRUO_FLOATING_TAGS` | `latest` | Comma-separated tags treated as rolling for update checks — e.g. `latest,release` if you run Immich |
 | `RESTRUO_REFRESH_SECONDS` | `180` | How often an open dashboard re-reads container state. `0` disables |
-| `RESTRUO_SMTP_HOST` | — | Mail server for update notifications (with `RESTRUO_EMAIL_TO`, enables email) |
+| `RESTRUO_SMTP_USER` / `RESTRUO_SMTP_PASSWORD` | — | Your mail address and password — enough on its own for Gmail, Outlook, Yahoo, iCloud, or Fastmail |
+| `RESTRUO_SMTP_HOST` | inferred from the address | Only needed for a provider not in that list, or your own relay |
 | `RESTRUO_SMTP_PORT` | `587` | `587` for STARTTLS, `465` for SSL, `25` for a local relay |
-| `RESTRUO_SMTP_USER` / `RESTRUO_SMTP_PASSWORD` | — | Mail login, if the server needs one |
-| `RESTRUO_EMAIL_TO` | — | Where to send notifications (comma-separate several) |
+| `RESTRUO_EMAIL_TO` | your own address | Where to send notifications (comma-separate several) |
 | `RESTRUO_EMAIL_FROM` | `RESTRUO_SMTP_USER` | Sender address |
 | `RESTRUO_SMTP_SECURITY` | `starttls` | `starttls`, `ssl`, or `none` |
 | `RESTRUO_REGISTRY_AUTH` | — | Logins for private registries, `host=user:token` (comma-separate several) — e.g. `ghcr.io=me:ghp_…` with a `read:packages` token |
@@ -128,8 +128,16 @@ performs as a rolling service update.
 
 ## Email notifications
 
-Set the `RESTRUO_SMTP_*` and `RESTRUO_EMAIL_*` variables above and Restruo emails you
-when a check finds something new — grouped by instance, one message per check, and only
+For a mainstream mail account, two variables are the whole setup:
+
+```
+RESTRUO_SMTP_USER=you@gmail.com
+RESTRUO_SMTP_PASSWORD=your-app-password
+```
+
+The server, port, sender, and recipient are all inferred from that address (Gmail,
+Outlook/Hotmail, Yahoo, iCloud and Fastmail are recognised; anything else needs
+`RESTRUO_SMTP_HOST`). Restruo then emails you when a check finds something new — grouped by instance, one message per check, and only
 for findings it hasn't already reported. Sending is outbound only, so nothing has to be
 exposed to the internet and no HTTPS or reverse proxy is involved.
 

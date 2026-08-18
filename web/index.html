@@ -1125,8 +1125,8 @@
     if (cfg && cfg.email) {
       $("#email-panel").style.display = "";
       $("#email-status").textContent = cfg.email.configured
-        ? `Emailing new updates to ${cfg.email.recipients.join(", ")}.`
-        : "Not configured — set RESTRUO_SMTP_HOST, RESTRUO_EMAIL_TO and a sender to get an email when an update appears.";
+        ? `Emailing new updates to ${cfg.email.recipients.join(", ")} via ${cfg.email.host}.`
+        : "Not configured — set RESTRUO_SMTP_USER and RESTRUO_SMTP_PASSWORD to get an email when an update appears.";
       $("#email-test").disabled = !cfg.email.configured;
     }
     // The running build lives on the settings page, out of the way.

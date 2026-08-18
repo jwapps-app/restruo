@@ -677,6 +677,7 @@ async def ui_config(request: Request):
         "email": {
             "configured": request.app.state.config.email.configured,
             "recipients": request.app.state.config.email.recipients,
+            "host": request.app.state.config.email.host,
         },
     }
 

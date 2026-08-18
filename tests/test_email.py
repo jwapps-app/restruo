@@ -1,6 +1,7 @@
 """Email notifications, exercised against a real (in-process) SMTP server."""
 
 import asyncio
+import os
 import socket
 import threading
 
@@ -112,3 +113,39 @@ def test_notifier_is_only_built_when_configured():
         email = EmailConfig(host="smtp.test", sender="a@b.c", recipients=["me@example.com"])
 
     assert any(isinstance(n, EmailNotifier) for n in build_notifiers(Configured()))
+
+
+def test_known_providers_need_only_an_address_and_password(monkeypatch):
+    """Two variables should be enough for a mainstream mail account."""
+    import importlib
+    import app.config
+
+    def configure(**env):
+        for key in list(os.environ):
+            if key.startswith(("RESTRUO_SMTP", "RESTRUO_EMAIL")):
+                monkeypatch.delenv(key, raising=False)
+        for key, value in env.items():
+            monkeypatch.setenv(key, value)
+        importlib.reload(app.config)
+        return app.config.EmailConfig()
+
+    gmail = configure(RESTRUO_SMTP_USER="me@gmail.com", RESTRUO_SMTP_PASSWORD="app-pw")
+    assert gmail.host == "smtp.gmail.com"
+    assert gmail.port == 587 and gmail.security == "starttls"
+    assert gmail.recipients == ["me@gmail.com"]  # defaults to mailing yourself
+    assert gmail.from_address == "me@gmail.com"
+    assert gmail.configured
+
+    assert configure(RESTRUO_SMTP_USER="me@icloud.com").host == "smtp.mail.me.com"
+
+    # An explicit host always wins, and an unknown domain needs one.
+    assert configure(
+        RESTRUO_SMTP_USER="me@gmail.com", RESTRUO_SMTP_HOST="smtp.lan"
+    ).host == "smtp.lan"
+    assert configure(RESTRUO_SMTP_USER="me@my-own-domain.org").configured is False
+
+    # Explicit recipients still override the default.
+    assert configure(
+        RESTRUO_SMTP_USER="me@gmail.com", RESTRUO_EMAIL_TO="a@x.com, b@y.com"
+    ).recipients == ["a@x.com", "b@y.com"]
+    importlib.reload(app.config)

@@ -83,20 +83,48 @@ def _env_str(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
 
 
+# Setting a server by hand is the boring part, and the address already says
+# which one it is. Ports are 587/STARTTLS for all of these.
+SMTP_HOSTS = {
+    "gmail.com": "smtp.gmail.com",
+    "googlemail.com": "smtp.gmail.com",
+    "outlook.com": "smtp-mail.outlook.com",
+    "hotmail.com": "smtp-mail.outlook.com",
+    "live.com": "smtp-mail.outlook.com",
+    "yahoo.com": "smtp.mail.yahoo.com",
+    "icloud.com": "smtp.mail.me.com",
+    "me.com": "smtp.mail.me.com",
+    "fastmail.com": "smtp.fastmail.com",
+}
+
+
+def _smtp_host_default() -> str:
+    """An explicit host wins; otherwise infer it from the account's domain, so
+    a known provider needs only an address and password."""
+    explicit = _env_str("RESTRUO_SMTP_HOST")
+    if explicit:
+        return explicit
+    domain = _env_str("RESTRUO_SMTP_USER").rpartition("@")[2].lower()
+    return SMTP_HOSTS.get(domain, "")
+
+
+def _recipients_default() -> list[str]:
+    """Default to mailing yourself — the usual case for a homelab."""
+    listed = [a.strip() for a in _env_str("RESTRUO_EMAIL_TO").split(",") if a.strip()]
+    if listed:
+        return listed
+    account = _env_str("RESTRUO_SMTP_USER")
+    return [account] if "@" in account else []
+
+
 class EmailConfig(BaseModel):
     """Outbound-only notifications: nothing has to be exposed to send mail."""
-    host: str = Field(default_factory=lambda: _env_str("RESTRUO_SMTP_HOST"))
+    host: str = Field(default_factory=_smtp_host_default)
     port: int = Field(default_factory=lambda: int(_env_str("RESTRUO_SMTP_PORT", "587") or 587))
     username: str = Field(default_factory=lambda: _env_str("RESTRUO_SMTP_USER"))
     password_env: str = "RESTRUO_SMTP_PASSWORD"
     sender: str = Field(default_factory=lambda: _env_str("RESTRUO_EMAIL_FROM"))
-    recipients: list[str] = Field(
-        default_factory=lambda: [
-            address.strip()
-            for address in _env_str("RESTRUO_EMAIL_TO").split(",")
-            if address.strip()
-        ]
-    )
+    recipients: list[str] = Field(default_factory=_recipients_default)
     # starttls (587, the usual), ssl (465), or none.
     security: str = Field(default_factory=lambda: _env_str("RESTRUO_SMTP_SECURITY", "starttls"))
 
