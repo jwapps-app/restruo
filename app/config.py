@@ -79,12 +79,47 @@ class UpdatesConfig(BaseModel):
     registry_auth: dict[str, str] = Field(default_factory=_registry_auth_default)
 
 
+def _env_str(name: str, default: str = "") -> str:
+    return os.environ.get(name, default).strip()
+
+
+class EmailConfig(BaseModel):
+    """Outbound-only notifications: nothing has to be exposed to send mail."""
+    host: str = Field(default_factory=lambda: _env_str("RESTRUO_SMTP_HOST"))
+    port: int = Field(default_factory=lambda: int(_env_str("RESTRUO_SMTP_PORT", "587") or 587))
+    username: str = Field(default_factory=lambda: _env_str("RESTRUO_SMTP_USER"))
+    password_env: str = "RESTRUO_SMTP_PASSWORD"
+    sender: str = Field(default_factory=lambda: _env_str("RESTRUO_EMAIL_FROM"))
+    recipients: list[str] = Field(
+        default_factory=lambda: [
+            address.strip()
+            for address in _env_str("RESTRUO_EMAIL_TO").split(",")
+            if address.strip()
+        ]
+    )
+    # starttls (587, the usual), ssl (465), or none.
+    security: str = Field(default_factory=lambda: _env_str("RESTRUO_SMTP_SECURITY", "starttls"))
+
+    @property
+    def password(self) -> str:
+        return os.environ.get(self.password_env, "")
+
+    @property
+    def from_address(self) -> str:
+        return self.sender or self.username
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.host and self.recipients and self.from_address)
+
+
 class AppConfig(BaseModel):
     # Optional seed list: imported into the instance store on first start,
     # then managed from the settings UI.
     instances: list[InstanceConfig] = Field(default_factory=list)
     ui: UIConfig = Field(default_factory=UIConfig)
     updates: UpdatesConfig = Field(default_factory=UpdatesConfig)
+    email: EmailConfig = Field(default_factory=EmailConfig)
 
 
 DEFAULT_CONFIG_PATH = "/config/config.yaml"

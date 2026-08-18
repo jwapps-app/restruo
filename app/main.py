@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from .auth import SESSION_COOKIE, SESSION_TTL_SECONDS, SessionManager
 from .config import AppConfig, load_config
 from .instances import ClientManager, InstanceRecord, InstanceStore
-from .notifiers import build_notifiers
+from .notifiers import EmailNotifier, UpdateEvent, build_notifiers, compose_body
 from .portainer import (
     PortainerClient,
     PortainerError,
@@ -644,6 +644,29 @@ async def check_updates(request: Request):
 
 
 # Title/version are cosmetic and shown on the login screen — no auth.
+@app.post("/api/test-email", dependencies=[Depends(require_auth)])
+async def test_email(request: Request):
+    """Send a sample notification so SMTP settings can be proven now rather
+    than the next time an update happens to appear."""
+    email = request.app.state.config.email
+    if not email.configured:
+        raise HTTPException(
+            status_code=400,
+            detail="Email isn't configured — set RESTRUO_SMTP_HOST, RESTRUO_EMAIL_TO "
+                   "and a sender (RESTRUO_EMAIL_FROM or RESTRUO_SMTP_USER).",
+        )
+    sample = [UpdateEvent("Example NAS", "jellyfin", "jellyfin/jellyfin:latest")]
+    try:
+        await EmailNotifier(email).deliver(
+            "Restruo: test notification",
+            "This is what an update notification looks like:\n\n"
+            + compose_body(sample),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"{type(exc).__name__}: {exc}")
+    return {"ok": True, "sentTo": email.recipients}
+
+
 @app.get("/api/ui-config")
 async def ui_config(request: Request):
     return {
@@ -651,6 +674,10 @@ async def ui_config(request: Request):
         "version": os.environ.get("RESTRUO_VERSION", "dev"),
         "authEnabled": request.app.state.config.ui.auth.enabled,
         "refreshSeconds": request.app.state.config.ui.refresh_seconds,
+        "email": {
+            "configured": request.app.state.config.email.configured,
+            "recipients": request.app.state.config.email.recipients,
+        },
     }
 
 

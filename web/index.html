@@ -156,6 +156,9 @@
   #form-msg { font-size: 13px; margin: 10px 0 0; }
   #form-msg.ok { color: var(--ok); }
   #form-msg.err { color: var(--err); }
+  #email-msg { font-size: 13px; margin: 10px 0 0; }
+  #email-msg.ok { color: var(--ok); }
+  #email-msg.err { color: var(--err); }
   /* modal */
   #modal-backdrop {
     position: fixed; inset: 0; background: rgba(0,0,0,.45);
@@ -243,6 +246,14 @@
         </div>
         <p id="form-msg"></p>
       </form>
+    </div>
+    <div class="settings-panel" id="email-panel" style="display:none">
+      <h2>Update notifications</h2>
+      <p id="email-status" class="count"></p>
+      <div class="form-actions">
+        <button type="button" id="email-test">Send test email</button>
+      </div>
+      <p id="email-msg"></p>
     </div>
     <div style="display:flex; gap:10px; align-items:center; justify-content:space-between;">
       <button id="settings-close">← Back to dashboard</button>
@@ -1066,6 +1077,26 @@
     radio.addEventListener("change", syncAuthFields));
   $("#f-cancel").addEventListener("click", () => fillForm(null));
   $("#settings-btn").addEventListener("click", () => showSettings(true));
+  $("#email-test").addEventListener("click", async () => {
+    const btn = $("#email-test");
+    const msg = $("#email-msg");
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>Sending…';
+    msg.textContent = "";
+    try {
+      const res = await fetch("/api/test-email", { method: "POST" });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
+      msg.textContent = `Sent to ${body.sentTo.join(", ")} — check your inbox.`;
+      msg.className = "ok";
+    } catch (err) {
+      msg.textContent = err.message;
+      msg.className = "err";
+    }
+    btn.disabled = false;
+    btn.textContent = "Send test email";
+  });
+
   $("#settings-close").addEventListener("click", () => showSettings(false));
   $("#home").addEventListener("click", () => {
     if ($("#view-login").style.display !== "none") return;  // not signed in yet
@@ -1090,6 +1121,13 @@
       document.title = cfg.title;
       $("#login-title").textContent = cfg.title;
       $("#title").innerHTML = `${esc(cfg.title)} <span>Portainer stack updater</span>`;
+    }
+    if (cfg && cfg.email) {
+      $("#email-panel").style.display = "";
+      $("#email-status").textContent = cfg.email.configured
+        ? `Emailing new updates to ${cfg.email.recipients.join(", ")}.`
+        : "Not configured — set RESTRUO_SMTP_HOST, RESTRUO_EMAIL_TO and a sender to get an email when an update appears.";
+      $("#email-test").disabled = !cfg.email.configured;
     }
     // The running build lives on the settings page, out of the way.
     if (cfg && cfg.version) {

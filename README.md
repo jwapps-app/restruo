@@ -84,6 +84,12 @@ Everything is optional except the password.
 | `RESTRUO_TITLE` | `Restruo` | Dashboard title |
 | `RESTRUO_FLOATING_TAGS` | `latest` | Comma-separated tags treated as rolling for update checks — e.g. `latest,release` if you run Immich |
 | `RESTRUO_REFRESH_SECONDS` | `180` | How often an open dashboard re-reads container state. `0` disables |
+| `RESTRUO_SMTP_HOST` | — | Mail server for update notifications (with `RESTRUO_EMAIL_TO`, enables email) |
+| `RESTRUO_SMTP_PORT` | `587` | `587` for STARTTLS, `465` for SSL, `25` for a local relay |
+| `RESTRUO_SMTP_USER` / `RESTRUO_SMTP_PASSWORD` | — | Mail login, if the server needs one |
+| `RESTRUO_EMAIL_TO` | — | Where to send notifications (comma-separate several) |
+| `RESTRUO_EMAIL_FROM` | `RESTRUO_SMTP_USER` | Sender address |
+| `RESTRUO_SMTP_SECURITY` | `starttls` | `starttls`, `ssl`, or `none` |
 | `RESTRUO_REGISTRY_AUTH` | — | Logins for private registries, `host=user:token` (comma-separate several) — e.g. `ghcr.io=me:ghp_…` with a `read:packages` token |
 
 For the rest (update-check interval, disabling auth, pre-seeding instances) mount a YAML
@@ -119,6 +125,19 @@ performs as a rolling service update.
   Neither counts as a failed check.
 - Runs every 6 hours (configurable) and whenever you hit **Refresh**, which reloads
   container state immediately and scans registries in the background.
+
+## Email notifications
+
+Set the `RESTRUO_SMTP_*` and `RESTRUO_EMAIL_*` variables above and Restruo emails you
+when a check finds something new — grouped by instance, one message per check, and only
+for findings it hasn't already reported. Sending is outbound only, so nothing has to be
+exposed to the internet and no HTTPS or reverse proxy is involved.
+
+**⚙ Instances → Update notifications** shows the current setting and has a **Send test
+email** button, so you can prove the settings work without waiting for the next check.
+
+For Gmail, use an [App Password](https://support.google.com/accounts/answer/185833)
+rather than your account password, with `smtp.gmail.com`, port `587`, STARTTLS.
 
 ## Updating Portainer itself
 
