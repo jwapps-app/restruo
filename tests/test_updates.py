@@ -473,3 +473,18 @@ async def test_registry_credentials_are_sent_when_configured():
     await registry.aclose()
     assert digest == NEW_DIGEST
     assert seen_auth["header"].startswith("Basic ")  # credentials were used
+
+
+def test_errors_always_say_what_they_were():
+    """httpx timeouts stringify to nothing; an empty reason is useless."""
+    import httpx
+
+    from app.updates import describe_error
+
+    assert describe_error(httpx.ConnectTimeout("")) == "ConnectTimeout"
+    assert describe_error(httpx.ReadTimeout("")) == "ReadTimeout"
+    assert "Name or service not known" in describe_error(
+        httpx.ConnectError("[Errno -2] Name or service not known"))
+    assert describe_error(RegistryError("", status_code=429)) == "HTTP 429"
+    assert describe_error(RegistryError("ghcr.io returned 401 for a/b")) == (
+        "ghcr.io returned 401 for a/b")

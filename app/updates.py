@@ -27,6 +27,18 @@ STATUS_UP_TO_DATE = "up-to-date"
 STATUS_PINNED = "pinned"
 STATUS_UNKNOWN = "unknown"
 STATUS_LOCAL = "local"
+
+
+def describe_error(exc: Exception) -> str:
+    """Some failures stringify to nothing — httpx timeouts in particular — so
+    always name the exception type. An error you can't read is a bug report you
+    can't act on."""
+    if isinstance(exc, RegistryError):
+        text = str(exc).strip()
+        return text or f"HTTP {exc.status_code}"
+    text = str(exc).strip()
+    name = type(exc).__name__
+    return f"{name}: {text}" if text else name
 STATUS_PRIVATE = "private"
 
 
@@ -133,7 +145,8 @@ class UpdateChecker:
                     entry.rpartition("@")[2] for entry in info.get("RepoDigests") or []
                 }
             except Exception as exc:
-                return {"image": raw, "status": STATUS_UNKNOWN, "detail": f"local image: {exc}"}
+                return {"image": raw, "status": STATUS_UNKNOWN,
+                        "detail": f"local image: {describe_error(exc)}"}
 
         if not local_digests:
             return {"image": raw, "status": STATUS_LOCAL,
@@ -146,9 +159,11 @@ class UpdateChecker:
                 return {"image": raw, "status": STATUS_PRIVATE,
                         "detail": f"{ref.registry} needs credentials for this image — "
                                   "set RESTRUO_REGISTRY_AUTH"}
-            return {"image": raw, "status": STATUS_UNKNOWN, "detail": f"registry: {exc}"}
+            return {"image": raw, "status": STATUS_UNKNOWN,
+                    "detail": f"{ref.registry}: {describe_error(exc)}"}
         except Exception as exc:
-            return {"image": raw, "status": STATUS_UNKNOWN, "detail": f"registry: {exc}"}
+            return {"image": raw, "status": STATUS_UNKNOWN,
+                    "detail": f"{ref.registry}: {describe_error(exc)}"}
 
         if remote_digest in local_digests:
             return {"image": raw, "status": STATUS_UP_TO_DATE}
