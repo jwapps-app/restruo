@@ -280,7 +280,14 @@ class PortainerClient:
         if response.is_error:
             try:
                 body = response.json()
-                message = body.get("message") or body.get("details") or response.text
+                # Portainer puts a generic line in `message` ("Unable to update
+                # stack") and the actual cause in `details`. Showing only the
+                # first tells you nothing you could act on.
+                message = body.get("message") or ""
+                details = body.get("details") or ""
+                if details and details != message:
+                    message = f"{message}: {details}" if message else details
+                message = message or response.text
             except ValueError:
                 message = response.text
             raise PortainerError(response.status_code, message)

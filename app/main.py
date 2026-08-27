@@ -46,6 +46,9 @@ async def lifespan(app: FastAPI):
 
     store: InstanceStore = getattr(app.state, "store", None) or InstanceStore()
     app.state.store = store
+    # Redeploys in progress, so a second request for the same one is refused
+    # with a reason instead of colliding inside Portainer.
+    app.state.in_flight: set = set()
     if not store.exists and config.instances:
         # One-time import of instances defined in config.yaml.
         await store.seed(
@@ -397,6 +400,30 @@ def _get_client(request: Request, iid: int) -> PortainerClient:
     return client
 
 
+@asynccontextmanager
+async def _exclusive(request: Request, key: tuple):
+    """One redeploy at a time per stack or container.
+
+    Portainer refuses a second deploy of the same stack while one is running,
+    and answers with a generic "Unable to update stack" — which reads as a
+    failure of the update rather than of the timing. A redeploy can take a
+    minute while compose waits on a healthcheck, which is ample time to click
+    again, or to click from another tab.
+    """
+    in_flight = request.app.state.in_flight
+    if key in in_flight:
+        raise HTTPException(
+            status_code=409,
+            detail="An update is already running for this one — it takes a "
+                   "moment while Portainer waits for the containers to come up.",
+        )
+    in_flight.add(key)
+    try:
+        yield
+    finally:
+        in_flight.discard(key)
+
+
 async def _update_one(client: PortainerClient, stack: dict) -> dict:
     name = stack.get("Name", f"stack {stack.get('Id')}")
     started = time.monotonic()
@@ -574,7 +601,8 @@ async def update_stack(request: Request, iid: int, sid: int):
                    "the redeploy could never finish. Update it from that host instead.",
         )
 
-    result = await _update_one(client, stack)
+    async with _exclusive(request, ("stack", iid, sid)):
+        result = await _update_one(client, stack)
     if result["ok"]:
         request.app.state.checker.mark_updated(iid, stack_id=sid)
     status = 200 if result["ok"] else 502
@@ -599,7 +627,8 @@ async def update_container(
                 detail="Portainer can't recreate itself through its own API — "
                        "update the Portainer container from the host instead.",
             )
-        await client.recreate_container(endpoint_id, cid)
+        async with _exclusive(request, ("container", iid, endpoint_id, cid)):
+            await client.recreate_container(endpoint_id, cid)
         request.app.state.checker.mark_updated(
             iid, container_id=cid, endpoint_id=endpoint_id
         )
