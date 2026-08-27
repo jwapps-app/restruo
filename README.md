@@ -119,7 +119,10 @@ performs as a rolling service update.
   recreating the container.
 - Works anonymously against Docker Hub, ghcr.io, lscr.io and other v2 registries. An
   image with no repo digest was never pulled from a registry (built on the box, or made
-  by the NAS itself) and is labelled **local** — there is nothing to compare it to.
+  by the NAS itself) and is labelled **local** — there is nothing to compare it to. The
+  exception is a container whose tag has since been re-pulled onto a newer image: the
+  newer one is already on the host and only the container is behind, so that reads as an
+  update waiting to be applied.
   Images in a registry that refuses anonymous access are labelled **private**; give
   Restruo a login with `RESTRUO_REGISTRY_AUTH` and they get checked like anything else.
   Neither counts as a failed check.

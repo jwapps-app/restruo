@@ -315,6 +315,16 @@ class PortainerClient:
         self._check(response)
         return response.json()
 
+    async def get_container_info(self, endpoint_id: int, container_id: str) -> dict:
+        """Inspect a container on the environment's Docker engine. Its
+        Config.Image keeps the reference it was created from even after that
+        tag has been re-pulled onto a newer image."""
+        response = await self._request(
+            "GET", f"/api/endpoints/{endpoint_id}/docker/containers/{container_id}/json"
+        )
+        self._check(response)
+        return response.json()
+
     async def get_image_info(self, endpoint_id: int, image: str) -> dict:
         """Inspect an image on the environment's Docker engine via Portainer's
         docker proxy. Used by update checks to read local RepoDigests."""
@@ -501,9 +511,21 @@ async def resolve_image_name(
         info = await client.get_image_info(endpoint_id, container.get("ImageID") or image)
         tags = info.get("RepoTags") or []
         digests = info.get("RepoDigests") or []
-        return (tags or digests or [image])[0]
+        if tags or digests:
+            return (tags or digests)[0]
     except Exception:
-        return image
+        pass
+    # Neither: the tag AND the digest reference have both been re-pulled onto a
+    # newer image, leaving this one anonymous. The container still remembers
+    # what it was created from, which is the only name left that means anything.
+    try:
+        info = await client.get_container_info(endpoint_id, container.get("Id") or "")
+        created_from = ((info.get("Config") or {}).get("Image") or "").strip()
+        if created_from and not created_from.startswith("sha256:"):
+            return created_from
+    except Exception:
+        pass
+    return image
 
 
 def standalone_containers(containers: list[dict], stack_names: set[str]) -> list[dict]:

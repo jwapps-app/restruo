@@ -84,6 +84,36 @@ class UpdateChecker:
             self._inspect_tasks[key] = task
         return await task
 
+    async def _container_info(
+        self, client: PortainerClient, endpoint_id: int, container_id: str
+    ) -> dict:
+        key = (id(client), endpoint_id, "container", container_id)
+        task = self._inspect_tasks.get(key)
+        if task is None:
+            task = asyncio.ensure_future(
+                client.get_container_info(endpoint_id, container_id)
+            )
+            self._inspect_tasks[key] = task
+        return await task
+
+    async def _container_ref(
+        self, client: PortainerClient, endpoint_id: int, container: dict
+    ) -> str:
+        """What this container was created from.
+
+        A container whose tag has since been re-pulled reports a bare image id,
+        which matches no image name — so it would silently drop out of the
+        comparison it most needs to be in.
+        """
+        ref = container.get("Image") or ""
+        if not ref.startswith("sha256:"):
+            return ref
+        try:
+            info = await self._container_info(client, endpoint_id, container.get("Id") or "")
+            return ((info.get("Config") or {}).get("Image") or "").strip() or ref
+        except Exception:
+            return ref
+
     def snapshot(self) -> dict:
         return {
             "checkedAt": self.checked_at,
@@ -97,6 +127,21 @@ class UpdateChecker:
         last = base.rsplit("/", 1)[-1]
         return base if ":" in last else f"{base}:latest"
 
+    async def _running_image_ids(
+        self, client: PortainerClient, endpoint_id: int, raw: str, containers: list[dict]
+    ) -> set[str] | None:
+        """Image ids of the containers running this reference, or None if none
+        of them do."""
+        wanted = self._normalize_image(raw)
+        ids: set[str] = set()
+        for container in containers:
+            if not container.get("ImageID"):
+                continue
+            ref = await self._container_ref(client, endpoint_id, container)
+            if self._normalize_image(ref) == wanted:
+                ids.add(container["ImageID"])
+        return ids or None
+
     async def _running_digests(
         self, client: PortainerClient, endpoint_id: int, raw: str, containers: list[dict]
     ) -> set[str] | None:
@@ -106,12 +151,7 @@ class UpdateChecker:
         runs the old image — comparing the running image is what tells the truth.
         Returns None when no matching container exists (fall back to the tag).
         """
-        wanted = self._normalize_image(raw)
-        image_ids = {
-            c.get("ImageID")
-            for c in containers
-            if c.get("ImageID") and self._normalize_image(c.get("Image", "")) == wanted
-        }
+        image_ids = await self._running_image_ids(client, endpoint_id, raw, containers)
         if not image_ids:
             return None
         digests: set[str] = set()
@@ -149,6 +189,29 @@ class UpdateChecker:
                         "detail": f"local image: {describe_error(exc)}"}
 
         if not local_digests:
+            # No repo digest at all. Either the image was built on the box, or
+            # its tag has since been re-pulled onto a newer image — which strips
+            # the old one of both its tag and its digest. In that case the new
+            # image is already on the host and only the container is behind, so
+            # this is an update waiting to be applied, not a local build.
+            running_ids = await self._running_image_ids(
+                client, endpoint_id, raw, containers
+            ) or set()
+            tag_id = None
+            try:
+                tag_id = (await self._image_info(client, endpoint_id, raw)).get("Id")
+            except Exception:
+                pass
+            if tag_id and running_ids and tag_id not in running_ids:
+                running_short = ", ".join(
+                    sorted(i.removeprefix("sha256:")[:12] for i in running_ids)
+                )
+                return {
+                    "image": raw,
+                    "status": STATUS_UPDATE_AVAILABLE,
+                    "detail": f"running {running_short} · {tag_id.removeprefix('sha256:')[:12]} "
+                              "already pulled — recreate to apply",
+                }
             return {"image": raw, "status": STATUS_LOCAL,
                     "detail": "built or loaded locally — not published to a registry"}
 
