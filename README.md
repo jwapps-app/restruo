@@ -82,7 +82,7 @@ Everything is optional except the password.
 | `DASHBOARD_PASSWORD` | — | **Required.** Dashboard login password |
 | `RESTRUO_USERNAME` | `admin` | Dashboard login username |
 | `RESTRUO_TITLE` | `Restruo` | Dashboard title |
-| `RESTRUO_FLOATING_TAGS` | `latest` | Comma-separated tags treated as rolling for update checks — e.g. `latest,release` if you run Immich |
+| `RESTRUO_FLOATING_TAGS` | channel tags | Comma-separated tags treated as rolling. Defaults to the tags that name a channel rather than a version — `latest`, `lts`, `stable`, `release`, `edge`, `main`, `master`, `nightly`, `rolling`, `dev`. Set it to override |
 | `RESTRUO_REFRESH_SECONDS` | `180` | How often an open dashboard re-reads container state. `0` disables |
 | `RESTRUO_SMTP_USER` / `RESTRUO_SMTP_PASSWORD` | — | Your mail address and password — enough on its own for Gmail, Outlook, Yahoo, iCloud, or Fastmail |
 | `RESTRUO_SMTP_HOST` | inferred from the address | Only needed for a provider not in that list, or your own relay |
@@ -111,9 +111,11 @@ performs as a rolling service update.
 
 **Detecting an update** compares digests, downloading nothing:
 
-- Only images on a **floating tag** are checked — `latest` by default. Add others with
-  `RESTRUO_FLOATING_TAGS`; some projects ship on `:release` or `:stable`. Everything else
-  reads as **pinned** and is left alone, which is the point of pinning.
+- Only images on a **floating tag** are checked. A tag that names a *channel* moves under
+  you — `latest`, `lts`, `stable`, `release`, `edge`, `main`, `nightly` — and all of those
+  are checked by default. A tag containing a digit names a *version* you chose
+  (`postgres:16-alpine`, `app:2026.07.2`), reads as **pinned**, and is left alone, which
+  is the point of pinning. Override the list with `RESTRUO_FLOATING_TAGS`.
 - The comparison uses the digest of the image the container is *actually running*, not
   what the local tag points at — those drift apart when something re-pulls a tag without
   recreating the container.

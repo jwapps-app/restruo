@@ -17,7 +17,12 @@ def test_defaults_without_config_file(tmp_path, monkeypatch):
     assert config.ui.title == "homelab"
     assert config.updates.enabled is True
     assert config.updates.interval_hours == 6
-    assert config.updates.floating_tags == ["latest"]
+    # Channel tags are checked by default; version tags stay pinned.
+    assert "latest" in config.updates.floating_tags
+    assert "lts" in config.updates.floating_tags
+    assert not any(
+        any(c.isdigit() for c in tag) for tag in config.updates.floating_tags
+    )
 
 
 def test_refresh_seconds_env(tmp_path, monkeypatch):

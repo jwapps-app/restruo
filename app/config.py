@@ -52,8 +52,14 @@ class UIConfig(BaseModel):
     refresh_seconds: int = Field(default_factory=_refresh_seconds_default)
 
 
+# Tags that name a channel rather than a version, so they move under you.
+# A tag containing a digit is a version the author chose to pin to
+# (postgres:16-alpine, app:2026.07.2) and is deliberately left alone.
+MOVING_TAGS = "latest,lts,stable,release,edge,main,master,nightly,rolling,dev"
+
+
 def _floating_tags_default() -> list[str]:
-    raw = os.environ.get("RESTRUO_FLOATING_TAGS", "latest")
+    raw = os.environ.get("RESTRUO_FLOATING_TAGS", MOVING_TAGS)
     return [tag.strip() for tag in raw.split(",") if tag.strip()]
 
 
