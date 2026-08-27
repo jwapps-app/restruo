@@ -420,8 +420,26 @@ async def _update_one(client: PortainerClient, stack: dict) -> dict:
     }
 
 
-async def _find_container(client: PortainerClient, cid: str) -> tuple[int, dict]:
-    for endpoint in await client.list_endpoints():
+async def _find_container(
+    client: PortainerClient, cid: str, endpoint_id: int | None = None
+) -> tuple[int, dict]:
+    """Locate a container, preferring the environment the caller names.
+
+    Container ids are unique per host, not per Portainer: machines cloned from
+    a template carry the same ids. Scanning environments in order would then
+    act on whichever host happens to come first — a different machine than the
+    row that was clicked.
+    """
+    endpoints = await client.list_endpoints()
+    if endpoint_id is not None:
+        for container in await client.list_containers(endpoint_id):
+            if container.get("Id") == cid:
+                return endpoint_id, container
+        raise HTTPException(
+            status_code=404,
+            detail=f"No container {cid[:12]} in environment {endpoint_id}",
+        )
+    for endpoint in endpoints:
         for container in await client.list_containers(endpoint["Id"]):
             if container.get("Id") == cid:
                 return endpoint["Id"], container
@@ -480,12 +498,14 @@ async def stop_stack(request: Request, iid: int, sid: int):
     return await _set_stack_state(request, iid, sid, "stop")
 
 
-async def _set_container_state(request: Request, iid: int, cid: str, action: str):
+async def _set_container_state(
+    request: Request, iid: int, cid: str, action: str, endpoint_id: int | None = None
+):
     """Start or stop a standalone container."""
     client = _get_client(request, iid)
     started = time.monotonic()
     try:
-        endpoint_id, container = await _find_container(client, cid)
+        endpoint_id, container = await _find_container(client, cid, endpoint_id)
     except HTTPException:
         raise
     except Exception as exc:
@@ -509,13 +529,17 @@ async def _set_container_state(request: Request, iid: int, cid: str, action: str
 
 
 @app.post("/api/instances/{iid}/containers/{cid}/start", dependencies=[Depends(require_auth)])
-async def start_container(request: Request, iid: int, cid: str):
-    return await _set_container_state(request, iid, cid, "start")
+async def start_container(
+    request: Request, iid: int, cid: str, endpointId: int | None = None
+):
+    return await _set_container_state(request, iid, cid, "start", endpointId)
 
 
 @app.post("/api/instances/{iid}/containers/{cid}/stop", dependencies=[Depends(require_auth)])
-async def stop_container(request: Request, iid: int, cid: str):
-    return await _set_container_state(request, iid, cid, "stop")
+async def stop_container(
+    request: Request, iid: int, cid: str, endpointId: int | None = None
+):
+    return await _set_container_state(request, iid, cid, "stop", endpointId)
 
 
 @app.post("/api/instances/{iid}/stacks/{sid}/update", dependencies=[Depends(require_auth)])
@@ -539,23 +563,14 @@ async def update_stack(request: Request, iid: int, sid: int):
 
 
 @app.post("/api/instances/{iid}/containers/{cid}/update", dependencies=[Depends(require_auth)])
-async def update_container(request: Request, iid: int, cid: str):
+async def update_container(
+    request: Request, iid: int, cid: str, endpointId: int | None = None
+):
     """Repull + recreate a standalone container via Portainer's recreate action."""
     client = _get_client(request, iid)
     started = time.monotonic()
     try:
-        endpoints = await client.list_endpoints()
-        target = None
-        for endpoint in endpoints:
-            for container in await client.list_containers(endpoint["Id"]):
-                if container.get("Id") == cid:
-                    target = (endpoint["Id"], container)
-                    break
-            if target:
-                break
-        if target is None:
-            raise HTTPException(status_code=404, detail=f"No container {cid[:12]} on this instance")
-        endpoint_id, container = target
+        endpoint_id, container = await _find_container(client, cid, endpointId)
         resolved_image = await resolve_image_name(client, endpoint_id, container)
         if "portainer/portainer" in resolved_image:
             # Portainer dies the moment it stops itself, before the replacement
@@ -566,7 +581,9 @@ async def update_container(request: Request, iid: int, cid: str):
                        "update the Portainer container from the host instead.",
             )
         await client.recreate_container(endpoint_id, cid)
-        request.app.state.checker.mark_updated(iid, container_id=cid)
+        request.app.state.checker.mark_updated(
+            iid, container_id=cid, endpoint_id=endpoint_id
+        )
     except HTTPException:
         raise
     except Exception as exc:

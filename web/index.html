@@ -299,9 +299,20 @@
     return inst ? inst.stacks.find((s) => s.id === sid) : null;
   }
 
-  function updateInfoForCtr(iid, cid) {
+  // Container ids are unique per host, not per Portainer — machines cloned from
+  // a template share them. Match on the environment too, or every clone shows
+  // whichever host was listed first.
+  function updateInfoForCtr(iid, cid, eid) {
     const inst = updates.instances.find((u) => u.instance.id === iid);
-    return inst ? (inst.containers || []).find((c) => c.id === cid) : null;
+    if (!inst) return null;
+    const list = inst.containers || [];
+    return list.find((c) => c.id === cid && (eid == null || c.endpointId === eid))
+      || (eid == null ? list.find((c) => c.id === cid) : null);
+  }
+
+  // Unique per row, for DOM ids and result messages.
+  function ctrKey(c) {
+    return c.endpointId == null ? c.id : `${c.endpointId}-${c.id}`;
   }
 
   function imgLine(img) {
@@ -326,7 +337,7 @@
     const act = o.running ? "stop" : "start";
     return `<button class="power-btn${o.running ? "" : " start"}" data-power="${act}"
       data-kind="${o.kind}" data-iid="${o.iid}" data-id="${esc(String(o.id))}"
-      data-name="${esc(o.name)}">${o.running ? "Stop" : "Start"}</button>`;
+      data-eid="${o.eid ?? ""}" data-name="${esc(o.name)}">${o.running ? "Stop" : "Start"}</button>`;
   }
 
   function renderImagesCell(stack, iid) {
@@ -441,7 +452,8 @@
           </tr>`;
         };
         const ctrRow = (c) => {
-          const cInfo = updateInfoForCtr(iid, c.id);
+          const cInfo = updateInfoForCtr(iid, c.id, c.endpointId);
+          const cKey = ctrKey(c);
           const hasUpd = !!(cInfo && cInfo.status === "update-available");
           const isPortainer = c.image.includes("portainer/portainer");
           const imagesCell = cInfo
@@ -459,10 +471,10 @@
               ${isPortainer
                 ? '<button class="update-btn" disabled title="Portainer can\'t update itself — update it from the host (SSH or your NAS\'s container manager); see the README">Update</button>'
                 : `<button class="update-btn${hasUpd ? " has-upd" : ""}" data-kind="container"
-                data-iid="${iid}" data-cid="${esc(c.id)}" data-name="${esc(c.name)}">${hasUpd ? "⬆ Update" : "Update"}</button>`}
-              ${powerBtn({ kind: "container", iid, id: c.id, name: c.name,
+                data-iid="${iid}" data-cid="${esc(c.id)}" data-eid="${c.endpointId ?? ""}" data-name="${esc(c.name)}">${hasUpd ? "⬆ Update" : "Update"}</button>`}
+              ${powerBtn({ kind: "container", iid, id: c.id, eid: c.endpointId, name: c.name,
                            running: !c.down || c.state === "running", protected: isPortainer })}
-              <span class="result-msg" id="msg-${iid}-${esc(c.id)}"></span>
+              <span class="result-msg" id="msg-${iid}-${esc(cKey)}"></span>
             </td>
           </tr>`;
         };
@@ -485,7 +497,7 @@
         inst.stacks.reduce(
           (n, s) => n + ((updateInfoFor(iid, s.id) || {}).updatesAvailable || 0), 0) +
         (inst.containers || []).filter(
-          (c) => (updateInfoForCtr(iid, c.id) || {}).status === "update-available").length;
+          (c) => (updateInfoForCtr(iid, c.id, c.endpointId) || {}).status === "update-available").length;
       const unknownReasons = [];
       inst.stacks.forEach((st) => {
         ((updateInfoFor(iid, st.id) || {}).images || [])
@@ -493,7 +505,7 @@
           .forEach((i) => unknownReasons.push(`${st.name} — ${i.image}: ${i.detail || "could not check"}`));
       });
       (inst.containers || []).forEach((c) => {
-        const info = updateInfoForCtr(iid, c.id) || {};
+        const info = updateInfoForCtr(iid, c.id, c.endpointId) || {};
         if (info.status === "unknown")
           unknownReasons.push(`${c.name} — ${c.image}: ${info.detail || "could not check"}`);
       });
@@ -501,7 +513,7 @@
         inst.stacks.reduce((n, st) => n + (((updateInfoFor(iid, st.id) || {}).images || [])
           .some((i) => i.status === "unknown") ? 1 : 0), 0) +
         (inst.containers || []).filter(
-          (c) => (updateInfoForCtr(iid, c.id) || {}).status === "unknown").length;
+          (c) => (updateInfoForCtr(iid, c.id, c.endpointId) || {}).status === "unknown").length;
       const instDownCount =
         inst.stacks.reduce((n, s) =>
           n + (s.status === "inactive" ? 1 : (s.downNames || []).length), 0) +
@@ -635,11 +647,11 @@
   function clearUpdateFlags(btn) {
     // Mirror a successful update in the cached data and the visible badges
     // right away, without re-rendering (which would wipe the ✅ + duration).
-    const { kind, iid, sid, cid } = btn.dataset;
+    const { kind, iid, sid, cid, eid } = btn.dataset;
     const instUpd = updates.instances.find((u) => u.instance.id === Number(iid));
     if (instUpd) {
       if (kind === "container") {
-        const c = (instUpd.containers || []).find((x) => x.id === cid);
+        const c = updateInfoForCtr(Number(iid), cid, eid ? Number(eid) : null);
         if (c && c.status === "update-available") c.status = "up-to-date";
       } else {
         const s = instUpd.stacks.find((x) => x.id === Number(sid));
@@ -704,10 +716,10 @@
   }
 
   async function runUpdate(btn) {
-    const { kind, iid, sid, cid } = btn.dataset;
-    const key = kind === "container" ? cid : sid;
+    const { kind, iid, sid, cid, eid } = btn.dataset;
+    const key = kind === "container" ? (eid ? `${eid}-${cid}` : cid) : sid;
     const url = kind === "container"
-      ? `/api/instances/${iid}/containers/${cid}/update`
+      ? `/api/instances/${iid}/containers/${cid}/update${eid ? `?endpointId=${eid}` : ""}`
       : `/api/instances/${iid}/stacks/${sid}/update`;
     const msg = document.getElementById(`msg-${iid}-${key}`);
     const idleLabel = () => btn.classList.contains("has-upd") ? "⬆ Update" : "Update";
@@ -831,9 +843,11 @@
   }
 
   async function runPower(btn) {
-    const { power, kind, iid, id, name } = btn.dataset;
-    const msg = document.getElementById(`msg-${iid}-${id}`);
-    const url = `/api/instances/${iid}/${kind === "container" ? "containers" : "stacks"}/${id}/${power}`;
+    const { power, kind, iid, id, eid, name } = btn.dataset;
+    const rowKey = kind === "container" && eid ? `${eid}-${id}` : id;
+    const msg = document.getElementById(`msg-${iid}-${rowKey}`);
+    const url = `/api/instances/${iid}/${kind === "container" ? "containers" : "stacks"}/${id}/${power}`
+      + (kind === "container" && eid ? `?endpointId=${eid}` : "");
     btn.disabled = true;
     btn.innerHTML = `<span class="spinner"></span>${power === "stop" ? "Stopping…" : "Starting…"}`;
     if (msg) { msg.textContent = ""; msg.className = "result-msg"; }
@@ -887,13 +901,14 @@
     }
     const updateBtn = e.target.closest(".update-btn");
     if (updateBtn) {
-      const { kind, iid, sid, cid, name } = updateBtn.dataset;
+      const { kind, iid, sid, cid, eid, name } = updateBtn.dataset;
       let text = kind === "container"
         ? "This pulls the image fresh and recreates the container with its existing configuration."
         : "This repulls the image(s) and redeploys the stack. Containers will restart.";
       const inst = data.find((i) => i.instance.id === Number(iid));
       const images = kind === "container"
-        ? [inst?.containers?.find((c) => c.id === cid)?.image || ""]
+        ? [(inst?.containers || []).find((c) => c.id === cid
+             && (!eid || c.endpointId === Number(eid)))?.image || ""]
         : inst?.stacks?.find((s) => s.id === Number(sid))?.images || [];
       if (images.some((i) => i.toLowerCase().includes("restruo")))
         text += " This looks like Restruo itself — the page will disconnect while it restarts, then reload automatically.";

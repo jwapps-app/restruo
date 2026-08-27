@@ -23,6 +23,10 @@ class UpdateEvent:
     instance_name: str
     stack_name: str
     image: str
+    # Which environment of that Portainer it runs in, when the instance manages
+    # more than one. Two hosts can run the same container name and image, so
+    # without this the mail lists lines nothing distinguishes.
+    environment: str | None = None
 
 
 class Notifier(ABC):
@@ -48,8 +52,11 @@ def compose_body(events: list[UpdateEvent]) -> str:
     lines = []
     for instance, found in by_instance.items():
         lines.append(instance)
-        for event in sorted(found, key=lambda e: (e.stack_name.lower(), e.image)):
-            lines.append(f"    {event.stack_name} — {event.image}")
+        for event in sorted(
+            found, key=lambda e: (e.stack_name.lower(), e.environment or "", e.image)
+        ):
+            where = f" [{event.environment}]" if event.environment else ""
+            lines.append(f"    {event.stack_name}{where} — {event.image}")
         lines.append("")
     lines.append("Open Restruo to review and update.")
     return "\n".join(lines)

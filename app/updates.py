@@ -233,8 +233,13 @@ class UpdateChecker:
 
         # Containers that live outside any Portainer stack.
         stack_names = {s.get("Name") for s in stacks}
+        environments: dict[int, str] = {}
         try:
-            endpoint_ids = [e["Id"] for e in await client.list_endpoints()]
+            endpoints = await client.list_endpoints()
+            endpoint_ids = [e["Id"] for e in endpoints]
+            environments = {
+                e["Id"]: e.get("Name") or f"env {e['Id']}" for e in endpoints
+            }
         except Exception:
             endpoint_ids = list(container_tasks)
 
@@ -246,7 +251,9 @@ class UpdateChecker:
             checked = await check_image_bounded(
                 endpoint_id, normalized["image"], [raw_container]
             )
-            return {**normalized, **checked}
+            environment = environments.get(endpoint_id)
+            return {**normalized, **checked,
+                    **({"environment": environment} if environment else {})}
 
         standalone_jobs = []
         for endpoint_id in endpoint_ids:
@@ -258,7 +265,8 @@ class UpdateChecker:
         return result
 
     def mark_updated(
-        self, iid: int, stack_id: int | None = None, container_id: str | None = None
+        self, iid: int, stack_id: int | None = None, container_id: str | None = None,
+        endpoint_id: int | None = None,
     ) -> None:
         """Reflect a successful repull+redeploy in the cached results so badges
         clear immediately instead of waiting for the next registry check."""
@@ -274,6 +282,11 @@ class UpdateChecker:
                         stack["updatesAvailable"] = 0
             if container_id is not None:
                 for container in instance_result.get("containers", []):
+                    # Cloned hosts share container ids, so clearing by id alone
+                    # would clear badges on machines nothing was done to.
+                    if endpoint_id is not None and \
+                            container.get("endpointId") != endpoint_id:
+                        continue
                     if container["id"] == container_id and \
                             container["status"] == STATUS_UPDATE_AVAILABLE:
                         container["status"] = STATUS_UP_TO_DATE
@@ -318,13 +331,21 @@ class UpdateChecker:
             for container in instance_result.get("containers", []):
                 if container["status"] != STATUS_UPDATE_AVAILABLE:
                     continue
-                key = (iid, "container", container["id"], container["image"])
+                # Container ids are only unique within one host. Machines cloned
+                # from a template share them, so the environment is part of the
+                # identity — without it several hosts collapse into one entry
+                # and the mail repeats a line it cannot tell apart.
+                key = (iid, "container", container.get("endpointId"),
+                       container["id"], container["image"])
+                if key in current:
+                    continue
                 current.add(key)
                 if key not in self._notified:
                     events.append(UpdateEvent(
                         instance_name=instance_result["instance"]["name"],
                         stack_name=container["name"],
                         image=container["image"],
+                        environment=container.get("environment"),
                     ))
         # Forget resolved updates so they re-notify if they reappear later.
         self._notified = current
