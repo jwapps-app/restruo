@@ -212,9 +212,13 @@ async def list_instances(request: Request):
             await client.list_endpoints()
         except PortainerError as exc:
             entry.update(reachable=False, error=exc.message)
+            logger.warning("Instance %r unreachable: %s", record.name, exc.message)
             await client.reconnect()
         except Exception as exc:
             entry.update(reachable=False, error=str(exc))
+            logger.warning(
+                "Instance %r unreachable: %s: %s", record.name, type(exc).__name__, exc
+            )
             await client.reconnect()
         return entry
 
@@ -307,12 +311,16 @@ async def _stacks_for_instance(iid: int, name: str, client: PortainerClient) -> 
         stacks = await client.list_stacks()
     except PortainerError as exc:
         result.update(reachable=False, error=exc.message)
+        logger.warning("Instance %r unreachable: %s", name, exc.message)
         # Whatever went wrong, start the next poll from a clean connection and
         # a fresh login — the same reset that re-saving the instance performs.
         await client.reconnect()
         return result
     except Exception as exc:
         result.update(reachable=False, error=str(exc))
+        logger.warning(
+            "Instance %r unreachable: %s: %s", name, type(exc).__name__, exc
+        )
         await client.reconnect()
         return result
 

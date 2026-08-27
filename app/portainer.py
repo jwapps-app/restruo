@@ -181,9 +181,22 @@ class PortainerClient:
         if token:
             self._csrf = token
 
+    def _origin_headers(self) -> dict[str, str]:
+        """Portainer's CSRF layer rejects state-changing requests that lack a
+        same-origin Referer ("Forbidden - referer not supplied")."""
+        return {
+            "Referer": f"{self.instance.base_url}/",
+            "Origin": self.instance.base_url,
+        }
+
     async def _login(self) -> None:
+        # /api/auth is itself state-changing, so it needs the same-origin
+        # headers every other mutating call sends. Without them a Portainer
+        # that has just been recreated refuses every login attempt, and the
+        # instance stays unreachable until its record is re-saved.
         response = await self._send(
             "POST", "/api/auth",
+            headers=self._origin_headers(),
             json={"Username": self.instance.username, "Password": self.instance.password},
         )
         self._check(response)
@@ -240,10 +253,7 @@ class PortainerClient:
             if mutating:
                 if self._csrf:
                     headers["X-CSRF-Token"] = self._csrf
-                # Over HTTPS, Portainer's CSRF layer additionally requires a
-                # same-origin Referer ("Forbidden - referer not supplied").
-                headers["Referer"] = f"{self.instance.base_url}/"
-                headers["Origin"] = self.instance.base_url
+                headers.update(self._origin_headers())
             response = await self._send(method, url, **kwargs)
             self._harvest_csrf(response)
 
