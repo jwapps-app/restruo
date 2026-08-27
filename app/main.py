@@ -22,6 +22,7 @@ from .portainer import (
     PortainerError,
     container_is_down,
     container_name,
+    cannot_recreate_image,
     is_self_critical_image,
     normalize_container,
     normalize_stack,
@@ -363,6 +364,9 @@ async def _stacks_for_instance(iid: int, name: str, client: PortainerClient) -> 
         normalized["selfCritical"] = any(
             is_self_critical_image(c.get("Image", "")) for c in own
         ) or any(is_self_critical_image(i) for i in images)
+        normalized["updateProtected"] = any(
+            cannot_recreate_image(c.get("Image", "")) for c in own
+        ) or any(cannot_recreate_image(i) for i in images)
         result["stacks"].append(normalized)
 
     # Containers that live outside any Portainer stack.
@@ -554,6 +558,21 @@ async def update_stack(request: Request, iid: int, sid: int):
         raise HTTPException(status_code=502, detail=f"Could not fetch stack: {exc.message}")
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Could not fetch stack: {exc}")
+
+    try:
+        own = stack_containers(stack, await client.list_containers(stack["EndpointId"]))
+    except Exception:
+        own = []
+    blocked = next(
+        (c for c in own if cannot_recreate_image(c.get("Image", ""))), None
+    )
+    if blocked is not None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"“{stack.get('Name', sid)}” runs Portainer or a Portainer agent. "
+                   "Redeploying it would stop the container carrying the command, so "
+                   "the redeploy could never finish. Update it from that host instead.",
+        )
 
     result = await _update_one(client, stack)
     if result["ok"]:

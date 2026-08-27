@@ -147,10 +147,28 @@ email** button, so you can prove the settings work without waiting for the next 
 For Gmail, use an [App Password](https://support.google.com/accounts/answer/185833)
 rather than your account password, with `smtp.gmail.com`, port `587`, STARTTLS.
 
-## Updating Portainer itself
+## Updating Portainer and its agents
 
-Restruo refuses to update — or stop — a `portainer/portainer-*` container, and shows
-disabled buttons instead. (Stopping Portainer through its own API is worse than
+Restruo refuses to update — or stop — a `portainer/portainer-*` or `portainer/agent`
+container, and shows disabled buttons instead.
+
+An agent fails the same way Portainer does, for the same reason: Portainer relays every
+command for an agent environment *through that agent*. Recreating it stops the container
+carrying the command, so the replacement is never created — the environment goes offline
+with the new image pulled and unused, and Portainer can no longer reach that machine to
+finish or undo it. Update an agent from its own host:
+
+```sh
+docker pull portainer/agent:latest
+docker rm -f portainer_agent
+docker run -d --name portainer_agent --restart=always \
+  -p 9001:9001 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /var/lib/docker/volumes:/var/lib/docker/volumes \
+  portainer/agent:latest
+```
+
+Check `docker inspect portainer_agent` first and match your own ports and volumes. (Stopping Portainer through its own API is worse than
 updating: it kills the connection Restruo would need to start it again. The same guard
 covers Restruo's own container.) Portainer dies the moment it stops its own container, so an API-driven
 recreate can never finish — it just leaves Portainer stopped with the new image pulled

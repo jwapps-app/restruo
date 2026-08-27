@@ -310,6 +310,15 @@
       || (eid == null ? list.find((c) => c.id === cid) : null);
   }
 
+  // Portainer relays every command for an environment through its agent, so
+  // recreating either the agent or Portainer itself stops the container
+  // carrying the command and the replacement is never created. Matches
+  // cannot_recreate_image() on the server.
+  function cannotRecreate(image) {
+    const n = (image || "").toLowerCase();
+    return n.includes("portainer/portainer") || n.includes("portainer/agent");
+  }
+
   // Unique per row, for DOM ids and result messages.
   function ctrKey(c) {
     return c.endpointId == null ? c.id : `${c.endpointId}-${c.id}`;
@@ -443,8 +452,10 @@
             <td class="images hide-sm">${renderImagesCell(s, iid)}</td>
             <td class="when hide-sm">${fmtWhen(s.updatedAt)}</td>
             <td>
-              <button class="update-btn${hasUpd ? " has-upd" : ""}" data-kind="stack"
-                data-iid="${iid}" data-sid="${s.id}" data-name="${esc(s.name)}">${hasUpd ? "⬆ Update" : "Update"}</button>
+              ${s.updateProtected
+                ? '<button class="update-btn" disabled title="This stack runs Portainer or a Portainer agent — redeploying it would stop the container carrying the command, so it could never finish. Update it from that host.">Update</button>'
+                : `<button class="update-btn${hasUpd ? " has-upd" : ""}" data-kind="stack"
+                data-iid="${iid}" data-sid="${s.id}" data-name="${esc(s.name)}">${hasUpd ? "⬆ Update" : "Update"}</button>`}
               ${powerBtn({ kind: "stack", iid, id: s.id, name: s.name,
                            running: s.status !== "inactive", protected: s.selfCritical })}
               <span class="result-msg" id="msg-${iid}-${s.id}"></span>
@@ -455,7 +466,7 @@
           const cInfo = updateInfoForCtr(iid, c.id, c.endpointId);
           const cKey = ctrKey(c);
           const hasUpd = !!(cInfo && cInfo.status === "update-available");
-          const isPortainer = c.image.includes("portainer/portainer");
+          const isPortainer = cannotRecreate(c.image);
           const imagesCell = cInfo
             ? imgLine({ image: c.image, status: cInfo.status, detail: cInfo.detail })
             : esc(c.image);
@@ -469,7 +480,9 @@
             <td class="when hide-sm"${c.down ? ' style="color:var(--err)"' : ""}>${esc(c.state)}</td>
             <td>
               ${isPortainer
-                ? '<button class="update-btn" disabled title="Portainer can\'t update itself — update it from the host (SSH or your NAS\'s container manager); see the README">Update</button>'
+                ? `<button class="update-btn" disabled title="${esc(c.image.toLowerCase().includes("portainer/agent")
+                    ? "Portainer relays this command through the agent itself, so the recreate can never finish — update the agent from that host"
+                    : "Portainer can't update itself — update it from the host (SSH or your NAS's container manager); see the README")}">Update</button>`
                 : `<button class="update-btn${hasUpd ? " has-upd" : ""}" data-kind="container"
                 data-iid="${iid}" data-cid="${esc(c.id)}" data-eid="${c.endpointId ?? ""}" data-name="${esc(c.name)}">${hasUpd ? "⬆ Update" : "Update"}</button>`}
               ${powerBtn({ kind: "container", iid, id: c.id, eid: c.endpointId, name: c.name,

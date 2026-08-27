@@ -532,15 +532,33 @@ def stack_containers(stack: dict, containers: list[dict]) -> list[dict]:
     return out
 
 
+def cannot_recreate_image(image: str) -> bool:
+    """Images whose container carries the connection used to recreate it.
+
+    Portainer proxies every command for an agent environment *through that
+    agent*, so recreating the agent stops the container mid-operation and the
+    replacement is never created — Portainer can no longer reach that machine
+    to finish, or to undo it. Portainer itself fails the same way for its own
+    container. Both leave the environment stopped with a new image pulled and
+    unused, and neither can be repaired from here.
+
+    Restruo is not included: recreating itself is disruptive but completes,
+    because Portainer — not Restruo — performs it.
+    """
+    name = (image or "").lower()
+    return "portainer/portainer" in name or "portainer/agent" in name
+
+
 def is_self_critical_image(image: str) -> bool:
     """Images this tool must never stop through its own control path.
 
     Stopping Portainer through Portainer's API is unrecoverable from here —
-    it kills the very API needed to start it again. Restruo stopping itself is
+    it kills the very API needed to start it again. The same is true of an
+    agent, which is that API for its environment. Restruo stopping itself is
     recoverable (from Portainer) but still removes the UI mid-click.
     """
     name = (image or "").lower()
-    return "portainer/portainer" in name or "restruo" in name
+    return cannot_recreate_image(image) or "restruo" in name
 
 
 def container_is_down(container: dict) -> bool:
