@@ -338,6 +338,11 @@
     return `<span class="img-line unk" title="${esc(img.detail || "Could not check")}">${esc(img.image)} <span class="img-note">?</span></span>`;
   }
 
+  // How many redeploys "Update all" runs at once. Portainer handles separate
+  // stacks in parallel; the cap is about not saturating the host's disk and
+  // network with simultaneous image pulls.
+  const UPDATE_ALL_CONCURRENCY = 4;
+
   function powerBtn(o) {
     // Stopping Portainer (or Restruo) through Portainer's own API would kill
     // the connection needed to start it again — the server refuses it too.
@@ -950,11 +955,20 @@
       }
       const yes = await confirmModal(
         `Update ${flagged.length} on “${inst.instance.name}”?`,
-        `Only the ${flagged.length} item${flagged.length === 1 ? "" : "s"} with an update available will be repulled and redeployed, one at a time.`);
+        `Only the ${flagged.length} item${flagged.length === 1 ? "" : "s"} with an update available will be repulled and redeployed. ` +
+        `A redeploy takes about a minute each; ${UPDATE_ALL_CONCURRENCY} run at a time.`);
       if (!yes) return;
       allBtn.disabled = true;
       allBtn.innerHTML = '<span class="spinner"></span>Updating…';
-      for (const btn of flagged) await runUpdate(btn);
+      // Portainer deploys different stacks concurrently without conflict, and
+      // each redeploy takes about a minute — sequentially, twenty stacks is
+      // twenty minutes. Capped so a NAS isn't asked to pull everything at once.
+      const queue = [...flagged];
+      await Promise.all(
+        Array.from({ length: Math.min(UPDATE_ALL_CONCURRENCY, queue.length) }, async () => {
+          while (queue.length) await runUpdate(queue.shift());
+        })
+      );
       allBtn.disabled = false;
       allBtn.textContent = "Update all";
     }
