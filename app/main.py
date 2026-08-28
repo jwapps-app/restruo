@@ -424,9 +424,61 @@ async def _exclusive(request: Request, key: tuple):
         in_flight.discard(key)
 
 
+# Portainer accepts a stack deploy and returns immediately, running compose in
+# the background — a redeploy the API "completed" in 68ms can still be pulling
+# an image a minute later. So watch the stack's containers until they settle,
+# and report what actually happened rather than what was accepted.
+DEPLOY_POLL_SECONDS = 2.0
+DEPLOY_SETTLE_POLLS = 2      # unchanged this many times running = finished
+DEPLOY_TIMEOUT_SECONDS = 240.0
+
+
+async def _stack_fingerprint(client: PortainerClient, stack: dict) -> frozenset:
+    """Which containers the stack is running. A compose recreate replaces them,
+    so a change here is the deploy actually landing."""
+    try:
+        own = stack_containers(
+            stack, await client.list_containers(stack["EndpointId"])
+        )
+    except Exception:
+        return frozenset()
+    return frozenset(
+        (c.get("Id"), c.get("State"), c.get("Status")) for c in own
+    )
+
+
+async def _await_deploy(client: PortainerClient, stack: dict, before: frozenset) -> str:
+    """Block until the deploy settles. Returns a description of the outcome."""
+    deadline = time.monotonic() + DEPLOY_TIMEOUT_SECONDS
+    changed_at: float | None = None
+    last = before
+    stable = 0
+    while time.monotonic() < deadline:
+        await asyncio.sleep(DEPLOY_POLL_SECONDS)
+        current = await _stack_fingerprint(client, stack)
+        if current != last:
+            changed_at = time.monotonic()
+            last = current
+            stable = 0
+            continue
+        if changed_at is not None:
+            stable += 1
+            if stable >= DEPLOY_SETTLE_POLLS:
+                recreated = len({c[0] for c in last} - {c[0] for c in before})
+                if recreated:
+                    return f"Redeployed {recreated} container{'' if recreated == 1 else 's'}."
+                return "Redeployed."
+    if changed_at is None:
+        return ("Portainer accepted the redeploy and nothing changed — the images "
+                "were already current, so no container was recreated.")
+    return ("Still deploying after "
+            f"{int(DEPLOY_TIMEOUT_SECONDS)}s — Portainer is finishing in the background.")
+
+
 async def _update_one(client: PortainerClient, stack: dict) -> dict:
     name = stack.get("Name", f"stack {stack.get('Id')}")
     started = time.monotonic()
+    before = await _stack_fingerprint(client, stack)
     try:
         await client.update_stack(stack)
     except PortainerError as exc:
@@ -443,11 +495,12 @@ async def _update_one(client: PortainerClient, stack: dict) -> dict:
             "durationMs": int((time.monotonic() - started) * 1000),
             "message": str(exc),
         }
+    message = await _await_deploy(client, stack, before)
     return {
         "ok": True,
         "stack": name,
         "durationMs": int((time.monotonic() - started) * 1000),
-        "message": "Repulled and redeployed.",
+        "message": message,
     }
 
 
