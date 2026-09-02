@@ -34,8 +34,14 @@ internet, and it can redeploy every stack on every machine you connect to it.
 
 ## Known limits
 
-- Sessions are stateless signed cookies (30 days). Signing out clears the cookie on that
-  device; it does not revoke sessions elsewhere. To invalidate every session, delete
-  `session_secret` from the data volume and restart.
-- The container runs as root so it can write its data volume without ownership fiddling.
+- Sessions are stateless signed cookies (30 days), signed with a key derived from the
+  dashboard password. Signing out clears the cookie on that device. To sign out everywhere,
+  change `DASHBOARD_PASSWORD` (or delete `session_secret` from the data volume) and
+  restart.
+- Ten failed logins from one address block that address for fifteen minutes, on the login
+  form and on basic auth alike. Each failure is logged with its source address.
+- Browser sessions must send `X-Restruo: 1` on any request that changes something; the
+  page does. It stops another page on the same host from reusing the session cookie.
+- The container starts as root only to make its data volume writable by the unprivileged
+  `restruo` user (uid 1000), then drops privileges before the app runs.
 - There is no per-user access control — one dashboard login, full access.

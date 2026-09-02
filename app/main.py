@@ -11,9 +11,9 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
-from .auth import SESSION_COOKIE, SESSION_TTL_SECONDS, SessionManager
+from .auth import SESSION_COOKIE, SESSION_TTL_SECONDS, LoginLimiter, SessionManager
 from .config import AppConfig, load_config
 from .instances import ClientManager, InstanceRecord, InstanceStore
 from .notifiers import EmailNotifier, UpdateEvent, build_notifiers, compose_body
@@ -68,7 +68,12 @@ async def lifespan(app: FastAPI):
     manager = ClientManager(store)
     await manager.refresh()
     app.state.manager = manager
-    app.state.sessions = SessionManager(store.path.parent / "session_secret")
+    app.state.sessions = SessionManager(
+        store.path.parent / "session_secret", config.ui.auth.password
+    )
+    app.state.limiter = LoginLimiter()
+    # Redeploys that outlived the request that started them; see _run_job.
+    app.state.jobs: dict[str, dict] = {}
 
     app.state.registry = RegistryClient(credentials={
         host: (creds.split(":", 1)[0], creds.split(":", 1)[1])
@@ -80,6 +85,7 @@ async def lifespan(app: FastAPI):
         interval_hours=config.updates.interval_hours,
         notifiers=build_notifiers(config),
         floating_tags=config.updates.floating_tags,
+        state_path=store.path.parent / "notified.json",
     )
     checker_task = None
     if config.updates.enabled:
@@ -96,12 +102,18 @@ app = FastAPI(title="Restruo", lifespan=lifespan)
 
 
 @app.middleware("http")
-async def no_store_api_responses(request: Request, call_next):
+async def response_headers(request: Request, call_next):
     """Live state must never be served from a browser cache — a stale
-    'unreachable' would outlive the outage that caused it."""
+    'unreachable' would outlive the outage that caused it. And the dashboard
+    must not be framed: "same-site" ignores the port, so any other web UI on
+    the same host could otherwise embed it with the session cookie attached."""
     response = await call_next(request)
     if request.url.path.startswith("/api/"):
         response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Content-Security-Policy"] = "frame-ancestors 'none'"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "same-origin"
     return response
 
 _basic = HTTPBasic(auto_error=False)
@@ -115,23 +127,86 @@ def _credentials_valid(request: Request, username: str, password: str) -> bool:
     )
 
 
+SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
+# A cookie-authenticated request that changes something must carry this
+# header. A form or a no-cors fetch from another page cannot add a custom
+# header, so it cannot ride the session cookie — which SameSite=Lax alone does
+# not prevent from a page on another port of the same host. Basic-auth callers
+# (curl, scripts) never carry the cookie and are unaffected.
+CSRF_HEADER = "X-Restruo"
+
+
+def _client_addr(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _is_https(request: Request) -> bool:
+    return request.url.scheme == "https" or \
+        request.headers.get("x-forwarded-proto", "").lower() == "https"
+
+
+def _session_valid(request: Request) -> bool:
+    token = request.cookies.get(SESSION_COOKIE)
+    return bool(token) and request.app.state.sessions.verify(token)
+
+
+def _require_csrf_header(request: Request) -> None:
+    if request.method in SAFE_METHODS:
+        return
+    if request.headers.get(CSRF_HEADER) != "1":
+        raise HTTPException(
+            status_code=403,
+            detail=f"Missing {CSRF_HEADER} header — a browser session must send it "
+                   "on every request that changes something.",
+        )
+
+
+def _basic_auth_ok(request: Request, credentials: HTTPBasicCredentials | None) -> bool:
+    if credentials is None:
+        return False
+    limiter: LoginLimiter = request.app.state.limiter
+    addr = _client_addr(request)
+    if limiter.blocked(addr):
+        raise HTTPException(
+            status_code=429, detail="Too many failed logins — try again later."
+        )
+    if _credentials_valid(request, credentials.username, credentials.password):
+        limiter.reset(addr)
+        return True
+    limiter.record_failure(addr)
+    logger.warning("Failed login for %r from %s", credentials.username, addr)
+    return False
+
+
 def require_auth(request: Request, credentials: HTTPBasicCredentials | None = Depends(_basic)):
     auth = request.app.state.config.ui.auth
     if not auth.enabled:
         return
-    token = request.cookies.get(SESSION_COOKIE)
-    if token and request.app.state.sessions.verify(token):
+    if _session_valid(request):
+        _require_csrf_header(request)
         return
-    if credentials is not None and _credentials_valid(
-        request, credentials.username, credentials.password
-    ):
+    if _basic_auth_ok(request, credentials):
         return
     # No WWW-Authenticate header: the app has its own login form, and the
     # header would make browsers pop the (slow) native basic-auth dialog.
     raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+def _authenticated(request: Request, credentials: HTTPBasicCredentials | None) -> bool:
+    """Like require_auth, but a question rather than a gate."""
+    if not request.app.state.config.ui.auth.enabled:
+        return True
+    if _session_valid(request):
+        return True
+    try:
+        return _basic_auth_ok(request, credentials)
+    except HTTPException:
+        return False
+
+
 class LoginRequest(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     username: str
     password: str
 
@@ -139,9 +214,19 @@ class LoginRequest(BaseModel):
 @app.post("/api/login")
 async def login(request: Request, body: LoginRequest):
     auth = request.app.state.config.ui.auth
-    if auth.enabled and not _credentials_valid(request, body.username, body.password):
-        await asyncio.sleep(1)  # blunt the speed of brute-force attempts
-        raise HTTPException(status_code=401, detail="Wrong username or password.")
+    if auth.enabled:
+        limiter: LoginLimiter = request.app.state.limiter
+        addr = _client_addr(request)
+        if limiter.blocked(addr):
+            raise HTTPException(
+                status_code=429, detail="Too many failed logins — try again later."
+            )
+        if not _credentials_valid(request, body.username, body.password):
+            limiter.record_failure(addr)
+            logger.warning("Failed login for %r from %s", body.username, addr)
+            await asyncio.sleep(1)
+            raise HTTPException(status_code=401, detail="Wrong username or password.")
+        limiter.reset(addr)
     response = JSONResponse({"ok": True})
     response.set_cookie(
         SESSION_COOKIE,
@@ -149,12 +234,15 @@ async def login(request: Request, body: LoginRequest):
         max_age=SESSION_TTL_SECONDS,
         httponly=True,
         samesite="lax",
+        secure=_is_https(request),
     )
     return response
 
 
 @app.post("/api/logout")
-async def logout():
+async def logout(request: Request):
+    if _session_valid(request):
+        _require_csrf_header(request)
     response = JSONResponse({"ok": True})
     response.delete_cookie(SESSION_COOKIE)
     return response
@@ -173,6 +261,8 @@ async def healthz():
 
 
 class InstanceInput(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     name: str
     baseUrl: str
     verifyTls: bool = True
@@ -191,6 +281,11 @@ class InstanceInput(BaseModel):
             "username": self.username,
             "password": self.password,
         }
+
+
+def _host_of(url: str) -> str:
+    from urllib.parse import urlsplit
+    return (urlsplit(url).netloc or url).lower()
 
 
 async def _probe_record(record: InstanceRecord) -> dict:
@@ -289,6 +384,15 @@ async def test_instance(request: Request, body: InstanceInput, id: int | None = 
     if id is not None:
         existing = request.app.state.store.get(id)
         if existing:
+            reusing = (fields["auth_type"] == "api_key" and not fields["api_key"]) or \
+                (fields["auth_type"] == "credentials" and not fields["password"])
+            if reusing and _host_of(fields["base_url"]) != _host_of(existing.base_url):
+                # A stored secret is only ever sent to the address it was
+                # saved for. Anything else would let a request that names a
+                # new URL collect the credential from the server.
+                return {"ok": False, "endpoints": 0,
+                        "error": "The address changed — enter the API key or "
+                                 "password again to test it there."}
             if fields["auth_type"] == "api_key" and not fields["api_key"]:
                 fields["api_key"] = existing.api_key
             if fields["auth_type"] == "credentials" and not fields["password"]:
@@ -340,15 +444,25 @@ async def _stacks_for_instance(iid: int, name: str, client: PortainerClient) -> 
     # keep their names so each row can say where it actually runs.
     environments: dict[int, str] = {}
     try:
-        for endpoint in await client.list_endpoints():
-            endpoint_id = endpoint["Id"]
-            environments[endpoint_id] = endpoint.get("Name") or f"env {endpoint_id}"
-            try:
-                containers_by_endpoint[endpoint_id] = await client.list_containers(endpoint_id)
-            except Exception:
-                pass
+        endpoints = await client.list_endpoints()
     except Exception:
-        pass
+        endpoints = []
+    for endpoint in endpoints:
+        environments[endpoint["Id"]] = endpoint.get("Name") or f"env {endpoint['Id']}"
+
+    async def containers_of(endpoint_id: int) -> tuple[int, list[dict] | None]:
+        try:
+            return endpoint_id, await client.list_containers(endpoint_id)
+        except Exception:
+            return endpoint_id, None
+
+    # Environments are independent hosts; asking them one after another
+    # makes the page wait on the slowest agent times the number of agents.
+    for endpoint_id, containers in await asyncio.gather(
+        *(containers_of(e["Id"]) for e in endpoints)
+    ):
+        if containers is not None:
+            containers_by_endpoint[endpoint_id] = containers
     result["environments"] = len(environments)
 
     owned = [
@@ -374,12 +488,18 @@ async def _stacks_for_instance(iid: int, name: str, client: PortainerClient) -> 
 
     # Containers that live outside any Portainer stack.
     stack_names = {s.get("Name") for s in stacks}
-    for endpoint_id, containers in containers_by_endpoint.items():
-        for c in standalone_containers(containers, stack_names):
-            normalized = normalize_container(c, endpoint_id)
-            normalized["image"] = await resolve_image_name(client, endpoint_id, c)
-            normalized["environment"] = environments.get(endpoint_id, "")
-            result["containers"].append(normalized)
+
+    async def standalone_row(endpoint_id: int, c: dict) -> dict:
+        normalized = normalize_container(c, endpoint_id)
+        normalized["image"] = await resolve_image_name(client, endpoint_id, c)
+        normalized["environment"] = environments.get(endpoint_id, "")
+        return normalized
+
+    result["containers"] = list(await asyncio.gather(*(
+        standalone_row(endpoint_id, c)
+        for endpoint_id, containers in containers_by_endpoint.items()
+        for c in standalone_containers(containers, stack_names)
+    )))
     return result
 
 
@@ -433,15 +553,17 @@ DEPLOY_SETTLE_POLLS = 2      # unchanged this many times running = finished
 DEPLOY_TIMEOUT_SECONDS = 240.0
 
 
-async def _stack_fingerprint(client: PortainerClient, stack: dict) -> frozenset:
+async def _stack_fingerprint(client: PortainerClient, stack: dict) -> frozenset | None:
     """Which containers the stack is running. A compose recreate replaces them,
-    so a change here is the deploy actually landing."""
+    so a change here is the deploy actually landing. None when the listing
+    itself failed — which says nothing about the stack, and must not be read
+    as "every container vanished" and then "redeployed"."""
     try:
         own = stack_containers(
             stack, await client.list_containers(stack["EndpointId"])
         )
     except Exception:
-        return frozenset()
+        return None
     return frozenset(
         (c.get("Id"), c.get("State"), c.get("Status")) for c in own
     )
@@ -456,6 +578,8 @@ async def _await_deploy(client: PortainerClient, stack: dict, before: frozenset)
     while time.monotonic() < deadline:
         await asyncio.sleep(DEPLOY_POLL_SECONDS)
         current = await _stack_fingerprint(client, stack)
+        if current is None:
+            continue
         if current != last:
             changed_at = time.monotonic()
             last = current
@@ -475,10 +599,73 @@ async def _await_deploy(client: PortainerClient, stack: dict, before: frozenset)
             f"{int(DEPLOY_TIMEOUT_SECONDS)}s — Portainer is finishing in the background.")
 
 
+# A redeploy can run for minutes. Answer inline when it finishes quickly, and
+# otherwise hand the page a job id to poll — an HTTP request that stays open
+# for four minutes is fine on a LAN and dead on arrival behind most proxies,
+# which cut it off around 100 s while the deploy carries on regardless.
+JOB_SYNC_WAIT_SECONDS = 25.0
+JOB_RETENTION_SECONDS = 3600.0
+
+
+def _prune_jobs(jobs: dict[str, dict]) -> None:
+    cutoff = time.time() - JOB_RETENTION_SECONDS
+    for job_id in [j for j, job in jobs.items() if job["done"] and job["started"] < cutoff]:
+        del jobs[job_id]
+
+
+async def _run_job(request: Request, key: tuple, work) -> JSONResponse:
+    """Run `work()` under the per-target lock and report its result."""
+    app = request.app
+    if key in app.state.in_flight:
+        raise HTTPException(
+            status_code=409,
+            detail="An update is already running for this one — it takes a "
+                   "moment while Portainer waits for the containers to come up.",
+        )
+    job = {"id": secrets.token_hex(8), "done": False, "result": None,
+           "started": time.time()}
+    _prune_jobs(app.state.jobs)
+    app.state.jobs[job["id"]] = job
+
+    async def runner() -> None:
+        try:
+            async with _exclusive(request, key):
+                job["result"] = await work()
+        except HTTPException as exc:
+            job["result"] = {"ok": False, "message": exc.detail}
+        except Exception as exc:
+            job["result"] = {"ok": False, "message": describe(exc)}
+        finally:
+            job["done"] = True
+
+    task = asyncio.create_task(runner())
+    try:
+        await asyncio.wait_for(asyncio.shield(task), JOB_SYNC_WAIT_SECONDS)
+    except asyncio.TimeoutError:
+        return JSONResponse(status_code=202, content={
+            "ok": None, "jobId": job["id"],
+            "message": "Still deploying — Restruo keeps watching it.",
+        })
+    result = job["result"] or {"ok": False, "message": "No result recorded."}
+    return JSONResponse(status_code=200 if result.get("ok") else 502, content=result)
+
+
+def describe(exc: Exception) -> str:
+    return exc.message if isinstance(exc, PortainerError) else (str(exc) or type(exc).__name__)
+
+
+@app.get("/api/jobs/{job_id}", dependencies=[Depends(require_auth)])
+async def get_job(request: Request, job_id: str):
+    job = request.app.state.jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="No such job — it may have expired.")
+    return {"done": job["done"], "result": job["result"]}
+
+
 async def _update_one(client: PortainerClient, stack: dict) -> dict:
     name = stack.get("Name", f"stack {stack.get('Id')}")
     started = time.monotonic()
-    before = await _stack_fingerprint(client, stack)
+    before = await _stack_fingerprint(client, stack) or frozenset()
     try:
         await client.update_stack(stack)
     except PortainerError as exc:
@@ -514,7 +701,6 @@ async def _find_container(
     act on whichever host happens to come first — a different machine than the
     row that was clicked.
     """
-    endpoints = await client.list_endpoints()
     if endpoint_id is not None:
         for container in await client.list_containers(endpoint_id):
             if container.get("Id") == cid:
@@ -523,7 +709,7 @@ async def _find_container(
             status_code=404,
             detail=f"No container {cid[:12]} in environment {endpoint_id}",
         )
-    for endpoint in endpoints:
+    for endpoint in await client.list_endpoints():
         for container in await client.list_containers(endpoint["Id"]):
             if container.get("Id") == cid:
                 return endpoint["Id"], container
@@ -654,12 +840,13 @@ async def update_stack(request: Request, iid: int, sid: int):
                    "the redeploy could never finish. Update it from that host instead.",
         )
 
-    async with _exclusive(request, ("stack", iid, sid)):
+    async def work() -> dict:
         result = await _update_one(client, stack)
-    if result["ok"]:
-        request.app.state.checker.mark_updated(iid, stack_id=sid)
-    status = 200 if result["ok"] else 502
-    return JSONResponse(status_code=status, content=result)
+        if result["ok"]:
+            request.app.state.checker.mark_updated(iid, stack_id=sid)
+        return result
+
+    return await _run_job(request, ("stack", iid, sid), work)
 
 
 @app.post("/api/instances/{iid}/containers/{cid}/update", dependencies=[Depends(require_auth)])
@@ -672,37 +859,41 @@ async def update_container(
     try:
         endpoint_id, container = await _find_container(client, cid, endpointId)
         resolved_image = await resolve_image_name(client, endpoint_id, container)
-        if "portainer/portainer" in resolved_image:
-            # Portainer dies the moment it stops itself, before the replacement
-            # is created — the recreate can never complete. Refuse.
-            raise HTTPException(
-                status_code=400,
-                detail="Portainer can't recreate itself through its own API — "
-                       "update the Portainer container from the host instead.",
-            )
-        async with _exclusive(request, ("container", iid, endpoint_id, cid)):
-            await client.recreate_container(endpoint_id, cid)
-        request.app.state.checker.mark_updated(
-            iid, container_id=cid, endpoint_id=endpoint_id
-        )
     except HTTPException:
         raise
     except Exception as exc:
-        message = exc.message if isinstance(exc, PortainerError) else str(exc)
-        return JSONResponse(status_code=502, content={
-            "ok": False,
-            "stack": cid[:12],
-            "durationMs": int((time.monotonic() - started) * 1000),
-            "message": message,
-        })
-    names = container.get("Names") or []
-    name = names[0].lstrip("/") if names else cid[:12]
-    return {
-        "ok": True,
-        "stack": name,
-        "durationMs": int((time.monotonic() - started) * 1000),
-        "message": "Repulled and recreated.",
-    }
+        raise HTTPException(status_code=502, detail=f"Could not find container: {describe(exc)}")
+
+    if cannot_recreate_image(resolved_image):
+        # Portainer relays this command through the very container being
+        # replaced, so it stops and the recreate never completes — leaving the
+        # environment offline with the new image pulled and unused.
+        what = ("Portainer" if "portainer/portainer" in resolved_image.lower()
+                else "the Portainer agent")
+        raise HTTPException(
+            status_code=400,
+            detail=f"{what} can't be recreated through Portainer's own API — the "
+                   "command travels through the container being replaced. Update "
+                   "it from that host instead.",
+        )
+
+    name = container_name(container)
+
+    async def work() -> dict:
+        try:
+            await client.recreate_container(endpoint_id, cid)
+        except Exception as exc:
+            return {"ok": False, "stack": name,
+                    "durationMs": int((time.monotonic() - started) * 1000),
+                    "message": describe(exc)}
+        request.app.state.checker.mark_updated(
+            iid, container_id=cid, endpoint_id=endpoint_id
+        )
+        return {"ok": True, "stack": name,
+                "durationMs": int((time.monotonic() - started) * 1000),
+                "message": "Repulled and recreated."}
+
+    return await _run_job(request, ("container", iid, endpoint_id, cid), work)
 
 
 class PruneRequest(BaseModel):
@@ -794,18 +985,24 @@ async def test_email(request: Request):
 
 
 @app.get("/api/ui-config")
-async def ui_config(request: Request):
-    return {
-        "title": request.app.state.config.ui.title,
+async def ui_config(
+    request: Request, credentials: HTTPBasicCredentials | None = Depends(_basic)
+):
+    """What the login screen needs is public; who gets emailed is not."""
+    config = request.app.state.config
+    out = {
+        "title": config.ui.title,
         "version": os.environ.get("RESTRUO_VERSION", "dev"),
-        "authEnabled": request.app.state.config.ui.auth.enabled,
-        "refreshSeconds": request.app.state.config.ui.refresh_seconds,
-        "email": {
-            "configured": request.app.state.config.email.configured,
-            "recipients": request.app.state.config.email.recipients,
-            "host": request.app.state.config.email.host,
-        },
+        "authEnabled": config.ui.auth.enabled,
     }
+    if _authenticated(request, credentials):
+        out["refreshSeconds"] = config.ui.refresh_seconds
+        out["email"] = {
+            "configured": config.email.configured,
+            "recipients": config.email.recipients,
+            "host": config.email.host,
+        }
+    return out
 
 
 @app.get("/icon.svg")

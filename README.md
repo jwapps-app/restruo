@@ -216,6 +216,19 @@ Restruo holds credentials that can redeploy anything on every machine you connec
 so keep auth on and keep it on your LAN. See [SECURITY.md](SECURITY.md) for what's stored
 where, deployment expectations, and how to report a vulnerability.
 
+A few behaviours worth knowing:
+
+- **Changing `DASHBOARD_PASSWORD` signs every device out.** Sessions are signed with a
+  key derived from the password, so a rotated password takes effect everywhere at once.
+- **Ten failed logins from one address blocks that address for fifteen minutes**, for
+  both the login form and HTTP basic auth. Failures are logged with the source address.
+- **The container runs as an unprivileged user** (`restruo`, uid 1000). On start it makes
+  `/data` writable by that user and drops root before the app runs — an existing volume
+  from an earlier version needs nothing done to it.
+- **Browser sessions must send an `X-Restruo: 1` header on any request that changes
+  something** (the page does this itself). It stops a page on another port of the same
+  host from reusing the session cookie. Basic-auth callers are unaffected.
+
 ## API
 
 Every endpoint except `/healthz`, `/api/login` and the static shell requires auth (session
@@ -234,10 +247,19 @@ cookie or HTTP basic, so `curl -u` works).
 | POST | `/api/instances/{iid}/containers/{cid}/update` | Repull + recreate one container |
 | POST | `/api/instances/{iid}/containers/{cid}/start`, `/stop` | Start or stop a container |
 | POST | `/api/instances/{iid}/prune` | Remove unused images/networks/volumes |
+| GET | `/api/jobs/{id}` | Progress of a redeploy that outlived its request (see below) |
 | GET | `/api/updates` | Cached update-check results |
 | POST | `/api/check-updates` | Run an update check now |
 | POST | `/api/login`, `/api/logout` | Session cookie in / out |
 | GET | `/healthz` | Liveness (no auth) |
+
+A stack or container update waits for the deploy and reports what happened. If that
+takes longer than 25 seconds the response is `202` with a `jobId`; poll `/api/jobs/{id}`
+until `done` is true and read `result`. The page does this for you — it exists so an
+update behind a reverse proxy isn't cut off mid-deploy by the proxy's timeout.
+
+Session-cookie requests that change something must also send `X-Restruo: 1`; basic auth
+(`curl -u`) does not need it.
 
 ## Development
 

@@ -29,6 +29,7 @@ def test_identical_rows_notify_once_each_not_once_per_duplicate():
     """Six clones must produce six distinct lines, not six copies of one."""
     checker = UpdateChecker.__new__(UpdateChecker)
     checker._notified = set()
+    checker._state_path = None
     checker.notifiers = []
     checker.results = [{
         "instance": {"id": 5, "name": "Proxmox"},

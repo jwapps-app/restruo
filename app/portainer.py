@@ -161,10 +161,14 @@ class PortainerClient:
     async def _send(self, method: str, url: str, **kwargs) -> httpx.Response:
         try:
             return await self._client.request(method, url, **kwargs)
-        except httpx.TransportError:
-            # Connection-level failure: rebuild the pool and give it one more
-            # go, so a machine that just came back recovers on this poll rather
-            # than needing the instance re-saved.
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            # The request never reached Portainer, so sending it again is safe
+            # for any method: rebuild the pool and give it one more go, so a
+            # machine that just came back recovers on this poll rather than
+            # needing the instance re-saved. A read timeout or a dropped
+            # connection is a different case — the server may already have
+            # acted on the first attempt, and a PUT or POST replayed then is a
+            # second deploy or a second prune. Those are left to fail.
             await self.reconnect()
             return await self._client.request(method, url, **kwargs)
 

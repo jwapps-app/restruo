@@ -7,10 +7,15 @@ against Docker Hub, ghcr.io, lscr.io and any other v2 registry that supports
 token auth.
 """
 
+import ipaddress
+import logging
 import re
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 import httpx
+
+logger = logging.getLogger("restruo.updates")
 
 REGISTRY_TIMEOUT = 15.0
 
@@ -75,6 +80,27 @@ def parse_image_ref(raw: str) -> ImageRef | None:
                     pinned_digest=pinned_digest)
 
 
+def _registrable(host: str) -> str:
+    """docker.io for auth.docker.io; an IP or single label as-is."""
+    host = host.lower()
+    try:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        pass
+    labels = host.split(".")
+    return ".".join(labels[-2:]) if len(labels) >= 2 else host
+
+
+def _realm_trusted(realm: str, registry: str) -> bool:
+    """Only hand a registry's login to an HTTPS realm on that registry's own
+    domain. Docker Hub's realm is auth.docker.io; ghcr.io's is ghcr.io/token."""
+    parts = urlsplit(realm)
+    if parts.scheme != "https" or not parts.hostname:
+        return False
+    return _registrable(parts.hostname) == _registrable(registry.split(":")[0])
+
+
 class RegistryClient:
     def __init__(
         self,
@@ -133,6 +159,13 @@ class RegistryClient:
             params["service"] = fields["service"]
         # With credentials the token comes back scoped to private repos too.
         auth = self._credentials.get(ref.registry)
+        if auth and not _realm_trusted(realm, ref.registry):
+            # The realm is whatever the registry's challenge says it is. A
+            # login belongs to that registry, not to any host it names.
+            logger.warning(
+                "Not sending %s credentials to token realm %s", ref.registry, realm
+            )
+            auth = None
         response = await self._client.get(realm, params=params, auth=auth)
         if response.status_code != 200:
             raise RegistryError(

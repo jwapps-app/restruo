@@ -6,8 +6,10 @@ are cached in memory for the dashboard.
 """
 
 import asyncio
+import json
 import logging
 import time
+from pathlib import Path
 
 from .notifiers import Notifier, UpdateEvent
 from .portainer import (
@@ -27,6 +29,7 @@ STATUS_UP_TO_DATE = "up-to-date"
 STATUS_PINNED = "pinned"
 STATUS_UNKNOWN = "unknown"
 STATUS_LOCAL = "local"
+STATUS_PRIVATE = "private"
 
 
 def describe_error(exc: Exception) -> str:
@@ -39,7 +42,6 @@ def describe_error(exc: Exception) -> str:
     text = str(exc).strip()
     name = type(exc).__name__
     return f"{name}: {text}" if text else name
-STATUS_PRIVATE = "private"
 
 
 class UpdateChecker:
@@ -50,6 +52,7 @@ class UpdateChecker:
         interval_hours: float,
         notifiers: list[Notifier] | None = None,
         floating_tags: tuple[str, ...] | list[str] = ("latest",),
+        state_path: Path | None = None,
     ):
         # get_clients: callable returning [(instance_id, PortainerClient), ...],
         # so the checker always sees the current set of managed instances.
@@ -62,7 +65,10 @@ class UpdateChecker:
         self.results: list[dict] = []
         self.checking = False
         self._lock = asyncio.Lock()
-        self._notified: set[tuple] = set()
+        # What has already been announced. Persisted, so a restart does not
+        # re-send a mail for every update that was already known.
+        self._state_path = state_path
+        self._notified: set[tuple] = self._load_notified()
         # Per-run memos (reset by check_all): the same image often appears in
         # many stacks/instances — ask each registry and docker engine once.
         self._remote_tasks: dict = {}
@@ -114,6 +120,26 @@ class UpdateChecker:
         except Exception:
             return ref
 
+    def _load_notified(self) -> set[tuple]:
+        if self._state_path is None or not self._state_path.is_file():
+            return set()
+        try:
+            return {tuple(item) for item in json.loads(self._state_path.read_text())}
+        except (ValueError, TypeError):
+            return set()
+
+    def _save_notified(self) -> None:
+        if self._state_path is None:
+            return
+        try:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._state_path.with_suffix(".tmp")
+            entries = sorted((list(k) for k in self._notified), key=json.dumps)
+            tmp.write_text(json.dumps(entries))
+            tmp.replace(self._state_path)
+        except OSError:
+            logger.exception("Could not persist notification state")
+
     def snapshot(self) -> dict:
         return {
             "checkedAt": self.checked_at,
@@ -143,7 +169,7 @@ class UpdateChecker:
         return ids or None
 
     async def _running_digests(
-        self, client: PortainerClient, endpoint_id: int, raw: str, containers: list[dict]
+        self, client: PortainerClient, endpoint_id: int, image_ids: set[str] | None
     ) -> set[str] | None:
         """Repo digests of the image the stack's containers are ACTUALLY running.
 
@@ -151,7 +177,6 @@ class UpdateChecker:
         runs the old image — comparing the running image is what tells the truth.
         Returns None when no matching container exists (fall back to the tag).
         """
-        image_ids = await self._running_image_ids(client, endpoint_id, raw, containers)
         if not image_ids:
             return None
         digests: set[str] = set()
@@ -176,7 +201,8 @@ class UpdateChecker:
         # Local first: an image with no repo digest never came from a registry
         # (built on the box, or created by the NAS itself), so there is nothing
         # to compare against and no point asking a registry about it.
-        local_digests = await self._running_digests(client, endpoint_id, raw, containers)
+        running_ids = await self._running_image_ids(client, endpoint_id, raw, containers)
+        local_digests = await self._running_digests(client, endpoint_id, running_ids)
         if local_digests is None:
             # No matching container found — fall back to what the tag points at.
             try:
@@ -194,9 +220,7 @@ class UpdateChecker:
             # the old one of both its tag and its digest. In that case the new
             # image is already on the host and only the container is behind, so
             # this is an update waiting to be applied, not a local build.
-            running_ids = await self._running_image_ids(
-                client, endpoint_id, raw, containers
-            ) or set()
+            running_ids = running_ids or set()
             tag_id = None
             try:
                 tag_id = (await self._image_info(client, endpoint_id, raw)).get("Id")
@@ -222,6 +246,11 @@ class UpdateChecker:
                 return {"image": raw, "status": STATUS_PRIVATE,
                         "detail": f"{ref.registry} needs credentials for this image — "
                                   "set RESTRUO_REGISTRY_AUTH"}
+            if exc.status_code == 429:
+                return {"image": raw, "status": STATUS_UNKNOWN,
+                        "detail": f"{ref.registry} is rate-limiting this address — "
+                                  "manifest checks count toward Docker Hub's pull limit; "
+                                  "try again later"}
             return {"image": raw, "status": STATUS_UNKNOWN,
                     "detail": f"{ref.registry}: {describe_error(exc)}"}
         except Exception as exc:
@@ -274,10 +303,14 @@ class UpdateChecker:
             own_containers = stack_containers(
                 stack, await containers_for(stack["EndpointId"])
             )
-            try:
-                content = await client.get_stack_file(stack["Id"])
-            except Exception:
-                content = ""
+            # Every stack is checked at once; without the semaphore here, a
+            # Portainer with thirty stacks gets thirty file fetches in the same
+            # instant before any image check has even started.
+            async with semaphore:
+                try:
+                    content = await client.get_stack_file(stack["Id"])
+                except Exception:
+                    content = ""
             images = stack_images(stack, content, own_containers)
             checked = list(await asyncio.gather(
                 *(check_image_bounded(stack["EndpointId"], raw, own_containers)
@@ -412,6 +445,7 @@ class UpdateChecker:
                     ))
         # Forget resolved updates so they re-notify if they reappear later.
         self._notified = current
+        self._save_notified()
         if not events:
             return
         for notifier in self.notifiers:

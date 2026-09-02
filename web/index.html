@@ -310,6 +310,19 @@
       || (eid == null ? list.find((c) => c.id === cid) : null);
   }
 
+  // Every call to our own API carries this header. The server refuses a
+  // cookie-authenticated change without it, which is what stops a page on
+  // another port of this host from riding the session cookie.
+  const nativeFetch = window.fetch.bind(window);
+  window.fetch = (url, opts = {}) => {
+    if (typeof url === "string" && url.startsWith("/api/")) {
+      const headers = new Headers(opts.headers || {});
+      headers.set("X-Restruo", "1");
+      opts = { ...opts, headers };
+    }
+    return nativeFetch(url, opts);
+  };
+
   // Portainer relays every command for an environment through its agent, so
   // recreating either the agent or Portainer itself stops the container
   // carrying the command and the replacement is never created. Matches
@@ -588,6 +601,7 @@
       if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
       $("#l-pass").value = "";
       showLogin(false);
+      loadUiConfig();
       refresh();
       loadUpdates();
     } catch (err) {
@@ -747,14 +761,20 @@
     busyCount++;
     try {
       const res = await fetch(url, { method: "POST" });
-      const body = await res.json().catch(() => ({}));
-      const ok = res.ok && body.ok;
+      let body = await res.json().catch(() => ({}));
+      let status = res.status;
+      if (status === 202 && body.jobId) {
+        // Still deploying: the server keeps watching it; we keep asking.
+        body = await waitForJob(body.jobId);
+        status = body.ok ? 200 : 502;
+      }
+      const ok = status < 400 && !!body.ok;
       btn.innerHTML = ok ? "✅ Updated" : "❌ Failed";
       if (ok) { btn.classList.remove("has-upd"); clearUpdateFlags(btn); }
       if (msg) {
         msg.textContent = ok
           ? `${((body.durationMs || 0) / 1000).toFixed(1)}s`
-          : (body.message || body.detail || `HTTP ${res.status}`);
+          : (body.message || body.detail || `HTTP ${status}`);
         msg.className = "result-msg " + (ok ? "ok" : "err");
       }
       setTimeout(() => { btn.disabled = false; btn.textContent = idleLabel(); }, 4000);
@@ -777,6 +797,23 @@
     } finally {
       busyCount--;
     }
+  }
+
+  async function waitForJob(jobId) {
+    // Ten minutes covers a slow image pull; past that, say so rather than
+    // guess. A brief network blip is not a failure — keep asking.
+    const deadline = Date.now() + 600 * 1000;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 2000));
+      try {
+        const res = await fetch(`/api/jobs/${jobId}`);
+        if (res.status === 401) { showLogin(true); return { ok: false, message: "Signed out." }; }
+        if (!res.ok) return { ok: false, message: `HTTP ${res.status}` };
+        const job = await res.json();
+        if (job.done) return job.result || { ok: false, message: "No result recorded." };
+      } catch (err) { /* transient — try again */ }
+    }
+    return { ok: false, message: "Lost track of this update after ten minutes — check the stack in Portainer." };
   }
 
   async function waitForBackend(seconds) {
@@ -1172,6 +1209,7 @@
   $("#refresh").addEventListener("click", () => { refresh(); backgroundCheck(); });
   $("#search").addEventListener("input", render);
 
+  function loadUiConfig() {
   fetch("/api/ui-config").then((r) => r.ok ? r.json() : null).then((cfg) => {
     if (cfg && cfg.authEnabled) $("#signout-btn").style.display = "";
     if (cfg && cfg.refreshSeconds > 0) {
@@ -1197,6 +1235,8 @@
       $("#build-line").title = cfg.version;
     }
   }).catch(() => {});
+  }
+  loadUiConfig();
 
   // Coming back to an open tab/PWA refreshes immediately.
   document.addEventListener("visibilitychange", () => {

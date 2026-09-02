@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from .portainer import PortainerClient
 
@@ -22,6 +22,10 @@ DEFAULT_DATA_PATH = "/data/instances.json"
 
 
 class InstanceRecord(BaseModel):
+    # Validation errors are shown to the user; without this pydantic quotes
+    # the offending input in them, which for this model is a token or password.
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     id: int
     name: str
     base_url: str
@@ -163,10 +167,23 @@ class ClientManager:
         return self._clients.get(iid)
 
     async def refresh(self) -> None:
+        """Rebuild clients whose record changed; keep the rest.
+
+        A client holds a logged-in session and a CSRF token for its Portainer.
+        Editing one instance used to throw all of them away, so every other
+        instance had to log in again on its next poll."""
         old = self._clients
-        self._clients = {r.id: PortainerClient(r) for r in self.store.list()}
-        for client in old.values():
-            await client.aclose()
+        fresh: dict[int, PortainerClient] = {}
+        for record in self.store.list():
+            existing = old.get(record.id)
+            if existing is not None and existing.instance == record:
+                fresh[record.id] = existing
+            else:
+                fresh[record.id] = PortainerClient(record)
+        self._clients = fresh
+        for iid, client in old.items():
+            if fresh.get(iid) is not client:
+                await client.aclose()
 
     async def aclose(self) -> None:
         for client in self._clients.values():

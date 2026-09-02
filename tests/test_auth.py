@@ -65,7 +65,7 @@ def test_login_sets_session_cookie_that_authenticates(client):
 def test_logout_clears_the_session(client):
     client.post("/api/login", json={"username": "admin", "password": "hunter2"})
     assert client.get("/api/instances").status_code == 200
-    client.post("/api/logout")
+    client.post("/api/logout", headers={"X-Restruo": "1"})
     assert client.get("/api/instances").status_code == 401
 
 
