@@ -332,6 +332,15 @@
     return n.includes("portainer/portainer") || n.includes("portainer/agent");
   }
 
+  // "agent", "portainer", or "" — the two that need the helper, told apart
+  // because replacing Portainer migrates its database and an agent has none.
+  function helperKind(image) {
+    const n = (image || "").toLowerCase();
+    if (n.includes("portainer/agent")) return "agent";
+    if (n.includes("portainer/portainer")) return "portainer";
+    return "";
+  }
+
   // Unique per row, for DOM ids and result messages.
   function ctrKey(c) {
     return c.endpointId == null ? c.id : `${c.endpointId}-${c.id}`;
@@ -497,12 +506,10 @@
             <td class="images hide-sm">${imagesCell}</td>
             <td class="when hide-sm"${c.down ? ' style="color:var(--err)"' : ""}>${esc(c.state)}</td>
             <td>
-              ${isPortainer
-                ? `<button class="update-btn" disabled title="${esc(c.image.toLowerCase().includes("portainer/agent")
-                    ? "Portainer relays this command through the agent itself, so the recreate can never finish — update the agent from that host"
-                    : "Portainer can't update itself — update it from the host (SSH or your NAS's container manager); see the README")}">Update</button>`
-                : `<button class="update-btn${hasUpd ? " has-upd" : ""}" data-kind="container"
-                data-iid="${iid}" data-cid="${esc(c.id)}" data-eid="${c.endpointId ?? ""}" data-name="${esc(c.name)}">${hasUpd ? "⬆ Update" : "Update"}</button>`}
+              <button class="update-btn${hasUpd ? " has-upd" : ""}" data-kind="container"
+                data-iid="${iid}" data-cid="${esc(c.id)}" data-eid="${c.endpointId ?? ""}" data-name="${esc(c.name)}"
+                data-helper="${helperKind(c.image)}"
+                ${isPortainer ? 'title="Replaced by a short-lived helper the Docker daemon runs — Portainer can\'t recreate this one itself"' : ""}>${hasUpd ? "⬆ Update" : "Update"}</button>
               ${powerBtn({ kind: "container", iid, id: c.id, eid: c.endpointId, name: c.name,
                            running: !c.down || c.state === "running", protected: isPortainer })}
               <span class="result-msg" id="msg-${iid}-${esc(cKey)}"></span>
@@ -967,6 +974,17 @@
         : inst?.stacks?.find((s) => s.id === Number(sid))?.images || [];
       if (images.some((i) => i.toLowerCase().includes("restruo")))
         text += " This looks like Restruo itself — the page will disconnect while it restarts, then reload automatically.";
+      const helper = updateBtn.dataset.helper;
+      if (helper === "agent")
+        text = "Portainer can't recreate its own agent — the command travels through it. " +
+          "Restruo starts a short-lived helper on that host instead: it pulls the new image first, " +
+          "swaps the container keeping its ports, mounts and settings, and puts the old one back if the new one doesn't stay up. " +
+          "The environment is unreachable for about twenty seconds while it happens.";
+      if (helper === "portainer")
+        text = "This replaces Portainer itself, using a short-lived helper on its host: it pulls the new image first, " +
+          "swaps the container keeping its ports, mounts and settings, and puts the old one back if the new one doesn't start. " +
+          "A new Portainer version upgrades its database on first start, and that cannot be undone by going back to the old image — " +
+          "take a backup first (Portainer → Settings → Backup). This instance is unreachable for a minute or so while it happens.";
       const yes = await confirmModal(`Update “${name}”?`, text);
       if (yes) runUpdate(updateBtn);
       return;
@@ -983,7 +1001,10 @@
         return;
       }
       const section = allBtn.closest("section");
-      const flagged = [...section.querySelectorAll(".update-btn.has-upd")];
+      // Portainer itself is never part of a bulk update: its database upgrade
+      // is one-way, so it gets its own click and its own warning.
+      const flagged = [...section.querySelectorAll(".update-btn.has-upd")]
+        .filter((b) => b.dataset.helper !== "portainer");
       if (!flagged.length) {
         await confirmModal("All up to date",
           `Nothing on “${inst.instance.name}” has an update available.`,
@@ -1000,12 +1021,19 @@
       // Portainer deploys different stacks concurrently without conflict, and
       // each redeploy takes about a minute — sequentially, twenty stacks is
       // twenty minutes. Capped so a NAS isn't asked to pull everything at once.
-      const queue = [...flagged];
-      await Promise.all(
-        Array.from({ length: Math.min(UPDATE_ALL_CONCURRENCY, queue.length) }, async () => {
-          while (queue.length) await runUpdate(queue.shift());
-        })
-      );
+      const runPool = async (buttons) => {
+        const queue = [...buttons];
+        await Promise.all(
+          Array.from({ length: Math.min(UPDATE_ALL_CONCURRENCY, queue.length) }, async () => {
+            while (queue.length) await runUpdate(queue.shift());
+          })
+        );
+      };
+      // Agents go last, once nothing is deploying any more: every stack on an
+      // environment is deployed THROUGH its agent, so replacing the agent
+      // mid-deploy would cut that deploy off.
+      await runPool(flagged.filter((b) => b.dataset.helper !== "agent"));
+      await runPool(flagged.filter((b) => b.dataset.helper === "agent"));
       allBtn.disabled = false;
       allBtn.textContent = "Update all";
     }

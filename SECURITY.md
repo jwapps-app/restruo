@@ -42,6 +42,10 @@ internet, and it can redeploy every stack on every machine you connect to it.
   form and on basic auth alike. Each failure is logged with its source address.
 - Browser sessions must send `X-Restruo: 1` on any request that changes something; the
   page does. It stops another page on the same host from reusing the session cookie.
+- Updating Portainer or an agent starts a short-lived helper container on that host with
+  the Docker socket mounted — the same access the agent itself already has. It runs from
+  Restruo's own image, has no network, replaces exactly one named container, and is
+  removed when it finishes.
 - The container starts as root only to make its data volume writable by the unprivileged
   `restruo` user (uid 1000), then drops privileges before the app runs.
 - There is no per-user access control — one dashboard login, full access.

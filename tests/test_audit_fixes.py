@@ -46,12 +46,14 @@ def _login(client):
     return r
 
 
-# --- #1 standalone-container updates must refuse an agent ------------------
+# --- #1 an agent is never sent to Portainer's own recreate ------------------
 
 class AgentHost:
     """A Portainer whose environment 11 runs a portainer/agent container."""
     instance = type("I", (), {"name": "Proxmox"})()
-    recreated: list = []
+
+    def __init__(self):
+        self.recreated, self.created, self.removed, self.pulled = [], [], [], []
 
     async def list_containers(self, endpoint_id):
         return [{"Id": "3c8646c2b71b", "Names": ["/portainer_agent"],
@@ -61,17 +63,75 @@ class AgentHost:
     async def recreate_container(self, endpoint_id, cid):
         self.recreated.append(cid)
 
+    async def pull_image(self, endpoint_id, image):
+        self.pulled.append(image)
+
+    async def create_container(self, endpoint_id, name, body):
+        self.created.append((name, body))
+        return "helper1"
+
+    async def set_container_state(self, endpoint_id, cid, running):
+        pass
+
+    async def get_container_info(self, endpoint_id, cid):
+        return {"State": {"Running": False, "Status": "exited", "ExitCode": 0}}
+
+    async def container_logs(self, endpoint_id, cid):
+        return 'noise\n{"ok": true, "message": "Updated portainer_agent to 38bc1dc7b847."}\n'
+
+    async def remove_container(self, endpoint_id, cid, force=False):
+        self.removed.append(cid)
+
     async def aclose(self):
         pass
 
 
-def test_container_update_refuses_a_portainer_agent(client):
+def test_agent_update_goes_through_the_helper_not_portainers_recreate(client, monkeypatch):
+    monkeypatch.setattr(main, "HELPER_POLL_SECONDS", 0.001)
+    monkeypatch.setenv("RESTRUO_VERSION", "abc123")
     host = AgentHost()
     app.state.manager._clients[7] = host
     r = client.post("/api/instances/7/containers/3c8646c2b71b/update?endpointId=11", auth=BASIC)
-    assert r.status_code == 400
-    assert "agent" in r.json()["detail"].lower()
-    assert host.recreated == [], "the recreate must never reach Portainer"
+
+    assert r.status_code == 200, r.text
+    assert "Updated portainer_agent" in r.json()["message"]
+    assert host.recreated == [], "Portainer's own recreate would kill the agent mid-command"
+    assert host.pulled == ["ghcr.io/jwapps-app/restruo:abc123"], "same build as the dashboard"
+    name, body = host.created[0]
+    assert body["Cmd"] == ["3c8646c2b71b"]
+    assert body["HostConfig"]["NetworkMode"] == "none", "socket only — no network"
+    assert body["HostConfig"]["Binds"] == ["/var/run/docker.sock:/var/run/docker.sock"]
+    assert "helper1" in host.removed, "the helper is cleaned up afterwards"
+
+
+def test_helper_failure_is_reported_with_its_reason(client, monkeypatch):
+    monkeypatch.setattr(main, "HELPER_POLL_SECONDS", 0.001)
+    host = AgentHost()
+
+    async def failed_logs(endpoint_id, cid):
+        return '{"ok": false, "message": "pull: rate limit — rolled back"}\n'
+    host.container_logs = failed_logs
+    app.state.manager._clients[7] = host
+    r = client.post("/api/instances/7/containers/3c8646c2b71b/update?endpointId=11", auth=BASIC)
+    assert r.status_code == 502
+    assert "rate limit" in r.json()["message"]
+
+
+def test_helper_result_parsing():
+    assert main.parse_helper_result('x\n{"ok": true, "message": "m"}', 0) == {"ok": True, "message": "m"}
+    crashed = main.parse_helper_result("Traceback...\nKeyError: 'Id'", 1)
+    assert crashed["ok"] is False and "KeyError" in crashed["message"]
+    assert main.parse_helper_result("", 137)["ok"] is False
+
+
+def test_docker_log_frames_are_demultiplexed():
+    from app.portainer import demux_docker_logs
+    def frame(stream, text):
+        data = text.encode()
+        return bytes([stream, 0, 0, 0]) + len(data).to_bytes(4, "big") + data
+    raw = frame(1, "hello\n") + frame(2, "warn\n") + frame(1, '{"ok": true}\n')
+    assert demux_docker_logs(raw) == 'hello\nwarn\n{"ok": true}\n'
+    assert demux_docker_logs(b"plain tty text") == "plain tty text"
 
 
 # --- #2 CSRF: cookie sessions need the header on anything that changes -----

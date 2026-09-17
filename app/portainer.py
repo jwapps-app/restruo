@@ -429,6 +429,57 @@ class PortainerClient:
             self._check(response)
         return {}
 
+    # --- plain Docker calls through Portainer's proxy, used to run the helper
+    # that replaces containers Portainer cannot recreate itself ---------------
+
+    async def pull_image(self, endpoint_id: int, image: str) -> None:
+        response = await self._request(
+            "POST",
+            f"/api/endpoints/{endpoint_id}/docker/images/create",
+            params={"fromImage": image},
+            timeout=REDEPLOY_TIMEOUT,
+        )
+        self._check(response)
+        # The Engine answers 200 and reports a failed pull inside the stream.
+        for line in response.text.splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(event, dict) and event.get("error"):
+                raise PortainerError(502, f"pull {image}: {event['error']}")
+
+    async def create_container(self, endpoint_id: int, name: str, body: dict) -> str:
+        response = await self._request(
+            "POST",
+            f"/api/endpoints/{endpoint_id}/docker/containers/create",
+            params={"name": name},
+            json=body,
+            timeout=REDEPLOY_TIMEOUT,
+        )
+        self._check(response)
+        return response.json()["Id"]
+
+    async def remove_container(
+        self, endpoint_id: int, container_id: str, force: bool = False
+    ) -> None:
+        response = await self._request(
+            "DELETE",
+            f"/api/endpoints/{endpoint_id}/docker/containers/{container_id}",
+            params={"force": "1" if force else "0"},
+        )
+        if response.status_code != 404:
+            self._check(response)
+
+    async def container_logs(self, endpoint_id: int, container_id: str) -> str:
+        response = await self._request(
+            "GET",
+            f"/api/endpoints/{endpoint_id}/docker/containers/{container_id}/logs",
+            params={"stdout": "1", "stderr": "1", "tail": "50"},
+        )
+        self._check(response)
+        return demux_docker_logs(response.content)
+
     async def recreate_container(self, endpoint_id: int, container_id: int | str) -> dict:
         """Portainer's own recreate action: pulls the image fresh and recreates
         the container with its existing configuration (same as the UI's
@@ -507,6 +558,19 @@ class PortainerClient:
         # never redeploy stale content.
         stack_file_content = await self.get_stack_file(stack_id)
         return await self.redeploy_compose(stack_id, endpoint_id, stack_file_content, env)
+
+
+def demux_docker_logs(raw: bytes) -> str:
+    """Logs of a container without a TTY arrive as frames: one byte for the
+    stream, three of padding, a four-byte big-endian length, then the text."""
+    out, pos = [], 0
+    while pos + 8 <= len(raw) and raw[pos] in (0, 1, 2) and raw[pos + 1:pos + 4] == b"\0\0\0":
+        size = int.from_bytes(raw[pos + 4:pos + 8], "big")
+        out.append(raw[pos + 8:pos + 8 + size])
+        pos += 8 + size
+    if pos == 0:
+        return raw.decode(errors="replace")  # a TTY stream: plain text already
+    return b"".join(out).decode(errors="replace")
 
 
 async def resolve_image_name(

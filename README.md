@@ -90,6 +90,7 @@ Everything is optional except the password.
 | `RESTRUO_EMAIL_TO` | your own address | Where to send notifications (comma-separate several) |
 | `RESTRUO_EMAIL_FROM` | `RESTRUO_SMTP_USER` | Sender address |
 | `RESTRUO_SMTP_SECURITY` | `starttls` | `starttls`, `ssl`, or `none` |
+| `RESTRUO_HELPER_IMAGE` | this build's image | Image the update helper runs from, for Portainer and agent updates — set it if your hosts pull from a mirror |
 | `RESTRUO_REGISTRY_AUTH` | — | Logins for private registries, `host=user:token` (comma-separate several) — e.g. `ghcr.io=me:ghp_…` with a `read:packages` token |
 
 For the rest (update-check interval, disabling auth, pre-seeding instances) mount a YAML
@@ -154,46 +155,35 @@ rather than your account password, with `smtp.gmail.com`, port `587`, STARTTLS.
 
 ## Updating Portainer and its agents
 
-Restruo refuses to update — or stop — a `portainer/portainer-*` or `portainer/agent`
-container, and shows disabled buttons instead.
+Portainer cannot recreate these two itself. It relays every command for an agent
+environment *through that agent*, and performs its own from its own container — so a
+recreate stops the container carrying the command, and the create that should follow is
+never sent. Asked to do it anyway, Portainer answers `Stop container error: error during
+connect`, and leaves the container stopped with the new image pulled and unused.
 
-An agent fails the same way Portainer does, for the same reason: Portainer relays every
-command for an agent environment *through that agent*. Recreating it stops the container
-carrying the command, so the replacement is never created — the environment goes offline
-with the new image pulled and unused, and Portainer can no longer reach that machine to
-finish or undo it. Update an agent from its own host:
+Restruo gets round that with a **helper**: a short-lived container it starts on the
+target host, from Restruo's own image, with the Docker socket mounted and no network.
+The Docker daemon runs it — not the agent, not Portainer — so it keeps going while they
+are down. It:
 
-```sh
-docker pull portainer/agent:latest
-docker rm -f portainer_agent
-docker run -d --name portainer_agent --restart=always \
-  -p 9001:9001 \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  -v /var/lib/docker/volumes:/var/lib/docker/volumes \
-  portainer/agent:latest
-```
+1. pulls the new image **first**, so a failed download touches nothing;
+2. stops the old container and sets it aside;
+3. creates the replacement with the same ports, mounts, networks, restart policy and
+   settings — leaving out anything the old container merely inherited from its image, so
+   the new image's own start command and environment apply;
+4. waits for it to stay up, then removes the old one — or, if it doesn't, removes the new
+   one and **puts the old one back**.
 
-Check `docker inspect portainer_agent` first and match your own ports and volumes. (Stopping Portainer through its own API is worse than
-updating: it kills the connection Restruo would need to start it again. The same guard
-covers Restruo's own container.) Portainer dies the moment it stops its own container, so an API-driven
-recreate can never finish — it just leaves Portainer stopped with the new image pulled
-but unused. (If that happens to you by other means: nothing is damaged, just start the
-container again.)
+The environment is unreachable for about twenty seconds while an agent is swapped.
 
-Upgrade it from the host instead, matching your original ports and volumes — check with
-`docker inspect portainer` first:
-
-```sh
-docker pull portainer/portainer-ce:latest
-docker stop portainer && docker rm portainer
-docker run -d --name portainer --restart=always \
-  -p 9443:9443 \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  -v portainer_data:/data \
-  portainer/portainer-ce:latest
-```
-
-Portainer's own config lives in its data volume and survives the recreate.
+- **Agents** are included in **Update all**, but run last: every stack on an environment
+  deploys through its agent, so replacing it mid-deploy would cut that deploy off.
+- **Portainer itself** is never part of **Update all**. A new version upgrades its
+  database on first start and that can't be undone by going back to the old image, so it
+  takes its own click and its own warning. Back up first (Portainer → Settings → Backup).
+- **Stopping** either is still refused — there would be nothing left to start it with.
+- A *stack* that contains Portainer or an agent is still refused; the helper replaces
+  single containers. Set `RESTRUO_HELPER_IMAGE` to run the helper from a mirror.
 
 ## Cleaning up
 

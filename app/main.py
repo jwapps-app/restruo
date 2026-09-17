@@ -1,6 +1,7 @@
 """Restruo — multi-instance Portainer stack updater dashboard."""
 
 import asyncio
+import json
 import logging
 import os
 import secrets
@@ -650,6 +651,95 @@ async def _run_job(request: Request, key: tuple, work) -> JSONResponse:
     return JSONResponse(status_code=200 if result.get("ok") else 502, content=result)
 
 
+HELPER_SOCKET = "/var/run/docker.sock"
+HELPER_POLL_SECONDS = 3.0
+HELPER_TIMEOUT_SECONDS = 900.0
+
+
+def helper_image() -> str:
+    """The same build as this dashboard, so the helper and the code that
+    reads its answer can never disagree. Every build is pushed under its
+    commit as well as :latest."""
+    explicit = os.environ.get("RESTRUO_HELPER_IMAGE", "").strip()
+    if explicit:
+        return explicit
+    version = os.environ.get("RESTRUO_VERSION", "dev")
+    tag = version if version and version != "dev" else "latest"
+    return f"ghcr.io/jwapps-app/restruo:{tag}"
+
+
+def helper_spec(image: str, target: str) -> dict:
+    """A container that can reach the Docker socket and nothing else: no
+    network, no environment, and it replaces exactly one named container."""
+    return {
+        "Image": image,
+        "Entrypoint": ["python", "-m", "app.helper"],
+        "Cmd": [target],
+        "User": "0",  # the socket is root's
+        "Env": [],
+        "Labels": {"restruo.helper": "1"},
+        "HostConfig": {
+            "Binds": [f"{HELPER_SOCKET}:{HELPER_SOCKET}"],
+            "NetworkMode": "none",
+            "AutoRemove": False,  # its exit status and last line are the result
+        },
+    }
+
+
+def parse_helper_result(logs: str, exit_code: int | None) -> dict:
+    for line in reversed(logs.strip().splitlines()):
+        try:
+            parsed = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict) and "ok" in parsed:
+            return {"ok": bool(parsed["ok"]), "message": str(parsed.get("message", ""))}
+    tail = logs.strip().splitlines()[-1] if logs.strip() else "no output"
+    return {"ok": False, "message": f"The helper exited with status {exit_code}: {tail}"}
+
+
+async def _replace_with_helper(
+    client: PortainerClient, endpoint_id: int, cid: str, name: str
+) -> dict:
+    image = helper_image()
+    helper_name = f"restruo-helper-{cid[:12]}"
+    try:
+        await client.pull_image(endpoint_id, image)
+        await client.remove_container(endpoint_id, helper_name, force=True)
+        helper_id = await client.create_container(
+            endpoint_id, helper_name, helper_spec(image, cid)
+        )
+        await client.set_container_state(endpoint_id, helper_id, running=True)
+    except Exception as exc:
+        return {"ok": False, "message": f"Could not start the update helper: {describe(exc)}"}
+
+    # From here the agent — or Portainer itself — goes away and comes back, so
+    # a failed poll is expected and means nothing. Only the helper's own exit
+    # says how it went.
+    deadline = time.monotonic() + HELPER_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        await asyncio.sleep(HELPER_POLL_SECONDS)
+        try:
+            state = (await client.get_container_info(endpoint_id, helper_id)).get("State") or {}
+        except Exception:
+            continue
+        if state.get("Running") or state.get("Status") in ("created", "restarting"):
+            continue
+        try:
+            logs = await client.container_logs(endpoint_id, helper_id)
+        except Exception:
+            logs = ""
+        result = parse_helper_result(logs, state.get("ExitCode"))
+        try:
+            await client.remove_container(endpoint_id, helper_id, force=True)
+        except Exception:
+            pass
+        return result
+    return {"ok": False,
+            "message": f"Lost track of the update after {int(HELPER_TIMEOUT_SECONDS / 60)} "
+                       f"minutes — check “{name}” on that host."}
+
+
 def describe(exc: Exception) -> str:
     return exc.message if isinstance(exc, PortainerError) else (str(exc) or type(exc).__name__)
 
@@ -864,20 +954,23 @@ async def update_container(
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Could not find container: {describe(exc)}")
 
-    if cannot_recreate_image(resolved_image):
-        # Portainer relays this command through the very container being
-        # replaced, so it stops and the recreate never completes — leaving the
-        # environment offline with the new image pulled and unused.
-        what = ("Portainer" if "portainer/portainer" in resolved_image.lower()
-                else "the Portainer agent")
-        raise HTTPException(
-            status_code=400,
-            detail=f"{what} can't be recreated through Portainer's own API — the "
-                   "command travels through the container being replaced. Update "
-                   "it from that host instead.",
-        )
-
     name = container_name(container)
+
+    if cannot_recreate_image(resolved_image):
+        # Portainer's own recreate stops the container that is carrying the
+        # command, so the create that should follow is never sent. Hand the
+        # job to a helper the Docker daemon runs, which outlives it.
+        async def helper_work() -> dict:
+            result = await _replace_with_helper(client, endpoint_id, cid, name)
+            result.update(stack=name,
+                          durationMs=int((time.monotonic() - started) * 1000))
+            if result["ok"]:
+                request.app.state.checker.mark_updated(
+                    iid, container_id=cid, endpoint_id=endpoint_id
+                )
+            return result
+
+        return await _run_job(request, ("container", iid, endpoint_id, cid), helper_work)
 
     async def work() -> dict:
         try:
