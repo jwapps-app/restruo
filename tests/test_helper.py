@@ -219,3 +219,22 @@ def test_host_network_gets_no_endpoint_config():
 ])
 def test_untagged_reference_means_latest_not_every_tag(ref, expected):
     assert normalize_image_ref(ref) == expected
+
+
+@pytest.mark.asyncio
+async def test_start_sends_an_empty_json_body():
+    """Measured through a live agent: no body -> 400 "starting container with
+    non-empty request body"; {} -> 204. Portainer's UI sends {} too."""
+    from app.instances import InstanceRecord
+    from app.portainer import PortainerClient
+    seen = {}
+
+    def handler(request):
+        seen["body"] = request.content
+        return httpx.Response(204)
+
+    client = PortainerClient(
+        InstanceRecord(id=1, name="p", base_url="https://p.test", auth_type="api_key", api_key="k"),
+        transport=httpx.MockTransport(handler))
+    await client.set_container_state(6, "abc", running=True)
+    assert seen["body"] == b"{}"

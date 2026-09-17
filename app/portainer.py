@@ -422,6 +422,11 @@ class PortainerClient:
         response = await self._request(
             "POST",
             f"/api/endpoints/{endpoint_id}/docker/containers/{container_id}/{action}",
+            # An explicit empty object, as Portainer's own UI sends. Relayed
+            # through an agent, a POST with no body reaches the Engine with an
+            # unknown length, which it rejects on start as a "non-empty request
+            # body" — so starting a container on an agent environment failed.
+            json={},
             timeout=REDEPLOY_TIMEOUT,
         )
         # 304 means it was already in that state — not an error worth surfacing.
