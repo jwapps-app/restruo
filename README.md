@@ -129,6 +129,8 @@ performs as a rolling service update.
   Images in a registry that refuses anonymous access are labelled **private**; give
   Restruo a login with `RESTRUO_REGISTRY_AUTH` and they get checked like anything else.
   Neither counts as a failed check.
+- A service behind a compose `profiles:` list is never started by Portainer, so its
+  image is declared but not running. It shows as **not deployed** and is left alone.
 - Runs every 6 hours (configurable) and whenever you hit **Refresh**, which reloads
   container state immediately and scans registries in the background.
 

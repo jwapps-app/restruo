@@ -14,6 +14,7 @@ import json
 import re
 
 import httpx
+import yaml
 
 # Reads (list/get) should fail fast; a redeploy legitimately takes minutes
 # because Portainer pulls images before recreating containers.
@@ -108,6 +109,36 @@ def stack_images(stack: dict, file_content: str, containers: list[dict]) -> list
     # Nothing to fall back on (a stopped stack, say) — keep the raw references
     # so the row still shows something recognisable.
     return resolved or declared
+
+
+def profiled_images(file_content: str, env: dict[str, str] | None = None) -> set[str]:
+    """Images of services that compose will not start.
+
+    A service with a `profiles:` list only runs when one of those profiles is
+    activated, and Portainer never activates any — so such a service has never
+    been deployed and its image has never been pulled. Asking the host about
+    it gets a 404, which is not a failed check but a service that is not
+    running, and must be reported as such.
+    """
+    try:
+        doc = yaml.safe_load(file_content or "")
+    except yaml.YAMLError:
+        return set()
+    services = (doc or {}).get("services") if isinstance(doc, dict) else None
+    if not isinstance(services, dict):
+        return set()
+    out: set[str] = set()
+    for service in services.values():
+        if not isinstance(service, dict) or not service.get("profiles"):
+            continue
+        image = service.get("image")
+        if isinstance(image, str) and image.strip():
+            image = image.strip()
+            out.add(image)
+            resolved = interpolate(image, env or {})
+            if resolved:
+                out.add(resolved)
+    return out
 
 
 class PortainerClient:

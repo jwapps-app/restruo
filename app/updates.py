@@ -15,8 +15,10 @@ from .notifiers import Notifier, UpdateEvent
 from .portainer import (
     PortainerClient,
     normalize_container,
+    profiled_images,
     resolve_image_name,
     stack_containers,
+    stack_env,
     stack_images,
     standalone_containers,
 )
@@ -30,6 +32,7 @@ STATUS_PINNED = "pinned"
 STATUS_UNKNOWN = "unknown"
 STATUS_LOCAL = "local"
 STATUS_PRIVATE = "private"
+STATUS_NOT_DEPLOYED = "not-deployed"
 
 
 def describe_error(exc: Exception) -> str:
@@ -312,10 +315,19 @@ class UpdateChecker:
                 except Exception:
                     content = ""
             images = stack_images(stack, content, own_containers)
-            checked = list(await asyncio.gather(
-                *(check_image_bounded(stack["EndpointId"], raw, own_containers)
-                  for raw in images)
-            ))
+            # A service behind a compose profile is never started by Portainer:
+            # its image is declared but not deployed, and there is nothing on
+            # the host to compare. Say so instead of reporting a failed check.
+            inactive = profiled_images(content, stack_env(stack))
+
+            async def check_or_skip(raw: str) -> dict:
+                if raw in inactive:
+                    return {"image": raw, "status": STATUS_NOT_DEPLOYED,
+                            "detail": "service is behind a compose profile, which "
+                                      "Portainer never activates — not running"}
+                return await check_image_bounded(stack["EndpointId"], raw, own_containers)
+
+            checked = list(await asyncio.gather(*(check_or_skip(raw) for raw in images)))
             return {
                 "id": stack["Id"],
                 "name": stack.get("Name", ""),

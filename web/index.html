@@ -357,6 +357,8 @@
       return `<span class="img-line" title="${esc(img.detail || "Not from a registry")}">${esc(img.image)} <span class="img-note">local</span></span>`;
     if (img.status === "private")
       return `<span class="img-line unk" title="${esc(img.detail || "Private registry")}">${esc(img.image)} <span class="img-note">private</span></span>`;
+    if (img.status === "not-deployed")
+      return `<span class="img-line" title="${esc(img.detail || "Declared in the stack file but not running")}">${esc(img.image)} <span class="img-note">not deployed</span></span>`;
     return `<span class="img-line unk" title="${esc(img.detail || "Could not check")}">${esc(img.image)} <span class="img-note">?</span></span>`;
   }
 
