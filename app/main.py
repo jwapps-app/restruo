@@ -1050,7 +1050,8 @@ async def get_updates(request: Request):
 
 @app.post("/api/check-updates", dependencies=[Depends(require_auth)])
 async def check_updates(request: Request):
-    return await request.app.state.checker.check_all()
+    # Asked for by hand, so the answer is on screen — no mail for it.
+    return await request.app.state.checker.check_all(notify=False)
 
 
 # Title/version are cosmetic and shown on the login screen — no auth.

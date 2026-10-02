@@ -399,7 +399,12 @@ class UpdateChecker:
                             container["status"] == STATUS_UPDATE_AVAILABLE:
                         container["status"] = STATUS_UP_TO_DATE
 
-    async def check_all(self) -> dict:
+    async def check_all(self, notify: bool = True) -> dict:
+        """Check every instance. `notify=False` is for a check someone asked
+        for from the dashboard: they are looking at the result, so a mail
+        saying the same thing is noise. It also leaves the record of what has
+        been announced untouched, so the next scheduled check still reports
+        anything that is new since the last mail."""
         async with self._lock:
             self.checking = True
             self._remote_tasks = {}
@@ -414,7 +419,8 @@ class UpdateChecker:
                     )
                 )
                 self.checked_at = time.time()
-                await self._notify_new()
+                if notify:
+                    await self._notify_new()
             finally:
                 self.checking = False
         return self.snapshot()

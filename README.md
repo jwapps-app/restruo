@@ -145,8 +145,9 @@ RESTRUO_SMTP_PASSWORD=your-app-password
 
 The server, port, sender, and recipient are all inferred from that address (Gmail,
 Outlook/Hotmail, Yahoo, iCloud and Fastmail are recognised; anything else needs
-`RESTRUO_SMTP_HOST`). Restruo then emails you when a check finds something new — grouped by instance, one message per check, and only
-for findings it hasn't already reported. Sending is outbound only, so nothing has to be
+`RESTRUO_SMTP_HOST`). Restruo then emails you when a scheduled check finds something new — grouped by instance, one message per check, and only
+for findings it hasn't already reported. Pressing **Refresh** never sends mail: you are
+looking at the result already. Sending is outbound only, so nothing has to be
 exposed to the internet and no HTTPS or reverse proxy is involved.
 
 **⚙ Instances → Update notifications** shows the current setting and has a **Send test
