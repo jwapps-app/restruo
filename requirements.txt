@@ -1,5 +1,5 @@
-fastapi>=0.140.13,<1.0
-uvicorn[standard]>=0.51.0,<1.0
+fastapi>=0.141.1,<1.0
+uvicorn[standard]>=0.54.0,<1.0
 httpx>=0.28.1,<1.0
 PyYAML>=6.0.3,<7.0
 # Imported directly (models and validators), not only through FastAPI.
