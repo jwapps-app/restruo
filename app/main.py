@@ -526,9 +526,36 @@ def _get_client(request: Request, iid: int) -> PortainerClient:
     return client
 
 
+def _conflicts(key: tuple, held: tuple) -> str | None:
+    """Why `key` cannot run while `held` is in flight, or None if it can.
+
+    Keys: ("stack", iid, eid, sid), ("container", iid, eid, cid),
+    ("agent", iid, eid, cid) for replacing the environment's own agent,
+    ("portainer", iid) for replacing Portainer itself, ("prune", iid).
+    """
+    if key == held:
+        return "an update is already running for this one"
+    if key[1] != held[1]:
+        return None  # different instances never conflict
+    kinds = {key[0], held[0]}
+    if "portainer" in kinds:
+        return "Portainer itself is being replaced on this instance"
+    if "prune" in kinds:
+        return "a clean-up is running on this instance" if held[0] == "prune" \
+            else "an update is running on this instance"
+    if "agent" in kinds and key[2] == held[2]:
+        # Every stack on an environment deploys through its agent.
+        return "this environment's agent is being replaced" if held[0] == "agent" \
+            else "a deploy is running on this environment"
+    return None
+
+
 @asynccontextmanager
 async def _exclusive(request: Request, key: tuple):
-    """One redeploy at a time per stack or container.
+    """One operation at a time per target — and none that would pull the
+    ground from under another: no stack deploy while its environment's agent
+    is being replaced, nothing at all while Portainer itself is, no prune
+    while anything deploys.
 
     Portainer refuses a second deploy of the same stack while one is running,
     and answers with a generic "Unable to update stack" — which reads as a
@@ -537,12 +564,14 @@ async def _exclusive(request: Request, key: tuple):
     again, or to click from another tab.
     """
     in_flight = request.app.state.in_flight
-    if key in in_flight:
-        raise HTTPException(
-            status_code=409,
-            detail="An update is already running for this one — it takes a "
-                   "moment while Portainer waits for the containers to come up.",
-        )
+    for held in in_flight:
+        reason = _conflicts(key, held)
+        if reason:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Not now — {reason}. It takes a moment while Portainer waits "
+                       "for the containers to come up.",
+            )
     in_flight.add(key)
     try:
         yield
@@ -651,12 +680,10 @@ def _prune_jobs(jobs: dict[str, dict]) -> None:
 async def _run_job(request: Request, key: tuple, work) -> JSONResponse:
     """Run `work()` under the per-target lock and report its result."""
     app = request.app
-    if key in app.state.in_flight:
-        raise HTTPException(
-            status_code=409,
-            detail="An update is already running for this one — it takes a "
-                   "moment while Portainer waits for the containers to come up.",
-        )
+    for held in app.state.in_flight:
+        reason = _conflicts(key, held)
+        if reason:
+            raise HTTPException(status_code=409, detail=f"Not now — {reason}.")
     job = {"id": secrets.token_hex(8), "done": False, "result": None,
            "started": time.time()}
     _prune_jobs(app.state.jobs)
@@ -829,28 +856,22 @@ async def _update_one(client: PortainerClient, stack: dict) -> dict:
 
 
 async def _find_container(
-    client: PortainerClient, cid: str, endpoint_id: int | None = None
+    client: PortainerClient, cid: str, endpoint_id: int
 ) -> tuple[int, dict]:
-    """Locate a container, preferring the environment the caller names.
+    """Locate a container in one named environment.
 
     Container ids are unique per host, not per Portainer: machines cloned from
-    a template carry the same ids. Scanning environments in order would then
-    act on whichever host happens to come first — a different machine than the
-    row that was clicked.
+    a template carry the same ids. Scanning environments for a bare id would
+    act on whichever host happens to come first — a different machine than
+    the row that was clicked — so the environment is never optional.
     """
-    if endpoint_id is not None:
-        for container in await client.list_containers(endpoint_id):
-            if container.get("Id") == cid:
-                return endpoint_id, container
-        raise HTTPException(
-            status_code=404,
-            detail=f"No container {cid[:12]} in environment {endpoint_id}",
-        )
-    for endpoint in await client.list_endpoints():
-        for container in await client.list_containers(endpoint["Id"]):
-            if container.get("Id") == cid:
-                return endpoint["Id"], container
-    raise HTTPException(status_code=404, detail=f"No container {cid[:12]} on this instance")
+    for container in await client.list_containers(endpoint_id):
+        if container.get("Id") == cid:
+            return endpoint_id, container
+    raise HTTPException(
+        status_code=404,
+        detail=f"No container {cid[:12]} in environment {endpoint_id}",
+    )
 
 
 def _timed(started: float, name: str, message: str, ok: bool = True) -> dict:
@@ -904,7 +925,10 @@ async def _set_stack_state(request: Request, iid: int, sid: int, action: str):
                        "would cut off the connection needed to start it again.",
             )
     try:
-        await client.set_stack_state(sid, stack["EndpointId"], running=action == "start")
+        async with _exclusive(request, ("stack", iid, stack["EndpointId"], sid)):
+            await client.set_stack_state(sid, stack["EndpointId"], running=action == "start")
+    except HTTPException:
+        raise
     except Exception as exc:
         message = exc.message if isinstance(exc, PortainerError) else str(exc)
         return JSONResponse(status_code=502, content=_timed(started, name, message, ok=False))
@@ -922,7 +946,7 @@ async def stop_stack(request: Request, iid: int, sid: int):
 
 
 async def _set_container_state(
-    request: Request, iid: int, cid: str, action: str, endpoint_id: int | None = None
+    request: Request, iid: int, cid: str, action: str, endpoint_id: int
 ):
     """Start or stop a standalone container."""
     client = _get_client(request, iid)
@@ -944,7 +968,10 @@ async def _set_container_state(
                    "cut off the connection needed to start it again.",
         )
     try:
-        await client.set_container_state(endpoint_id, cid, running=action == "start")
+        async with _exclusive(request, ("container", iid, endpoint_id, cid)):
+            await client.set_container_state(endpoint_id, cid, running=action == "start")
+    except HTTPException:
+        raise
     except Exception as exc:
         message = exc.message if isinstance(exc, PortainerError) else str(exc)
         return JSONResponse(status_code=502, content=_timed(started, name, message, ok=False))
@@ -953,14 +980,14 @@ async def _set_container_state(
 
 @app.post("/api/instances/{iid}/containers/{cid}/start", dependencies=[Depends(require_auth)])
 async def start_container(
-    request: Request, iid: int, cid: str, endpointId: int | None = None
+    request: Request, iid: int, cid: str, endpointId: int
 ):
     return await _set_container_state(request, iid, cid, "start", endpointId)
 
 
 @app.post("/api/instances/{iid}/containers/{cid}/stop", dependencies=[Depends(require_auth)])
 async def stop_container(
-    request: Request, iid: int, cid: str, endpointId: int | None = None
+    request: Request, iid: int, cid: str, endpointId: int
 ):
     return await _set_container_state(request, iid, cid, "stop", endpointId)
 
@@ -993,13 +1020,16 @@ async def update_stack(request: Request, iid: int, sid: int):
             request.app.state.checker.mark_updated(iid, stack_id=sid)
         return result
 
-    return await _run_job(request, ("stack", iid, sid), work)
+    return await _run_job(request, ("stack", iid, stack["EndpointId"], sid), work)
 
 
 @app.post("/api/instances/{iid}/containers/{cid}/update", dependencies=[Depends(require_auth)])
 async def update_container(
-    request: Request, iid: int, cid: str, endpointId: int | None = None
+    request: Request, iid: int, cid: str, endpointId: int
 ):
+    """Repull + recreate a standalone container. `endpointId` is required:
+    container ids are unique per host, and cloned hosts share them, so a
+    bare id can name several containers on several machines."""
     """Repull + recreate a standalone container via Portainer's recreate action."""
     client = _get_client(request, iid)
     started = time.monotonic()
@@ -1027,7 +1057,8 @@ async def update_container(
                 )
             return result
 
-        return await _run_job(request, ("container", iid, endpoint_id, cid), helper_work)
+        kind = "portainer" if "portainer/portainer" in resolved_image.lower() else "agent"
+        return await _run_job(request, (kind, iid, endpoint_id, cid), helper_work)
 
     async def work() -> dict:
         try:
@@ -1071,6 +1102,13 @@ async def prune_instance(request: Request, iid: int, body: PruneRequest):
     def _msg(exc: Exception) -> str:
         return exc.message if isinstance(exc, PortainerError) else str(exc)
 
+    async with _exclusive(request, ("prune", iid)):
+        await _prune_endpoints(client, endpoints, body, summary, _msg)
+    summary["ok"] = not summary["errors"]
+    return summary
+
+
+async def _prune_endpoints(client, endpoints, body, summary, _msg) -> None:
     for endpoint in endpoints:
         endpoint_id = endpoint["Id"]
         if body.images:
@@ -1093,8 +1131,6 @@ async def prune_instance(request: Request, iid: int, body: PruneRequest):
                 summary["spaceReclaimed"] += pruned.get("SpaceReclaimed") or 0
             except Exception as exc:
                 summary["errors"].append(f"volumes: {_msg(exc)}")
-    summary["ok"] = not summary["errors"]
-    return summary
 
 
 # --- updates & UI -------------------------------------------------------------

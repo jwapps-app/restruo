@@ -102,13 +102,11 @@ class EmailNotifier(Notifier):
             return
         count = len(events)
         subject = f"Restruo: {count} update{'' if count == 1 else 's'} available"
-        try:
-            await self.deliver(subject, compose_body(events))
-            logger.info("Emailed %d update(s) to %s", count,
-                        ", ".join(self.config.recipients))
-        except Exception:
-            # A mail failure must never break the update check itself.
-            logger.exception("Could not send the update email")
+        # A failure propagates: the checker must know the mail did not go,
+        # so it can try again next time instead of filing it as announced.
+        await self.deliver(subject, compose_body(events))
+        logger.info("Emailed %d update(s) to %s", count,
+                    ", ".join(self.config.recipients))
 
 
 def build_notifiers(config) -> list[Notifier]:

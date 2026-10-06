@@ -94,13 +94,24 @@ async def test_sends_a_real_message():
     assert "DATA" in server.commands
 
 
-async def test_send_failure_never_breaks_the_check():
-    """A dead mail server must not take the update check down with it."""
+async def test_send_failure_is_raised_so_the_checker_can_retry():
+    """A dead mail server must not take the update check down — but the
+    checker has to hear about it, or the mail is filed as sent and never
+    tried again. So the notifier raises, and the checker catches."""
+    from app.updates import UpdateChecker
     config = EmailConfig(
         host="127.0.0.1", port=1, sender="a@b.c", recipients=["me@example.com"],
         security="none",
     )
-    await EmailNotifier(config).send(EVENTS)  # logs, does not raise
+    notifier = EmailNotifier(config)
+    with pytest.raises(Exception):
+        await notifier.send(EVENTS)
+    checker = UpdateChecker(lambda: [], registry=None, interval_hours=6, notifiers=[notifier])
+    checker.results = [{"instance": {"id": 1, "name": "n"}, "stacks": [
+        {"id": 1, "name": "s", "images": [{"image": "x:latest", "status": "update-available"}]}],
+        "containers": []}]
+    await checker._notify_new()  # does not raise
+    assert checker._notified == set(), "undelivered means unannounced — tried again next time"
 
 
 def test_notifier_is_only_built_when_configured():

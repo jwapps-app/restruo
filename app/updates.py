@@ -468,17 +468,22 @@ class UpdateChecker:
         return self.snapshot()
 
     async def _notify_new(self) -> None:
+        previous = self._notified
         current: set[tuple] = set()
         events: list[UpdateEvent] = []
+        observed: set[int] = set()
         for instance_result in self.results:
             iid = instance_result["instance"]["id"]
+            if instance_result.get("error"):
+                continue  # not seen this time — says nothing about its updates
+            observed.add(iid)
             for stack in instance_result["stacks"]:
                 for image in stack["images"]:
                     if image["status"] != STATUS_UPDATE_AVAILABLE:
                         continue
                     key = (iid, stack["id"], image["image"])
                     current.add(key)
-                    if key not in self._notified:
+                    if key not in previous:
                         events.append(UpdateEvent(
                             instance_name=instance_result["instance"]["name"],
                             stack_name=stack["name"],
@@ -496,23 +501,31 @@ class UpdateChecker:
                 if key in current:
                     continue
                 current.add(key)
-                if key not in self._notified:
+                if key not in previous:
                     events.append(UpdateEvent(
                         instance_name=instance_result["instance"]["name"],
                         stack_name=container["name"],
                         image=container["image"],
                         environment=container.get("environment"),
                     ))
-        # Forget resolved updates so they re-notify if they reappear later.
-        self._notified = current
+        # An instance that could not be checked keeps what was known about
+        # it: forgetting would re-announce every one of its updates when it
+        # comes back. Resolved updates (observed, and gone) are dropped.
+        carried = {key for key in previous if key[0] not in observed}
+        delivered = True
+        if events:
+            for notifier in self.notifiers:
+                try:
+                    await notifier.send(events)
+                except Exception:
+                    delivered = False
+                    logger.exception("Notifier %s failed", type(notifier).__name__)
+        if delivered:
+            self._notified = current | carried
+        else:
+            # Nothing new counts as announced; it is tried again next check.
+            self._notified = (previous & current) | carried
         self._save_notified()
-        if not events:
-            return
-        for notifier in self.notifiers:
-            try:
-                await notifier.send(events)
-            except Exception:
-                logger.exception("Notifier %s failed", type(notifier).__name__)
 
     async def run_periodic(self) -> None:
         while True:

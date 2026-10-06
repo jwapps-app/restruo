@@ -20,6 +20,9 @@ from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 from .portainer import PortainerClient
 
 DEFAULT_DATA_PATH = "/data/instances.json"
+# Longer than any one job can run (a helper gets fifteen minutes), so a
+# replaced client is never closed under something still using it.
+RETIRE_AFTER_SECONDS = 20 * 60
 
 
 def destination(url: str) -> str:
@@ -70,17 +73,41 @@ class InstanceRecord(BaseModel):
         }
 
 
+def _write_private(path: Path, text: str) -> None:
+    """Write a file nobody else can read, from the first byte: created 0600,
+    never 0644-then-chmod. Flushed to disk before it is renamed into place."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)  # in case the file already existed
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
 class InstanceStore:
     def __init__(self, path: str | Path | None = None):
         self.path = Path(path or os.environ.get("DATA_PATH", DEFAULT_DATA_PATH))
         self._lock = asyncio.Lock()
         self._records: list[InstanceRecord] = []
+        self._next = 1
         if self.path.is_file():
             # The file holds Portainer credentials — keep it owner-only, and
             # repair permissions on files written by older versions.
             self.path.chmod(0o600)
             data = json.loads(self.path.read_text() or "[]")
-            self._records = [InstanceRecord.model_validate(r) for r in data]
+            if isinstance(data, dict):
+                records, self._next = data.get("instances", []), int(data.get("nextId", 1))
+            else:
+                records = data  # the older, bare-list format
+            self._records = [InstanceRecord.model_validate(r) for r in records]
+            self._next = max(self._next, max((r.id for r in self._records), default=0) + 1)
 
     @property
     def exists(self) -> bool:
@@ -92,21 +119,31 @@ class InstanceStore:
     def get(self, iid: int) -> InstanceRecord | None:
         return next((r for r in self._records if r.id == iid), None)
 
-    def _save(self) -> None:
+    def _save(self, records: list[InstanceRecord], next_id: int) -> None:
+        """Persist, then publish: the in-memory state only changes once the
+        file is safely on disk, so a failed write leaves memory, disk and the
+        running clients agreeing with each other."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps([r.model_dump() for r in self._records], indent=2))
-        tmp.chmod(0o600)  # holds Portainer credentials
+        payload = {"nextId": next_id, "instances": [r.model_dump() for r in records]}
+        _write_private(tmp, json.dumps(payload, indent=2))
         tmp.replace(self.path)
-
-    def _next_id(self) -> int:
-        return max((r.id for r in self._records), default=0) + 1
+        try:
+            dir_fd = os.open(self.path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass  # the rename is already durable on most filesystems
+        self._records, self._next = records, next_id
 
     async def add(self, fields: dict) -> InstanceRecord:
         async with self._lock:
-            record = InstanceRecord.model_validate({**fields, "id": self._next_id()})
-            self._records.append(record)
-            self._save()
+            # Ids are never reused: a tab still showing a deleted instance
+            # must not be able to act on whatever took its number.
+            record = InstanceRecord.model_validate({**fields, "id": self._next})
+            self._save(self._records + [record], self._next + 1)
             return record
 
     async def update(self, iid: int, fields: dict) -> InstanceRecord | None:
@@ -130,9 +167,15 @@ class InstanceStore:
                 if key in ("api_key", "password") and not value:
                     continue
                 merged[key] = value
+            if auth_type != existing.auth_type:
+                # Switching how an instance authenticates retires the other
+                # credential; it must not linger on disk unused.
+                merged["api_key" if auth_type == "credentials" else "password"] = None
+                if auth_type == "api_key":
+                    merged["username"] = None
             record = InstanceRecord.model_validate({**merged, "id": iid})
-            self._records[self._records.index(existing)] = record
-            self._save()
+            records = [record if r.id == iid else r for r in self._records]
+            self._save(records, self._next)
             return record
 
     async def move(self, iid: int, direction: str) -> bool:
@@ -141,34 +184,30 @@ class InstanceStore:
             record = self.get(iid)
             if record is None:
                 return False
-            index = self._records.index(record)
+            records = list(self._records)
+            index = records.index(record)
             target = index - 1 if direction == "up" else index + 1
-            if not 0 <= target < len(self._records):
+            if not 0 <= target < len(records):
                 return False  # already at the end
-            self._records[index], self._records[target] = (
-                self._records[target],
-                self._records[index],
-            )
-            self._save()
+            records[index], records[target] = records[target], records[index]
+            self._save(records, self._next)
             return True
 
     async def delete(self, iid: int) -> bool:
         async with self._lock:
-            existing = self.get(iid)
-            if existing is None:
+            if self.get(iid) is None:
                 return False
-            self._records.remove(existing)
-            self._save()
+            self._save([r for r in self._records if r.id != iid], self._next)
             return True
 
     async def seed(self, records: list[dict]) -> None:
         """One-time import (e.g. from config.yaml) — only when no store file exists."""
         async with self._lock:
+            new, next_id = list(self._records), self._next
             for fields in records:
-                self._records.append(
-                    InstanceRecord.model_validate({**fields, "id": self._next_id()})
-                )
-            self._save()
+                new.append(InstanceRecord.model_validate({**fields, "id": next_id}))
+                next_id += 1
+            self._save(new, next_id)
 
 
 class ClientManager:
@@ -177,6 +216,7 @@ class ClientManager:
     def __init__(self, store: InstanceStore):
         self.store = store
         self._clients: dict[int, PortainerClient] = {}
+        self._retiring: set[asyncio.Task] = set()
 
     def items(self) -> list[tuple[int, PortainerClient]]:
         return [
@@ -191,7 +231,10 @@ class ClientManager:
 
         A client holds a logged-in session and a CSRF token for its Portainer.
         Editing one instance used to throw all of them away, so every other
-        instance had to log in again on its next poll."""
+        instance had to log in again on its next poll. A client that is
+        replaced is retired, not closed: a deploy or a check that already
+        holds it finishes on it, and it is closed once that could be over.
+        """
         old = self._clients
         fresh: dict[int, PortainerClient] = {}
         for record in self.store.list():
@@ -203,9 +246,30 @@ class ClientManager:
         self._clients = fresh
         for iid, client in old.items():
             if fresh.get(iid) is not client:
+                self._retire(client)
+
+    def _retire(self, client: PortainerClient) -> None:
+        task = asyncio.create_task(self._close_later(client))
+        self._retiring.add(task)
+        task.add_done_callback(self._retiring.discard)
+
+    async def _close_later(self, client: PortainerClient) -> None:
+        try:
+            await asyncio.sleep(RETIRE_AFTER_SECONDS)
+        finally:
+            try:
                 await client.aclose()
+            except Exception:
+                pass
 
     async def aclose(self) -> None:
+        for task in list(self._retiring):
+            task.cancel()
+        for task in list(self._retiring):
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
         for client in self._clients.values():
             await client.aclose()
         self._clients = {}

@@ -108,7 +108,9 @@ async def test_store_seed(tmp_path):
         {"name": "B", "base_url": "https://b.test", "auth_type": "api_key", "api_key": "k2"},
     ])
     assert [r.id for r in store.list()] == [1, 2]
-    assert json.loads(path.read_text())[1]["name"] == "B"
+    on_disk = json.loads(path.read_text())
+    assert on_disk["instances"][1]["name"] == "B"
+    assert on_disk["nextId"] == 3
 
 
 def test_public_shape_has_no_secrets():

@@ -222,6 +222,7 @@ class PortainerClient:
         self._csrf: str | None = None
         self._logged_in = False
         self._auth_lock = asyncio.Lock()
+        self._retiring: set[asyncio.Future] = set()
 
     def _new_client(self) -> httpx.AsyncClient:
         transport = self._injected_transport
@@ -252,10 +253,19 @@ class PortainerClient:
         self._jwt = None
         self._csrf = None
         self._logged_in = False
+        # Requests already in flight on the old pool — a deploy that has
+        # reached Portainer, say — finish on it. It is closed once they can
+        # all be over, not the moment a probe elsewhere failed.
+        self._retiring.add(asyncio.ensure_future(self._close_later(old)))
+
+    async def _close_later(self, client: httpx.AsyncClient) -> None:
         try:
-            await old.aclose()
-        except Exception:
-            pass
+            await asyncio.sleep(REDEPLOY_TIMEOUT + 60)
+        finally:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
 
     async def _send(self, method: str, url: str, **kwargs) -> httpx.Response:
         try:
@@ -272,6 +282,9 @@ class PortainerClient:
             return await self._client.request(method, url, **kwargs)
 
     async def aclose(self) -> None:
+        for task in list(self._retiring):
+            task.cancel()
+        self._retiring.clear()
         await self._client.aclose()
 
     def _harvest_csrf(self, response: httpx.Response) -> None:

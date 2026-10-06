@@ -354,3 +354,144 @@ def test_auto_refresh_also_reloads_update_results():
     html = open("web/index.html").read()
     body = html[html.index("async function refresh()"):html.index("function ago(")]
     assert "loadUpdates()" in body
+
+
+# --- A19 -------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_an_unobserved_instance_keeps_what_was_announced():
+    from app.updates import UpdateChecker
+    sent = []
+
+    class Capture:
+        async def send(self, events):
+            sent.append(list(events))
+
+    checker = UpdateChecker(lambda: [], registry=None, interval_hours=6, notifiers=[Capture()])
+    finding = {"instance": {"id": 5, "name": "P"}, "stacks": [
+        {"id": 1, "name": "s", "images": [{"image": "x:latest", "status": "update-available"}]}], "containers": []}
+    checker.results = [finding]
+    await checker._notify_new()
+    assert len(sent) == 1
+    # The instance is unreachable on the next check: nothing is known, nothing is forgotten.
+    checker.results = [{"instance": {"id": 5, "name": "P"}, "stacks": [], "containers": [], "error": "down"}]
+    await checker._notify_new()
+    assert checker._notified == {(5, 1, "x:latest")}
+    # It comes back with the same update: no second mail.
+    checker.results = [finding]
+    await checker._notify_new()
+    assert len(sent) == 1
+
+
+# --- A21 -------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_ids_are_never_reused_and_the_old_format_still_loads(tmp_path):
+    import json
+    path = tmp_path / "i.json"
+    path.write_text(json.dumps([{"id": 1, "name": "a", "base_url": "http://a", "api_key": "k"},
+                                {"id": 4, "name": "b", "base_url": "http://b", "api_key": "k"}]))
+    store = InstanceStore(path)
+    assert [r.id for r in store.list()] == [1, 4]
+    await store.delete(4)
+    added = await store.add({"name": "c", "base_url": "http://c", "api_key": "k"})
+    assert added.id == 5, "4 is retired, not recycled"
+    reloaded = InstanceStore(path)
+    assert (await reloaded.add({"name": "d", "base_url": "http://d", "api_key": "k"})).id == 6
+
+
+# --- A22 / A29 --------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_failed_write_changes_nothing_in_memory(tmp_path, monkeypatch):
+    import app.instances as instances
+    store = InstanceStore(tmp_path / "i.json")
+    await store.add({"name": "a", "base_url": "http://a", "api_key": "k"})
+
+    def disk_full(path, text):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(instances, "_write_private", disk_full)
+    with pytest.raises(OSError):
+        await store.add({"name": "b", "base_url": "http://b", "api_key": "k"})
+    with pytest.raises(OSError):
+        await store.delete(1)
+    assert [r.name for r in store.list()] == ["a"], "memory still matches the disk"
+    assert [r.name for r in InstanceStore(tmp_path / "i.json").list()] == ["a"]
+
+
+def test_secret_files_are_private_from_the_first_byte(tmp_path):
+    import os, stat
+    from app.instances import _write_private
+    os.umask(0o022)
+    target = tmp_path / "s"
+    _write_private(target, "secret")
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+# --- A23 -------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_replaced_client_is_retired_not_closed_under_a_running_job(tmp_path, monkeypatch):
+    import app.instances as instances
+    monkeypatch.setattr(instances, "RETIRE_AFTER_SECONDS", 0.05)
+    store = InstanceStore(tmp_path / "i.json")
+    rec = await store.add({"name": "a", "base_url": "http://a", "api_key": "k"})
+    manager = instances.ClientManager(store)
+    await manager.refresh()
+    old = manager.get(rec.id)
+    closed = []
+    async def aclose():
+        closed.append(True)
+    old.aclose = aclose
+    await store.update(rec.id, {"name": "renamed"})
+    await manager.refresh()
+    assert manager.get(rec.id) is not old and closed == [], "still usable by whatever holds it"
+    await __import__("asyncio").sleep(0.1)
+    assert closed == [True], "closed once the retirement window passed"
+    await manager.aclose()
+
+
+# --- A24 -------------------------------------------------------------------
+
+@pytest.mark.parametrize("key,held,blocked", [
+    (("stack", 5, 2, 7), ("stack", 5, 2, 7), True),         # same stack
+    (("stack", 5, 2, 7), ("stack", 5, 2, 8), False),        # another stack: fine
+    (("stack", 5, 2, 7), ("agent", 5, 2, "abc"), True),     # its environment's agent is being swapped
+    (("agent", 5, 2, "abc"), ("stack", 5, 2, 7), True),     # and vice versa
+    (("stack", 5, 3, 7), ("agent", 5, 2, "abc"), False),    # a different environment: fine
+    (("stack", 5, 2, 7), ("portainer", 5), True),           # Portainer itself: nothing else
+    (("prune", 5), ("stack", 5, 2, 7), True),
+    (("stack", 5, 2, 7), ("prune", 5), True),
+    (("stack", 6, 2, 7), ("prune", 5), False),              # other instance: fine
+])
+def test_conflicting_operations_are_refused(key, held, blocked):
+    from app.main import _conflicts
+    assert (_conflicts(key, held) is not None) is blocked
+
+
+def test_stop_is_refused_while_the_stack_is_deploying(client):
+    host = StackHost()
+
+    async def plain_stack(sid):  # not Portainer: the self-critical guard stays out of the way
+        return {"Id": sid, "Name": "plain", "EndpointId": 1, "Env": [], "Type": 2}
+    host.get_stack = plain_stack
+
+    async def plain_containers(endpoint_id):
+        return [{"Id": "a" * 12, "Image": "nginx:latest", "ImageID": "sha256:x", "State": "running",
+                 "Labels": {"com.docker.compose.project": "plain"}}]
+    host.list_containers = plain_containers
+    app.state.manager._clients[7] = host
+    app.state.in_flight.add(("stack", 7, 1, 1))
+    try:
+        r = client.post("/api/instances/7/stacks/1/stop", auth=BASIC)
+        assert r.status_code == 409 and host.stopped == []
+    finally:
+        app.state.in_flight.discard(("stack", 7, 1, 1))
+
+
+# --- A25 -------------------------------------------------------------------
+
+def test_container_actions_require_an_environment(client):
+    for action in ("start", "stop", "update"):
+        r = client.post(f"/api/instances/7/containers/{'a' * 12}/{action}", auth=BASIC)
+        assert r.status_code == 422, action
