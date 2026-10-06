@@ -16,7 +16,7 @@ from app.auth import LoginLimiter, SessionManager
 from app.instances import ClientManager, InstanceRecord, InstanceStore
 from app.main import app
 from app.portainer import PortainerClient
-from app.registry import _realm_trusted
+from app.registry import realm_policy
 from app.updates import UpdateChecker
 
 CSRF = {"X-Restruo": "1"}
@@ -331,16 +331,21 @@ def test_secure_flag_only_over_https(client):
 
 # --- #13 registry logins only go to the registry's own HTTPS realm ---------
 
-@pytest.mark.parametrize("realm,registry,ok", [
-    ("https://auth.docker.io/token", "docker.io", True),
-    ("https://ghcr.io/token", "ghcr.io", True),
-    ("http://auth.docker.io/token", "docker.io", False),      # plain http
-    ("https://evil.example/token", "ghcr.io", False),         # other domain
-    ("https://registry.lan:5000/auth", "registry.lan:5000", True),
-    ("https://10.0.0.5/auth", "10.0.0.5:5000", True),
+@pytest.mark.parametrize("realm,registry,creds,fetch,send", [
+    ("https://auth.docker.io/token", "docker.io", True, True, True),
+    ("https://ghcr.io/token", "ghcr.io", True, True, True),
+    ("https://ghcr.io/token", "lscr.io", False, True, False),          # lscr.io hands off to ghcr — anonymous is fine
+    ("https://ghcr.io/token", "lscr.io", True, True, False),           # …but a login for lscr.io stays home
+    ("http://auth.docker.io/token", "docker.io", True, False, False),  # plain http: not even fetched
+    ("https://attacker.co.uk/token", "registry.victim.co.uk", True, True, False),
+    ("https://127.0.0.1:9000/internal", "ghcr.io", False, False, False),  # never a request to this network
+    ("https://10.0.0.5/auth", "ghcr.io", False, False, False),
+    ("https://registry.lan/auth", "registry.lan:5000", True, True, True),  # a LAN registry's own host is fine
+    ("https://nas.local/auth", "ghcr.io", False, False, False),
 ])
-def test_realm_trust(realm, registry, ok):
-    assert _realm_trusted(realm, registry) is ok
+def test_realm_policy(realm, registry, creds, fetch, send):
+    got_fetch, got_send, _ = realm_policy(realm, registry, creds)
+    assert (got_fetch, got_send) == (fetch, send)
 
 
 # --- #14/#19 an edit rebuilds only the instance that changed ----------------
@@ -362,27 +367,7 @@ async def test_refresh_keeps_clients_whose_record_is_unchanged(tmp_path):
 
 # --- #16 a failed poll is not "every container vanished" -------------------
 
-@pytest.mark.asyncio
-async def test_transient_listing_error_does_not_fake_a_redeploy(monkeypatch):
-    monkeypatch.setattr(main, "DEPLOY_POLL_SECONDS", 0.001)
-    monkeypatch.setattr(main, "DEPLOY_TIMEOUT_SECONDS", 0.5)
-    same = [{"Id": "c1", "State": "running", "Status": "Up",
-             "Labels": {"com.docker.compose.project": "s"}}]
-
-    class Flaky:
-        calls = 0
-
-        async def list_containers(self, endpoint_id):
-            Flaky.calls += 1
-            if Flaky.calls % 2 == 0:
-                raise RuntimeError("proxy hiccup")
-            return same
-
-    stack = {"Id": 1, "Name": "s", "EndpointId": 1}
-    before = await main._stack_fingerprint(Flaky(), stack)
-    message = await main._await_deploy(Flaky(), stack, before)
-    assert "nothing changed" in message
-    assert "Redeployed" not in message
+# (the transient-listing case now lives in tests/test_deploy_completion.py)
 
 
 # --- #17 long deploys become a job the page polls --------------------------

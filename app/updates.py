@@ -20,6 +20,7 @@ from .portainer import (
     stack_containers,
     stack_env,
     stack_images,
+    stack_names_by_endpoint,
     standalone_containers,
 )
 from .registry import RegistryClient, RegistryError, parse_image_ref
@@ -173,23 +174,24 @@ class UpdateChecker:
 
     async def _running_digests(
         self, client: PortainerClient, endpoint_id: int, image_ids: set[str] | None
-    ) -> set[str] | None:
-        """Repo digests of the image the stack's containers are ACTUALLY running.
+    ) -> dict[str, set[str]] | None:
+        """Repo digests of each image the containers are ACTUALLY running,
+        keyed by image id — every replica judged on its own, so one current
+        replica cannot vouch for an old one beside it.
 
-        The local tag may already point at a newer pull while the container still
-        runs the old image — comparing the running image is what tells the truth.
-        Returns None when no matching container exists (fall back to the tag).
+        The local tag may already point at a newer pull while the container
+        still runs the old image — comparing the running image is what tells
+        the truth. Returns None when no matching container exists (fall back
+        to the tag). Raises if an image cannot be inspected: an unreadable
+        image is not a locally built one.
         """
         if not image_ids:
             return None
-        digests: set[str] = set()
+        out: dict[str, set[str]] = {}
         for image_id in image_ids:
-            try:
-                info = await self._image_info(client, endpoint_id, image_id)
-                digests |= {e.rpartition("@")[2] for e in info.get("RepoDigests") or []}
-            except Exception:
-                pass
-        return digests
+            info = await self._image_info(client, endpoint_id, image_id)
+            out[image_id] = {e.rpartition("@")[2] for e in info.get("RepoDigests") or []}
+        return out
 
     async def _check_image(
         self, client: PortainerClient, endpoint_id: int, raw: str, containers: list[dict]
@@ -205,7 +207,12 @@ class UpdateChecker:
         # (built on the box, or created by the NAS itself), so there is nothing
         # to compare against and no point asking a registry about it.
         running_ids = await self._running_image_ids(client, endpoint_id, raw, containers)
-        local_digests = await self._running_digests(client, endpoint_id, running_ids)
+        try:
+            per_image = await self._running_digests(client, endpoint_id, running_ids)
+        except Exception as exc:
+            return {"image": raw, "status": STATUS_UNKNOWN,
+                    "detail": f"running image: {describe_error(exc)}"}
+        local_digests = set().union(*per_image.values()) if per_image else None
         if local_digests is None:
             # No matching container found — fall back to what the tag points at.
             try:
@@ -260,10 +267,13 @@ class UpdateChecker:
             return {"image": raw, "status": STATUS_UNKNOWN,
                     "detail": f"{ref.registry}: {describe_error(exc)}"}
 
-        if remote_digest in local_digests:
+        behind = ({i for i, d in (per_image or {}).items() if remote_digest not in d}
+                  if per_image else ({"tag"} if remote_digest not in local_digests else set()))
+        if not behind:
             return {"image": raw, "status": STATUS_UP_TO_DATE}
         # Show both digests so a stuck badge is diagnosable from the tooltip.
-        local_short = ", ".join(sorted(d.removeprefix("sha256:")[:12] for d in local_digests))
+        shown = ({d for i in behind for d in per_image[i]} if per_image else local_digests)
+        local_short = ", ".join(sorted(d.removeprefix("sha256:")[:12] for d in shown)) or "no digest"
         return {
             "image": raw,
             "status": STATUS_UPDATE_AVAILABLE,
@@ -284,13 +294,17 @@ class UpdateChecker:
             return result
 
         container_tasks: dict[int, asyncio.Task] = {}
+        listing_errors: dict[int, str] = {}
 
         def containers_for(endpoint_id: int) -> asyncio.Task:
             if endpoint_id not in container_tasks:
                 async def fetch() -> list[dict]:
                     try:
                         return await client.list_containers(endpoint_id)
-                    except Exception:
+                    except Exception as exc:
+                        # Not "no containers": "could not look". Everything
+                        # on this environment reads as unchecked, not as fine.
+                        listing_errors[endpoint_id] = describe_error(exc)
                         return []
                 container_tasks[endpoint_id] = asyncio.ensure_future(fetch())
             return container_tasks[endpoint_id]
@@ -306,6 +320,20 @@ class UpdateChecker:
             own_containers = stack_containers(
                 stack, await containers_for(stack["EndpointId"])
             )
+            if stack["EndpointId"] in listing_errors:
+                reason = listing_errors[stack["EndpointId"]]
+                content = ""
+                try:
+                    content = await client.get_stack_file(stack["Id"])
+                except Exception:
+                    pass
+                return {
+                    "id": stack["Id"], "name": stack.get("Name", ""),
+                    "images": [{"image": raw, "status": STATUS_UNKNOWN,
+                                "detail": f"could not list this environment's containers: {reason}"}
+                               for raw in stack_images(stack, content, [])],
+                    "updatesAvailable": 0,
+                }
             # Every stack is checked at once; without the semaphore here, a
             # Portainer with thirty stacks gets thirty file fetches in the same
             # instant before any image check has even started.
@@ -320,8 +348,18 @@ class UpdateChecker:
             # the host to compare. Say so instead of reporting a failed check.
             inactive = profiled_images(content, stack_env(stack))
 
+            async def runs_in_this_stack(raw: str) -> bool:
+                wanted = self._normalize_image(raw)
+                for c in own_containers:
+                    ref = await self._container_ref(client, stack["EndpointId"], c)
+                    if self._normalize_image(ref) == wanted:
+                        return True
+                return False
+
             async def check_or_skip(raw: str) -> dict:
-                if raw in inactive:
+                # Behind a profile — unless some active service runs the same
+                # image, in which case there is a container to check.
+                if raw in inactive and not await runs_in_this_stack(raw):
                     return {"image": raw, "status": STATUS_NOT_DEPLOYED,
                             "detail": "service is behind a compose profile, which "
                                       "Portainer never activates — not running"}
@@ -340,7 +378,7 @@ class UpdateChecker:
         result["stacks"] = list(await asyncio.gather(*(check_stack(s) for s in stacks)))
 
         # Containers that live outside any Portainer stack.
-        stack_names = {s.get("Name") for s in stacks}
+        names_by_endpoint = stack_names_by_endpoint(stacks)
         environments: dict[int, str] = {}
         try:
             endpoints = await client.list_endpoints()
@@ -366,10 +404,14 @@ class UpdateChecker:
         standalone_jobs = []
         for endpoint_id in endpoint_ids:
             for raw_container in standalone_containers(
-                await containers_for(endpoint_id), stack_names
+                await containers_for(endpoint_id), names_by_endpoint.get(endpoint_id, set())
             ):
                 standalone_jobs.append(check_standalone(endpoint_id, raw_container))
         result["containers"] = list(await asyncio.gather(*standalone_jobs))
+        if listing_errors:
+            result["environmentErrors"] = {
+                environments.get(eid, f"env {eid}"): reason for eid, reason in listing_errors.items()
+            }
         return result
 
     def mark_updated(

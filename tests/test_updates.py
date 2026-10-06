@@ -114,6 +114,11 @@ def portainer_transport(local_digest: str) -> httpx.MockTransport:
             return httpx.Response(200, json=[STACK])
         if path == "/api/stacks/1/file":
             return httpx.Response(200, json={"StackFileContent": COMPOSE_YAML})
+        if path == "/api/endpoints":
+            return httpx.Response(200, json=[{"Id": 2, "Name": "local"}])
+        if path == "/api/endpoints/2/docker/containers/json":
+            # Nothing running: the check falls back to what the tag points at.
+            return httpx.Response(200, json=[])
         if path.startswith("/api/endpoints/2/docker/images/") and path.endswith("/json"):
             return httpx.Response(
                 200, json={"RepoDigests": [f"registry.test/acme/web@{local_digest}"]}

@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from contextlib import asynccontextmanager
@@ -30,6 +31,7 @@ from .portainer import (
     resolve_image_name,
     stack_containers,
     stack_images,
+    stack_names_by_endpoint,
     standalone_containers,
 )
 from .registry import RegistryClient
@@ -439,27 +441,33 @@ async def _stacks_for_instance(iid: int, name: str, client: PortainerClient) -> 
     # One Portainer can manage several environments (agents, remote hosts) —
     # keep their names so each row can say where it actually runs.
     environments: dict[int, str] = {}
+    # What could not be read is reported as such — never as "nothing there".
+    environment_errors: dict[str, str] = {}
     try:
         endpoints = await client.list_endpoints()
-    except Exception:
+    except Exception as exc:
         endpoints = []
+        environment_errors["(all)"] = f"could not list environments: {describe(exc)}"
     for endpoint in endpoints:
         environments[endpoint["Id"]] = endpoint.get("Name") or f"env {endpoint['Id']}"
 
-    async def containers_of(endpoint_id: int) -> tuple[int, list[dict] | None]:
+    async def containers_of(endpoint_id: int) -> tuple[int, list[dict] | None, str | None]:
         try:
-            return endpoint_id, await client.list_containers(endpoint_id)
-        except Exception:
-            return endpoint_id, None
+            return endpoint_id, await client.list_containers(endpoint_id), None
+        except Exception as exc:
+            return endpoint_id, None, describe(exc)
 
     # Environments are independent hosts; asking them one after another
     # makes the page wait on the slowest agent times the number of agents.
-    for endpoint_id, containers in await asyncio.gather(
+    for endpoint_id, containers, error in await asyncio.gather(
         *(containers_of(e["Id"]) for e in endpoints)
     ):
         if containers is not None:
             containers_by_endpoint[endpoint_id] = containers
+        else:
+            environment_errors[environments[endpoint_id]] = f"could not list containers: {error}"
     result["environments"] = len(environments)
+    result["environmentErrors"] = environment_errors
 
     owned = [
         stack_containers(stack, containers_by_endpoint.get(stack.get("EndpointId"), []))
@@ -472,6 +480,8 @@ async def _stacks_for_instance(iid: int, name: str, client: PortainerClient) -> 
         normalized = normalize_stack(stack, images)
         normalized["containersTotal"] = len(own)
         normalized["downNames"] = [container_name(c) for c in own if container_is_down(c)]
+        # Unknown is not the same as fine.
+        normalized["unchecked"] = stack.get("EndpointId") not in containers_by_endpoint
         normalized["environment"] = environments.get(stack.get("EndpointId"), "")
         # Stacks running Portainer or Restruo can't be stopped from here.
         normalized["selfCritical"] = any(
@@ -483,7 +493,7 @@ async def _stacks_for_instance(iid: int, name: str, client: PortainerClient) -> 
         result["stacks"].append(normalized)
 
     # Containers that live outside any Portainer stack.
-    stack_names = {s.get("Name") for s in stacks}
+    names_by_endpoint = stack_names_by_endpoint(stacks)
 
     async def standalone_row(endpoint_id: int, c: dict) -> dict:
         normalized = normalize_container(c, endpoint_id)
@@ -494,7 +504,7 @@ async def _stacks_for_instance(iid: int, name: str, client: PortainerClient) -> 
     result["containers"] = list(await asyncio.gather(*(
         standalone_row(endpoint_id, c)
         for endpoint_id, containers in containers_by_endpoint.items()
-        for c in standalone_containers(containers, stack_names)
+        for c in standalone_containers(containers, names_by_endpoint.get(endpoint_id, set()))
     )))
     return result
 
@@ -543,56 +553,85 @@ async def _exclusive(request: Request, key: tuple):
 # Portainer accepts a stack deploy and returns immediately, running compose in
 # the background — a redeploy the API "completed" in 68ms can still be pulling
 # an image a minute later. So watch the stack's containers until they settle,
-# and report what actually happened rather than what was accepted.
+# then check that what settled is actually working, and report that.
 DEPLOY_POLL_SECONDS = 2.0
-DEPLOY_SETTLE_POLLS = 2      # unchanged this many times running = finished
-DEPLOY_TIMEOUT_SECONDS = 240.0
+DEPLOY_SETTLE_POLLS = 3      # unchanged this many times running = settled
+DEPLOY_TIMEOUT_SECONDS = 600.0
 
 
-async def _stack_fingerprint(client: PortainerClient, stack: dict) -> frozenset | None:
-    """Which containers the stack is running. A compose recreate replaces them,
-    so a change here is the deploy actually landing. None when the listing
-    itself failed — which says nothing about the stack, and must not be read
-    as "every container vanished" and then "redeployed"."""
+async def _stack_containers_now(client: PortainerClient, stack: dict) -> list[dict] | None:
+    """The stack's containers, or None when the listing itself failed — which
+    says nothing about the stack and must not be read as "all gone"."""
     try:
-        own = stack_containers(
-            stack, await client.list_containers(stack["EndpointId"])
-        )
+        return stack_containers(stack, await client.list_containers(stack["EndpointId"]))
     except Exception:
         return None
-    return frozenset(
-        (c.get("Id"), c.get("State"), c.get("Status")) for c in own
-    )
 
 
-async def _await_deploy(client: PortainerClient, stack: dict, before: frozenset) -> str:
-    """Block until the deploy settles. Returns a description of the outcome."""
+def _fingerprint(containers: list[dict]) -> frozenset:
+    """Identity and state only. Docker's human-readable Status ("Up 5
+    seconds") changes on every poll for a minute, which once made every
+    deploy look like it took exactly that long to settle."""
+    return frozenset((c.get("Id"), c.get("State"), c.get("ImageID")) for c in containers)
+
+
+_EXIT_CODE_RE = re.compile(r"Exited \((\d+)\)")
+
+
+def _container_working(c: dict) -> bool:
+    """Running and not failing its healthcheck — or finished cleanly, which
+    is what a one-shot service (a backup job, a migration) is meant to do."""
+    state = (c.get("State") or "").lower()
+    status = c.get("Status") or ""
+    if state == "running":
+        return "(unhealthy)" not in status
+    if state == "exited":
+        match = _EXIT_CODE_RE.search(status)
+        return bool(match) and match.group(1) == "0"
+    return False
+
+
+async def _await_deploy(client: PortainerClient, stack: dict, before: frozenset) -> dict:
+    """Block until the deploy settles, then judge it. Returns
+    {"ok": bool, "message": str}; ok means the stack's containers were
+    replaced and are all working — nothing less is called a success."""
     deadline = time.monotonic() + DEPLOY_TIMEOUT_SECONDS
-    changed_at: float | None = None
+    changed = False
     last = before
+    last_containers: list[dict] = []
     stable = 0
     while time.monotonic() < deadline:
         await asyncio.sleep(DEPLOY_POLL_SECONDS)
-        current = await _stack_fingerprint(client, stack)
-        if current is None:
+        containers = await _stack_containers_now(client, stack)
+        if containers is None:
             continue
+        current = _fingerprint(containers)
         if current != last:
-            changed_at = time.monotonic()
-            last = current
-            stable = 0
+            changed, last, last_containers, stable = True, current, containers, 0
             continue
-        if changed_at is not None:
+        last_containers = containers
+        if changed:
             stable += 1
             if stable >= DEPLOY_SETTLE_POLLS:
-                recreated = len({c[0] for c in last} - {c[0] for c in before})
-                if recreated:
-                    return f"Redeployed {recreated} container{'' if recreated == 1 else 's'}."
-                return "Redeployed."
-    if changed_at is None:
-        return ("Portainer accepted the redeploy and nothing changed — the images "
-                "were already current, so no container was recreated.")
-    return ("Still deploying after "
-            f"{int(DEPLOY_TIMEOUT_SECONDS)}s — Portainer is finishing in the background.")
+                break
+    else:
+        if not changed:
+            return {"ok": False, "message": (
+                f"Portainer accepted the redeploy, but nothing about the stack's containers "
+                f"changed in {int(DEPLOY_TIMEOUT_SECONDS)}s — not confirmed.")}
+        return {"ok": False, "message": (
+            f"Still changing after {int(DEPLOY_TIMEOUT_SECONDS)}s — the deploy may finish in "
+            "the background, but it is not confirmed. Check the stack in Portainer.")}
+
+    if not last_containers:
+        return {"ok": False, "message": "The deploy settled with no containers in the stack."}
+    broken = [container_name(c) for c in last_containers if not _container_working(c)]
+    if broken:
+        return {"ok": False, "message": (
+            f"Redeployed, but not working: {', '.join(sorted(broken))} "
+            f"({'is' if len(broken) == 1 else 'are'} stopped, restarting, or unhealthy).")}
+    recreated = len({c[0] for c in last} - {c[0] for c in before})
+    return {"ok": True, "message": f"Redeployed {recreated} container{'' if recreated == 1 else 's'}, all running."}
 
 
 # A redeploy can run for minutes. Answer inline when it finishes quickly, and
@@ -762,7 +801,8 @@ async def get_job(request: Request, job_id: str):
 async def _update_one(client: PortainerClient, stack: dict) -> dict:
     name = stack.get("Name", f"stack {stack.get('Id')}")
     started = time.monotonic()
-    before = await _stack_fingerprint(client, stack) or frozenset()
+    containers = await _stack_containers_now(client, stack)
+    before = _fingerprint(containers or [])
     try:
         await client.update_stack(stack)
     except PortainerError as exc:
@@ -779,12 +819,12 @@ async def _update_one(client: PortainerClient, stack: dict) -> dict:
             "durationMs": int((time.monotonic() - started) * 1000),
             "message": str(exc),
         }
-    message = await _await_deploy(client, stack, before)
+    outcome = await _await_deploy(client, stack, before)
     return {
-        "ok": True,
+        "ok": outcome["ok"],
         "stack": name,
         "durationMs": int((time.monotonic() - started) * 1000),
-        "message": message,
+        "message": outcome["message"],
     }
 
 

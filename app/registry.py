@@ -80,25 +80,39 @@ def parse_image_ref(raw: str) -> ImageRef | None:
                     pinned_digest=pinned_digest)
 
 
-def _registrable(host: str) -> str:
-    """docker.io for auth.docker.io; an IP or single label as-is."""
-    host = host.lower()
+def _is_public_host(host: str) -> bool:
+    """A host on the public internet, as far as the name alone can tell.
+    Loopback, private and link-local addresses, bare names and local
+    suffixes are not somewhere a registry's token service lives."""
     try:
-        ipaddress.ip_address(host)
-        return host
+        return ipaddress.ip_address(host).is_global
     except ValueError:
         pass
-    labels = host.split(".")
-    return ".".join(labels[-2:]) if len(labels) >= 2 else host
-
-
-def _realm_trusted(realm: str, registry: str) -> bool:
-    """Only hand a registry's login to an HTTPS realm on that registry's own
-    domain. Docker Hub's realm is auth.docker.io; ghcr.io's is ghcr.io/token."""
-    parts = urlsplit(realm)
-    if parts.scheme != "https" or not parts.hostname:
+    if "." not in host:
         return False
-    return _registrable(parts.hostname) == _registrable(registry.split(":")[0])
+    return not host.endswith((".local", ".localhost", ".internal", ".lan", ".home", ".arpa"))
+
+
+def realm_policy(realm: str, registry: str, with_credentials: bool) -> tuple[bool, bool, str]:
+    """Decide what to do with the token realm a registry's challenge names.
+
+    Returns (fetch, send_credentials, reason). The realm is whatever the
+    registry said it was, so it gets no trust it has not earned: it must be
+    HTTPS, and either the registry's own host or a public one — never
+    something on this network. A configured login goes only to the
+    registry's own host, with Docker Hub's auth.docker.io the one exception.
+    """
+    parts = urlsplit(realm)
+    host = (parts.hostname or "").lower()
+    registry_host = registry.split(":")[0].lower()
+    if parts.scheme != "https" or not host:
+        return False, False, f"token realm {realm!r} is not an https URL"
+    if host != registry_host and not _is_public_host(host):
+        return False, False, f"token realm {realm!r} is not a public host"
+    own = {registry_host} | ({"auth.docker.io"} if registry_host == "docker.io" else set())
+    if with_credentials and host not in own:
+        return True, False, f"realm {host} is not {registry_host}; login withheld"
+    return True, with_credentials, ""
 
 
 class RegistryClient:
@@ -159,12 +173,11 @@ class RegistryClient:
             params["service"] = fields["service"]
         # With credentials the token comes back scoped to private repos too.
         auth = self._credentials.get(ref.registry)
-        if auth and not _realm_trusted(realm, ref.registry):
-            # The realm is whatever the registry's challenge says it is. A
-            # login belongs to that registry, not to any host it names.
-            logger.warning(
-                "Not sending %s credentials to token realm %s", ref.registry, realm
-            )
+        fetch, send, reason = realm_policy(realm, ref.registry, auth is not None)
+        if not fetch:
+            raise RegistryError(f"{ref.registry}: {reason}")
+        if auth is not None and not send:
+            logger.warning("%s: %s", ref.registry, reason)
             auth = None
         response = await self._client.get(realm, params=params, auth=auth)
         if response.status_code != 200:

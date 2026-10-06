@@ -447,6 +447,10 @@
         : `<span class="badge err" title="${esc(inst.error)}">● unreachable</span>`;
 
       let body;
+      const envErrors = Object.entries(inst.environmentErrors || {});
+      const envNote = envErrors.length
+        ? `<div class="stack-body unreachable-note">Could not read ${envErrors.length === 1 ? "an environment" : envErrors.length + " environments"} — what is shown for ${esc(envErrors.map(([n]) => n).join(", "))} is incomplete, not fine. ${esc(envErrors[0][1])}</div>`
+        : "";
       if (!inst.reachable) {
         body = `<div class="stack-body unreachable-note">${esc(inst.error)}</div>`;
       } else if (stacks.length === 0 && ctrs.length === 0) {
@@ -571,7 +575,7 @@
           ${inst.reachable ? `<button class="cleanup-btn" data-iid="${esc(String(iid))}" title="Remove unused images, networks, and optionally volumes">Clean up</button>` : ""}
           ${inst.reachable && (inst.stacks.length || ctrCount) ?
             `<button class="update-all-btn${instUpdCount ? " has-upd" : ""}" data-iid="${esc(String(iid))}">${instUpdCount ? "⬆ Update all" : "Update all"}</button>` : ""}
-        </div>${body}`;
+        </div>${envNote}${body}`;
 
       $(".instance-header", section).addEventListener("click", (e) => {
         if (e.target.closest("button")) return;
@@ -627,6 +631,7 @@
       if (res.status === 401) { showLogin(true); return; }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       data = await res.json();
+      loadUpdates();  // the cached result — cheap, and a scheduled check may have run
       const total = data.reduce((n, i) => n + i.stacks.length, 0);
       const down = data.filter((i) => !i.reachable).length;
       $("#status-stacks").textContent = data.length === 0
@@ -782,7 +787,7 @@
       if (ok) { btn.classList.remove("has-upd"); clearUpdateFlags(btn); }
       if (msg) {
         msg.textContent = ok
-          ? `${((body.durationMs || 0) / 1000).toFixed(1)}s`
+          ? `${((body.durationMs || 0) / 1000).toFixed(1)}s · ${body.message || "done"}`
           : (body.message || body.detail || `HTTP ${status}`);
         msg.className = "result-msg " + (ok ? "ok" : "err");
       }

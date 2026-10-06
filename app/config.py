@@ -14,6 +14,8 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, Field, field_validator
 
+SMTP_SECURITY = ("starttls", "ssl", "none")
+
 
 class InstanceConfig(BaseModel):
     name: str
@@ -132,7 +134,21 @@ class EmailConfig(BaseModel):
     sender: str = Field(default_factory=lambda: _env_str("RESTRUO_EMAIL_FROM"))
     recipients: list[str] = Field(default_factory=_recipients_default)
     # starttls (587, the usual), ssl (465), or none.
-    security: str = Field(default_factory=lambda: _env_str("RESTRUO_SMTP_SECURITY", "starttls"))
+    security: str = Field(
+        default_factory=lambda: _env_str("RESTRUO_SMTP_SECURITY", "starttls"),
+        validate_default=True,
+    )
+
+    @field_validator("security")
+    @classmethod
+    def known_security(cls, value: str) -> str:
+        """A typo here must not quietly mean plaintext. Only `none` does."""
+        normalized = (value or "starttls").strip().lower()
+        if normalized not in SMTP_SECURITY:
+            raise ValueError(
+                f"RESTRUO_SMTP_SECURITY must be one of {', '.join(SMTP_SECURITY)} — got {value!r}"
+            )
+        return normalized
 
     @property
     def password(self) -> str:

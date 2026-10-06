@@ -44,7 +44,25 @@ class PortainerError(Exception):
 
 
 def extract_images(stack_file_content: str) -> list[str]:
+    """Every service's image, in file order, each once.
+
+    Parsed as YAML — compose files are YAML, and a line-based regex misses
+    flow syntax (`services: {web: {image: nginx}}`) and matches `image:` in
+    places that are not services. The regex remains as a fallback for a file
+    that does not parse, so a broken file still yields what can be read.
+    """
     seen: dict[str, None] = {}
+    try:
+        doc = yaml.safe_load(stack_file_content or "")
+    except yaml.YAMLError:
+        doc = None
+    services = doc.get("services") if isinstance(doc, dict) else None
+    if isinstance(services, dict):
+        for service in services.values():
+            image = service.get("image") if isinstance(service, dict) else None
+            if isinstance(image, str) and image.strip():
+                seen.setdefault(image.strip())
+        return list(seen)
     for match in _IMAGE_RE.findall(stack_file_content or ""):
         seen.setdefault(match)
     return list(seen)
@@ -52,7 +70,7 @@ def extract_images(stack_file_content: str) -> list[str]:
 
 # ${VAR}, ${VAR:-default}, ${VAR-default}, ${VAR:?msg}, ${VAR?msg}, $VAR
 _INTERPOLATE_RE = re.compile(
-    r"\$\{([A-Za-z_]\w*)(?::?[-?]([^}]*))?\}|\$([A-Za-z_]\w*)"
+    r"\$\{([A-Za-z_]\w*)(?:(:-|-|:\?|\?)([^}]*))?\}|\$([A-Za-z_]\w*)"
 )
 
 
@@ -70,20 +88,32 @@ def interpolate(value: str, env: dict[str, str]) -> str | None:
     """Resolve compose-style variables in an image reference.
 
     Stack files routinely read `${IMAGE_PREFIX}-backend:${IMAGE_TAG:-latest}`;
-    the raw file alone says nothing about what is actually running. Returns None
-    if a variable has neither a value nor a default — substituting empty text
+    the raw file alone says nothing about what is actually running. Follows
+    compose: `:-` falls back when unset or empty, `-` only when unset, and
+    `:?` / `?` are errors when unset (or empty) — not defaults. Returns None
+    when a variable cannot be resolved, because substituting empty text
     would silently produce a nonsense reference like ":latest".
     """
     unresolved = False
 
     def replace(match: re.Match) -> str:
         nonlocal unresolved
-        name = match.group(1) or match.group(3)
-        default = match.group(2)
-        if env.get(name):
-            return env[name]
-        if default is not None:
-            return default
+        name = match.group(1) or match.group(4)
+        op, arg = match.group(2), match.group(3)
+        present = name in env
+        current = env.get(name, "")
+        if op == ":-":
+            return current if current else arg
+        if op == "-":
+            return current if present else arg
+        if op in (":?", "?"):
+            ok = bool(current) if op == ":?" else present
+            if ok:
+                return current
+            unresolved = True
+            return ""
+        if current:
+            return current
         unresolved = True
         return ""
 
@@ -101,8 +131,10 @@ def stack_images(stack: dict, file_content: str, containers: list[dict]) -> list
     env = stack_env(stack)
     declared = extract_images(file_content)
     images = [interpolate(image, env) for image in declared]
-    if all(image is not None for image in images):
+    if images and all(image is not None for image in images):
         return images
+    # Nothing declared (no file, or a file that could not be read) or
+    # something unresolved: what the containers run is the ground truth.
 
     resolved = [image for image in images if image is not None]
     for container in containers:
@@ -649,11 +681,24 @@ async def resolve_image_name(
     client: PortainerClient, endpoint_id: int, container: dict
 ) -> str:
     """Containers whose image tag was re-pulled elsewhere report a bare sha256
-    digest as their image. Resolve it back to a repository name via the image
-    metadata so display, update checks, and guards keep working."""
+    digest as their image. Resolve it back to the reference the container was
+    created from, so display, update checks, and guards keep working.
+
+    The container's Config.Image is asked first: it is the operator's own
+    choice of tag, and the one thing that decides whether the image floats.
+    The old image's RepoTags/RepoDigests are a fallback — a digest reference
+    from there would read as pinned when the operator chose `latest`.
+    """
     image = container.get("Image") or ""
     if not image.startswith("sha256:"):
         return image
+    try:
+        info = await client.get_container_info(endpoint_id, container.get("Id") or "")
+        created_from = ((info.get("Config") or {}).get("Image") or "").strip()
+        if created_from and not created_from.startswith("sha256:"):
+            return created_from
+    except Exception:
+        pass
     try:
         info = await client.get_image_info(endpoint_id, container.get("ImageID") or image)
         tags = info.get("RepoTags") or []
@@ -662,21 +707,20 @@ async def resolve_image_name(
             return (tags or digests)[0]
     except Exception:
         pass
-    # Neither: the tag AND the digest reference have both been re-pulled onto a
-    # newer image, leaving this one anonymous. The container still remembers
-    # what it was created from, which is the only name left that means anything.
-    try:
-        info = await client.get_container_info(endpoint_id, container.get("Id") or "")
-        created_from = ((info.get("Config") or {}).get("Image") or "").strip()
-        if created_from and not created_from.startswith("sha256:"):
-            return created_from
-    except Exception:
-        pass
     return image
 
 
+def stack_names_by_endpoint(stacks: list[dict]) -> dict[int, set[str]]:
+    """Which Portainer stack names live on which environment. A compose
+    project named like a stack on *another* environment is not that stack."""
+    out: dict[int, set[str]] = {}
+    for stack in stacks:
+        out.setdefault(stack.get("EndpointId"), set()).add(stack.get("Name"))
+    return out
+
+
 def standalone_containers(containers: list[dict], stack_names: set[str]) -> list[dict]:
-    """Containers that don't belong to any Portainer stack on this instance."""
+    """Containers that don't belong to any Portainer stack on this environment."""
     out = []
     for container in containers:
         labels = container.get("Labels") or {}
