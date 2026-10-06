@@ -698,14 +698,29 @@ def parse_helper_result(logs: str, exit_code: int | None) -> dict:
     return {"ok": False, "message": f"The helper exited with status {exit_code}: {tail}"}
 
 
+async def _remove_helper(client: PortainerClient, endpoint_id: int, helper_id: str) -> None:
+    """Remove a helper we started — and only that: the id is checked for the
+    label the helper is created with before anything is deleted."""
+    try:
+        info = await client.get_container_info(endpoint_id, helper_id)
+        labels = ((info.get("Config") or {}).get("Labels") or {})
+        if labels.get("restruo.helper") != "1":
+            logger.warning("Not removing %s: it does not carry the helper label", helper_id[:12])
+            return
+        await client.remove_container(endpoint_id, helper_id, force=True)
+    except Exception as exc:
+        logger.warning("Could not remove helper %s: %s", helper_id[:12], describe(exc))
+
+
 async def _replace_with_helper(
     client: PortainerClient, endpoint_id: int, cid: str, name: str
 ) -> dict:
     image = helper_image()
-    helper_name = f"restruo-helper-{cid[:12]}"
+    # A name of our own, unique per run: nothing is ever removed on the
+    # strength of a predictable name, and two runs cannot collide.
+    helper_name = f"restruo-helper-{cid[:12]}-{secrets.token_hex(3)}"
     try:
         await client.pull_image(endpoint_id, image)
-        await client.remove_container(endpoint_id, helper_name, force=True)
         helper_id = await client.create_container(
             endpoint_id, helper_name, helper_spec(image, cid)
         )
@@ -730,10 +745,7 @@ async def _replace_with_helper(
         except Exception:
             logs = ""
         result = parse_helper_result(logs, state.get("ExitCode"))
-        try:
-            await client.remove_container(endpoint_id, helper_id, force=True)
-        except Exception:
-            pass
+        await _remove_helper(client, endpoint_id, helper_id)
         return result
     return {"ok": False,
             "message": f"Lost track of the update after {int(HELPER_TIMEOUT_SECONDS / 60)} "

@@ -19,6 +19,7 @@ Exit status is 0 on success (including "already current") and 1 otherwise.
 """
 
 import json
+import secrets
 import sys
 import time
 
@@ -29,8 +30,6 @@ OLD_SUFFIX = "-restruo-old"
 # Let the request that started this container finish its round trip before
 # the container carrying that request is stopped.
 STARTUP_GRACE_SECONDS = 3.0
-# How long the replacement must stay up before the old one is discarded.
-SETTLE_SECONDS = 8.0
 STOP_TIMEOUT_SECONDS = 20
 
 # Config fields a container inherits from its image. Where the old container
@@ -175,6 +174,44 @@ def endpoint_settings(network: dict, old_id: str) -> dict:
     return settings
 
 
+def _covered_destinations(host_config: dict) -> set[str]:
+    """Container paths that HostConfig already provides a mount for."""
+    covered: set[str] = set()
+    for bind in host_config.get("Binds") or []:
+        parts = bind.split(":")
+        # "src:dst[:opts]"; a bare "dst" is an anonymous volume asked for by -v
+        covered.add(parts[1] if len(parts) >= 2 else parts[0])
+    for mount in host_config.get("Mounts") or []:
+        if mount.get("Target"):
+            covered.add(mount["Target"])
+    return covered
+
+
+def mounts_to_carry(container: dict) -> list[dict]:
+    """Mounts the replacement must be given explicitly or it will lose them.
+
+    A volume that came from the image's VOLUME line, with no -v naming it,
+    appears nowhere in HostConfig — only in the live container's Mounts. A
+    replacement created from HostConfig alone gets a fresh empty volume in its
+    place, and for Portainer that is a blank install with no environments and
+    no users. Name every such volume so the new container reattaches to the
+    same data.
+    """
+    covered = _covered_destinations(container.get("HostConfig") or {})
+    out = []
+    for mount in container.get("Mounts") or []:
+        dest = mount.get("Destination")
+        if not dest or dest in covered:
+            continue
+        kind = mount.get("Type")
+        source = mount.get("Name") if kind == "volume" else mount.get("Source")
+        if not source or kind not in ("volume", "bind"):
+            continue
+        out.append({"Type": kind, "Source": source, "Target": dest,
+                    "ReadOnly": not mount.get("RW", True)})
+    return out
+
+
 def build_create_body(container: dict, old_image_config: dict) -> tuple[dict, dict]:
     """Returns (create body, networks to join after creation)."""
     old_id = container["Id"]
@@ -188,6 +225,9 @@ def build_create_body(container: dict, old_image_config: dict) -> tuple[dict, di
         config.pop("MacAddress", None)
 
     host_config = dict(container.get("HostConfig") or {})
+    carried = mounts_to_carry(container)
+    if carried:
+        host_config["Mounts"] = list(host_config.get("Mounts") or []) + carried
     body = {**config, "HostConfig": host_config}
 
     mode = host_config.get("NetworkMode") or "default"
@@ -209,15 +249,43 @@ def build_create_body(container: dict, old_image_config: dict) -> tuple[dict, di
     return body, extra
 
 
-def _is_up(docker: Docker, ref: str) -> bool:
-    state = docker.inspect_container(ref).get("State") or {}
-    return bool(state.get("Running")) and not state.get("Restarting")
+READY_POLL_SECONDS = 2.0
+READY_POLLS = 45            # 90 s for a healthcheck to pass
+READY_STABLE_POLLS = 4      # running (and healthy, if checked) this long in a row
+
+
+def wait_ready(docker: Docker, ref: str, sleep=time.sleep) -> None:
+    """Block until the container has proven itself, or raise.
+
+    Running is not the same as working. A process can stay up while its
+    healthcheck fails, or crash a few seconds in. So: it must be running,
+    not restarting, with its healthcheck — when it has one — reporting
+    healthy, and it must hold that for several polls in a row.
+    """
+    stable = 0
+    for _ in range(READY_POLLS):
+        sleep(READY_POLL_SECONDS)
+        state = docker.inspect_container(ref).get("State") or {}
+        if not state.get("Running") or state.get("Restarting"):
+            code = state.get("ExitCode")
+            raise HelperError(f"the new container stopped (exit code {code})")
+        health = (state.get("Health") or {}).get("Status")
+        if health == "unhealthy":
+            raise HelperError("the new container is running but reports unhealthy")
+        if health == "starting":
+            stable = 0
+            continue
+        stable += 1
+        if stable >= READY_STABLE_POLLS:
+            return
+    raise HelperError("the new container did not become healthy in time")
 
 
 def replace(docker: Docker, target: str, sleep=time.sleep) -> str:
     """Swap `target` for a container on the freshly pulled image. Returns a
-    description of what happened; raises HelperError if it could not be done,
-    in which case the original container is running again."""
+    description of what happened. Raises HelperError if it could not be done;
+    the message says whether the original is running again, and under what
+    name, because recovery itself can fail part-way."""
     container = docker.inspect_container(target)
     old_id = container["Id"]
     name = container["Name"].lstrip("/")
@@ -237,30 +305,60 @@ def replace(docker: Docker, target: str, sleep=time.sleep) -> str:
         return f"{name} is already running the current {image}."
 
     body, extra_networks = build_create_body(container, old_image_config)
-    parked = f"{name}{OLD_SUFFIX}"
-    docker.remove(parked, force=True)  # left over from an interrupted run
+    # A name of our own for the set-aside original: unique, so nothing that
+    # happens to carry the obvious name is ever deleted on the strength of it.
+    parked = f"{name}{OLD_SUFFIX}-{secrets.token_hex(3)}"
 
-    docker.stop(old_id)
-    docker.rename(old_id, parked)
-    new_id = None
+    done = {"stopped": False, "parked": False, "created": None}
     try:
-        new_id = docker.create(name, body)
+        docker.stop(old_id)
+        done["stopped"] = True
+        docker.rename(old_id, parked)
+        done["parked"] = True
+        done["created"] = docker.create(name, body)
         for network, settings in extra_networks.items():
-            docker.connect(network, new_id, settings)
-        docker.start(new_id)
-        sleep(SETTLE_SECONDS)
-        if not _is_up(docker, new_id):
-            raise HelperError("the new container did not stay up")
+            docker.connect(network, done["created"], settings)
+        docker.start(done["created"])
+        wait_ready(docker, done["created"], sleep)
     except Exception as exc:
-        # Put things back exactly as they were.
-        if new_id is not None:
-            docker.remove(new_id, force=True)
-        docker.rename(old_id, name)
-        docker.start(old_id)
-        raise HelperError(f"{exc} — rolled back, {name} is running its previous image") from exc
+        raise HelperError(_recover(docker, exc, name, old_id, parked, done)) from exc
 
     docker.remove(old_id)
     return f"Updated {name} to {new_image_id.removeprefix('sha256:')[:12]}."
+
+
+def _recover(docker: Docker, cause: Exception, name: str, old_id: str, parked: str,
+             done: dict) -> str:
+    """Undo every step that was taken, attempting each even if another fails,
+    and say exactly what state things were left in."""
+    problems = []
+    if done["created"] is not None:
+        try:
+            docker.remove(done["created"], force=True)
+        except Exception as exc:
+            problems.append(f"could not remove the new container: {exc}")
+    restored_name = not done["parked"]
+    if done["parked"]:
+        try:
+            docker.rename(old_id, name)
+            restored_name = True
+        except Exception as exc:
+            problems.append(f"could not restore the name: {exc}")
+    running = False
+    if done["stopped"]:
+        try:
+            docker.start(old_id)
+            running = True
+        except Exception as exc:
+            problems.append(f"could not restart the original: {exc}")
+    else:
+        running = True
+    where = name if restored_name else parked
+    if not problems:
+        return f"{cause} — rolled back, {name} is running its previous image"
+    state = "running" if running else "STOPPED"
+    return (f"{cause} — rollback incomplete: {'; '.join(problems)}. "
+            f"The original container is {state} under the name {where!r} on that host.")
 
 
 def main(argv: list[str]) -> int:

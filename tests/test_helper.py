@@ -54,16 +54,33 @@ class Engine:
     """A Docker Engine with just enough behaviour to rehearse a replacement."""
 
     def __init__(self, *, pull_error=None, new_stays_up=True, create_fails=False,
-                 tag_points_to=NEW_IMG):
+                 tag_points_to=NEW_IMG, health=None, rename_fails=False,
+                 remove_new_fails=False, extra_containers=None, old=None):
         self.pull_error, self.new_stays_up = pull_error, new_stays_up
         self.create_fails, self.tag_points_to = create_fails, tag_points_to
+        # health: a list of statuses the new container reports, one per poll;
+        # the last one repeats. None = no healthcheck.
+        self.health, self.polls = health, 0
+        self.rename_fails, self.remove_new_fails = rename_fails, remove_new_fails
         self.log: list[str] = []
         self.created: dict | None = None
+        self.old = old or agent_container()
         self.names = {OLD_ID: "portainer_agent"}
         self.running = {OLD_ID: True}
+        for cid, cname in (extra_containers or {}).items():
+            self.names[cid] = cname
+            self.running[cid] = True
 
     def transport(self):
         return httpx.MockTransport(self.handle)
+
+    def _new_state(self):
+        state = {"Running": self.running["NEWID"], "Restarting": False, "ExitCode": 0 if self.running["NEWID"] else 1}
+        if self.health is not None and self.running["NEWID"]:
+            status = self.health[min(self.polls, len(self.health) - 1)]
+            self.polls += 1
+            state["Health"] = {"Status": status}
+        return state
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         path, method = request.url.path, request.method
@@ -81,6 +98,8 @@ class Engine:
             self.log.append("create")
             if self.create_fails:
                 return httpx.Response(409, json={"message": "port is already allocated"})
+            if request.url.params["name"] in self.names.values():
+                return httpx.Response(409, json={"message": "name already in use"})
             self.created = json.loads(request.content)
             self.names["NEWID"] = request.url.params["name"]
             self.running["NEWID"] = False
@@ -91,6 +110,8 @@ class Engine:
             if method == "DELETE":
                 if ref is None:
                     return httpx.Response(404, json={"message": "no such container"})
+                if ref == "NEWID" and self.remove_new_fails:
+                    return httpx.Response(500, json={"message": "device or resource busy"})
                 self.log.append(f"remove:{self.names[ref]}")
                 del self.names[ref], self.running[ref]
                 return httpx.Response(204)
@@ -98,7 +119,9 @@ class Engine:
                 return httpx.Response(404, json={"message": "no such container"})
             if action == "json":
                 if ref == OLD_ID:
-                    return httpx.Response(200, json=agent_container())
+                    return httpx.Response(200, json=self.old)
+                if ref == "NEWID":
+                    return httpx.Response(200, json={"State": self._new_state()})
                 return httpx.Response(200, json={"State": {"Running": self.running[ref]}})
             if action == "stop":
                 self.log.append(f"stop:{self.names[ref]}"); self.running[ref] = False
@@ -108,6 +131,10 @@ class Engine:
                 self.running[ref] = self.new_stays_up if ref == "NEWID" else True
                 return httpx.Response(204)
             if action == "rename":
+                if self.rename_fails and ref == OLD_ID and "restruo-old" in request.url.params["name"]:
+                    return httpx.Response(500, json={"message": "rename failed"})
+                if request.url.params["name"] in self.names.values():
+                    return httpx.Response(409, json={"message": "name already in use"})
                 self.names[ref] = request.url.params["name"]
                 self.log.append(f"rename:{self.names[ref]}")
                 return httpx.Response(204)
@@ -238,3 +265,92 @@ async def test_start_sends_an_empty_json_body():
         transport=httpx.MockTransport(handler))
     await client.set_container_state(6, "abc", running=True)
     assert seen["body"] == b"{}"
+
+
+# --- audit A01: anonymous volumes travel with the container ------------------
+
+def test_anonymous_volume_is_reattached_not_recreated():
+    """`docker run portainer/portainer-ce` with no -v gives /data an anonymous
+    volume that appears only in the live container's Mounts. The replacement
+    must be told its name, or it starts with an empty one — a blank Portainer."""
+    c = agent_container()
+    c["Config"]["Volumes"] = {"/data": {}}
+    c["HostConfig"]["Binds"] = ["/var/run/docker.sock:/var/run/docker.sock"]
+    c["Mounts"] = [
+        {"Type": "volume", "Name": "9f3c2e…existing-data", "Destination": "/data", "RW": True},
+        {"Type": "bind", "Source": "/var/run/docker.sock", "Destination": "/var/run/docker.sock", "RW": True},
+    ]
+    body, _ = build_create_body(c, {**IMAGE_CONFIG, "Volumes": {"/data": {}}})
+    mounts = body["HostConfig"]["Mounts"]
+    assert mounts == [{"Type": "volume", "Source": "9f3c2e…existing-data", "Target": "/data", "ReadOnly": False}]
+    assert body["HostConfig"]["Binds"] == ["/var/run/docker.sock:/var/run/docker.sock"], "bind untouched"
+
+
+def test_mounts_already_in_hostconfig_are_not_duplicated():
+    c = agent_container()
+    c["HostConfig"]["Mounts"] = [{"Type": "volume", "Source": "named", "Target": "/data"}]
+    c["Mounts"] = [{"Type": "volume", "Name": "named", "Destination": "/data", "RW": True},
+                   {"Type": "bind", "Source": "/", "Destination": "/host", "RW": True}]
+    body, _ = build_create_body(c, IMAGE_CONFIG)
+    assert body["HostConfig"]["Mounts"] == [{"Type": "volume", "Source": "named", "Target": "/data"}]
+
+
+# --- audit A02: recovery attempts every step and says what it managed --------
+
+def test_rename_failure_still_restarts_the_original():
+    engine = Engine(rename_fails=True)
+    with pytest.raises(HelperError, match="rolled back"):
+        run(engine)
+    assert engine.running[OLD_ID] is True
+    assert engine.names[OLD_ID] == "portainer_agent"
+
+
+def test_incomplete_recovery_is_reported_honestly():
+    """The new container will not die; the old one must still be restarted,
+    and the message must say which name it is under."""
+    engine = Engine(new_stays_up=False, remove_new_fails=True)
+    with pytest.raises(HelperError) as caught:
+        run(engine)
+    message = str(caught.value)
+    assert "rollback incomplete" in message
+    assert engine.running[OLD_ID] is True, "restart was still attempted"
+    assert "restruo-old" in message, "names the parked container"
+    assert "running" in message
+
+
+# --- audit A03: nothing is deleted on the strength of a name -----------------
+
+def test_an_unrelated_container_with_the_obvious_name_survives():
+    engine = Engine(extra_containers={"BYSTANDER": "portainer_agent-restruo-old"})
+    run(engine)
+    assert "BYSTANDER" in engine.names, "never removed"
+    assert engine.running["BYSTANDER"] is True
+
+
+def test_parked_name_is_unique_per_run():
+    first, second = Engine(), Engine()
+    run(first); run(second)
+    parked = lambda e: next(x for x in e.log if x.startswith("rename:"))
+    assert parked(first) != parked(second)
+
+
+# --- audit A04: running is not the same as working ---------------------------
+
+def test_unhealthy_replacement_is_rolled_back():
+    engine = Engine(health=["starting", "starting", "unhealthy"])
+    with pytest.raises(HelperError, match="unhealthy"):
+        run(engine)
+    assert engine.names == {OLD_ID: "portainer_agent"} and engine.running[OLD_ID]
+
+
+def test_healthcheck_is_waited_for_then_trusted():
+    engine = Engine(health=["starting", "starting", "starting", "healthy"])
+    assert "Updated" in run(engine)
+    assert engine.names == {"NEWID": "portainer_agent"}
+
+
+def test_a_container_that_never_becomes_healthy_is_rolled_back():
+    engine = Engine(health=["starting"])
+    with pytest.raises(HelperError, match="did not become healthy"):
+        run(engine)
+    assert engine.running[OLD_ID] is True

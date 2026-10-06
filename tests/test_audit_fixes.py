@@ -74,7 +74,8 @@ class AgentHost:
         pass
 
     async def get_container_info(self, endpoint_id, cid):
-        return {"State": {"Running": False, "Status": "exited", "ExitCode": 0}}
+        return {"State": {"Running": False, "Status": "exited", "ExitCode": 0},
+                "Config": {"Labels": {"restruo.helper": "1"}}}
 
     async def container_logs(self, endpoint_id, cid):
         return 'noise\n{"ok": true, "message": "Updated portainer_agent to 38bc1dc7b847."}\n'
