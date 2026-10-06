@@ -495,3 +495,111 @@ def test_container_actions_require_an_environment(client):
     for action in ("start", "stop", "update"):
         r = client.post(f"/api/instances/7/containers/{'a' * 12}/{action}", auth=BASIC)
         assert r.status_code == 422, action
+
+
+# --- A26: an empty variable is an unset one ----------------------------------
+
+def test_empty_environment_values_mean_defaults(monkeypatch):
+    from app.config import AppConfig, MOVING_TAGS
+    for name in ("RESTRUO_USERNAME", "RESTRUO_TITLE", "RESTRUO_FLOATING_TAGS",
+                 "RESTRUO_REFRESH_SECONDS", "RESTRUO_SMTP_PORT", "RESTRUO_SMTP_SECURITY"):
+        monkeypatch.setenv(name, "")
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "pw")
+    cfg = AppConfig()
+    assert cfg.ui.auth.username == "admin" and cfg.ui.title == "Restruo"
+    assert cfg.updates.floating_tags == MOVING_TAGS.split(",")
+    assert cfg.ui.refresh_seconds == 180 and cfg.email.port == 587 and cfg.email.security == "starttls"
+
+
+def test_compose_passes_every_documented_setting_through():
+    import re
+    compose = open("docker-compose.yml").read()
+    env = open(".env.example").read()
+    documented = set(re.findall(r"^#?\s*(RESTRUO_[A-Z_]+|DASHBOARD_PASSWORD)=", env, re.M))
+    passed = set(re.findall(r"^\s+(RESTRUO_[A-Z_]+|DASHBOARD_PASSWORD):", compose, re.M))
+    missing = documented - passed - {"RESTRUO_PORT"}  # RESTRUO_PORT is a host-side port mapping
+    assert not missing, f".env.example documents settings the compose file never passes in: {sorted(missing)}"
+
+
+# --- A27: a 422 never quotes the input ---------------------------------------
+
+def test_validation_errors_never_echo_the_request(client):
+    r = client.post("/api/login", json={"password": "SYNTHETIC_SECRET_XYZ"})
+    assert r.status_code == 422 and "SYNTHETIC_SECRET_XYZ" not in r.text
+    assert r.json()["detail"][0]["loc"] == ["body", "username"]
+    r = client.post("/api/instances", auth=BASIC, json={"name": "x", "baseUrl": 5, "apiKey": "ptr_LEAK"})
+    assert r.status_code == 422 and "ptr_LEAK" not in r.text
+
+
+# --- A28: the token grammar is exact -----------------------------------------
+
+@pytest.mark.parametrize("cookie", [
+    "١٢٣٤٥٦٧٨٩٠.aaaaaaaaaaaaaaaa." + "0" * 64,  # non-ASCII digits
+    "1" * 10 + "." + "g" * 16 + "." + "0" * 64,         # not hex
+    "1" * 10 + "." + "a" * 16 + "." + "é" * 64,    # non-ASCII signature
+    "9" * 13 + ".aaaaaaaaaaaaaaaa." + "0" * 64,          # too long an expiry
+])
+def test_malformed_cookies_are_unauthenticated_not_errors(tmp_path, cookie):
+    from app.auth import SessionManager
+    assert SessionManager(tmp_path / "s", "pw").verify(cookie) is False
+
+
+# --- A29: the session secret is private from the first byte -----------------
+
+def test_session_secret_created_private(tmp_path):
+    import os, stat
+    from app.auth import SessionManager
+    os.umask(0o022)
+    SessionManager(tmp_path / "secret", "pw")
+    assert stat.S_IMODE((tmp_path / "secret").stat().st_mode) == 0o600
+
+
+# --- A30: a check already running is shared, not repeated -------------------
+
+@pytest.mark.asyncio
+async def test_concurrent_manual_checks_share_one_scan():
+    import asyncio
+    from app.updates import UpdateChecker
+    scans = []
+
+    class Slow:
+        instance = type("I", (), {"name": "p"})()
+        async def list_stacks(self):
+            scans.append(1)
+            await asyncio.sleep(0.05)
+            return []
+        async def list_endpoints(self):
+            return []
+
+    checker = UpdateChecker(lambda: [(1, Slow())], registry=None, interval_hours=6)
+    await asyncio.gather(checker.check_all(notify=False), checker.check_all(notify=False),
+                         checker.check_all(notify=False))
+    assert len(scans) == 1
+
+
+def test_generated_api_docs_are_off(client):
+    for path in ("/docs", "/redoc", "/openapi.json"):
+        assert client.get(path).status_code == 404, path
+
+
+# --- observation 7: configuration is checked where it is set ---------------
+
+def test_bad_instance_urls_are_refused_on_save(client):
+    for url in ("portainer.lan:9443", "ftp://x", "https://", ""):
+        r = client.post("/api/instances", auth=BASIC, json={"name": "x", "baseUrl": url, "apiKey": "k"})
+        assert r.status_code == 422, url
+
+
+def test_registry_auth_without_a_colon_is_refused():
+    from app.config import UpdatesConfig
+    with pytest.raises(ValueError, match="username:token"):
+        UpdatesConfig(registry_auth={"ghcr.io": "justatoken"})
+
+
+@pytest.mark.asyncio
+async def test_switching_auth_mode_retires_the_other_credential(tmp_path):
+    store = InstanceStore(tmp_path / "i.json")
+    rec = await store.add({"name": "n", "base_url": "https://h", "auth_type": "api_key", "api_key": "ptr_OLD"})
+    updated = await store.update(rec.id, {"name": "n", "base_url": "https://h", "auth_type": "credentials",
+                                          "username": "u", "password": "p"})
+    assert updated.api_key is None and updated.password == "p"

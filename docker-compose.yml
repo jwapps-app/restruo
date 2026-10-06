@@ -11,12 +11,24 @@ services:
       - restruo-data:/data
       # Optional: mount a config file to override defaults (see config.example.yaml)
       # - ./config.yaml:/config/config.yaml:ro
+    # Every supported setting is passed through. Set them in a .env file next
+    # to this one (see .env.example) or in the shell; an unset or empty one
+    # leaves Restruo at its default.
     environment:
-      - DASHBOARD_PASSWORD=${DASHBOARD_PASSWORD:?set DASHBOARD_PASSWORD in the stack environment}
-      # - RESTRUO_USERNAME=admin
-      # - RESTRUO_TITLE=Restruo
-      # - RESTRUO_FLOATING_TAGS=latest,release
-      # - RESTRUO_REFRESH_SECONDS=180
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:?set DASHBOARD_PASSWORD in .env or the stack environment}
+      RESTRUO_USERNAME: ${RESTRUO_USERNAME:-}
+      RESTRUO_TITLE: ${RESTRUO_TITLE:-}
+      RESTRUO_FLOATING_TAGS: ${RESTRUO_FLOATING_TAGS:-}
+      RESTRUO_REFRESH_SECONDS: ${RESTRUO_REFRESH_SECONDS:-}
+      RESTRUO_SMTP_USER: ${RESTRUO_SMTP_USER:-}
+      RESTRUO_SMTP_PASSWORD: ${RESTRUO_SMTP_PASSWORD:-}
+      RESTRUO_SMTP_HOST: ${RESTRUO_SMTP_HOST:-}
+      RESTRUO_SMTP_PORT: ${RESTRUO_SMTP_PORT:-}
+      RESTRUO_SMTP_SECURITY: ${RESTRUO_SMTP_SECURITY:-}
+      RESTRUO_EMAIL_TO: ${RESTRUO_EMAIL_TO:-}
+      RESTRUO_EMAIL_FROM: ${RESTRUO_EMAIL_FROM:-}
+      RESTRUO_REGISTRY_AUTH: ${RESTRUO_REGISTRY_AUTH:-}
+      RESTRUO_HELPER_IMAGE: ${RESTRUO_HELPER_IMAGE:-}
     restart: unless-stopped
 
 volumes:

@@ -1,8 +1,9 @@
 """Async client for a single Portainer instance.
 
-Implements the calls from the spec (§3) with the compose-vs-git redeploy
-branching (§3.7). Field names in request bodies are PascalCase and
-case-sensitive per Portainer's API.
+A redeploy branches on how the stack was created: a git stack is told to
+pull and redeploy, a compose stack is re-sent its file with PullImage set.
+Field names in request bodies are PascalCase and case-sensitive per
+Portainer's API.
 
 Two auth modes: an API token sent as X-API-Key, or username/password exchanged
 at /api/auth for a session JWT that is refreshed automatically on expiry.
@@ -658,7 +659,7 @@ class PortainerClient:
         return response.json()
 
     async def update_stack(self, stack: dict) -> dict:
-        """Repull + redeploy one stack, branching on GitConfig per spec §3.7.
+        """Repull + redeploy one stack, branching on GitConfig.
 
         `stack` is the raw stack object from list_stacks — Env and EndpointId
         are re-sent from it so redeploys never wipe env vars or hit the wrong

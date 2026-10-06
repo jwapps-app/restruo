@@ -1,6 +1,5 @@
 """Email notifications, exercised against a real (in-process) SMTP server."""
 
-import asyncio
 import os
 import socket
 import threading

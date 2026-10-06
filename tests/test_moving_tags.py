@@ -6,11 +6,9 @@ under you exactly like `latest` — so they were silently never checked. Being
 quiet about something that moved is the worst way for an update checker to be
 wrong.
 """
-import os
-
 import pytest
 
-from app.config import MOVING_TAGS, AppConfig, load_config
+from app.config import MOVING_TAGS, AppConfig
 
 
 @pytest.mark.parametrize("tag", [

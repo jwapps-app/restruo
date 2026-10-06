@@ -205,8 +205,8 @@
       <img src="/icon.svg" width="56" height="56" alt="">
       <h2 id="login-title">Restruo</h2>
       <form id="login-form">
-        <input id="l-user" type="text" placeholder="Username" autocomplete="username" required>
-        <input id="l-pass" type="password" placeholder="Password" autocomplete="current-password" required>
+        <input id="l-user" type="text" placeholder="Username" aria-label="Username" autocomplete="username" required>
+        <input id="l-pass" type="password" placeholder="Password" aria-label="Password" autocomplete="current-password" required>
         <button class="primary" type="submit" id="l-submit">Sign in</button>
         <p id="login-msg"></p>
       </form>
@@ -265,7 +265,7 @@
 </main>
 
 <div id="modal-backdrop">
-  <div id="modal" role="dialog" aria-modal="true">
+  <div id="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" aria-describedby="modal-text">
     <h3 id="modal-title"></h3>
     <p id="modal-text"></p>
     <div id="modal-extra"></div>
@@ -398,14 +398,20 @@
       $("#modal-confirm").textContent = opts.okText || "Update";
       $("#modal-cancel").style.display = opts.okOnly ? "none" : "";
       const backdrop = $("#modal-backdrop");
+      const opener = document.activeElement;
       backdrop.classList.add("open");
+      const onKey = (e) => { if (e.key === "Escape") done(false); };
+      document.addEventListener("keydown", onKey);
+      setTimeout(() => (opts.okOnly ? $("#modal-confirm") : $("#modal-cancel")).focus(), 0);
       const done = (answer) => {
         const checks = {};
         $("#modal-extra").querySelectorAll("input[type=checkbox]")
           .forEach((cb) => { checks[cb.id] = cb.checked; });
         backdrop.classList.remove("open");
+        document.removeEventListener("keydown", onKey);
         $("#modal-extra").innerHTML = "";
         $("#modal-confirm").onclick = $("#modal-cancel").onclick = backdrop.onclick = null;
+        if (opener && opener.focus) opener.focus();
         resolve(opts.extraHtml ? { confirmed: answer, checks } : answer);
       };
       $("#modal-confirm").onclick = () => done(true);
@@ -563,9 +569,10 @@
           n + (s.status === "inactive" ? 1 : (s.downNames || []).length), 0) +
         (inst.containers || []).filter((c) => c.down).length;
       const ctrCount = (inst.containers || []).length;
+      const open = !!(filter || expanded.has(iid));
       section.innerHTML = `
-        <div class="instance-header">
-          <span class="caret">▼</span>
+        <div class="instance-header" role="button" tabindex="0" aria-expanded="${open}" aria-label="${esc(inst.instance.name)}: ${open ? "collapse" : "expand"}">
+          <span class="caret" aria-hidden="true">▼</span>
           <h2>${esc(inst.instance.name)}</h2>
           <span class="count">${inst.stacks.length} stack${inst.stacks.length === 1 ? "" : "s"}${ctrCount ? ` · ${ctrCount} container${ctrCount === 1 ? "" : "s"}` : ""}</span>
           ${instDownCount ? `<span class="badge err">● ${instDownCount} down</span>` : ""}
@@ -577,11 +584,18 @@
             `<button class="update-all-btn${instUpdCount ? " has-upd" : ""}" data-iid="${esc(String(iid))}">${instUpdCount ? "⬆ Update all" : "Update all"}</button>` : ""}
         </div>${envNote}${body}`;
 
-      $(".instance-header", section).addEventListener("click", (e) => {
+      const toggle = (e) => {
         if (e.target.closest("button")) return;
         const id = inst.instance.id;
         expanded.has(id) ? expanded.delete(id) : expanded.add(id);
         section.classList.toggle("collapsed");
+        const header = $(".instance-header", section);
+        header.setAttribute("aria-expanded", String(!section.classList.contains("collapsed")));
+      };
+      const headerEl = $(".instance-header", section);
+      headerEl.addEventListener("click", toggle);
+      headerEl.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(e); }
       });
       root.appendChild(section);
     }
@@ -814,9 +828,11 @@
   }
 
   async function waitForJob(jobId) {
-    // Ten minutes covers a slow image pull; past that, say so rather than
-    // guess. A brief network blip is not a failure — keep asking.
-    const deadline = Date.now() + 600 * 1000;
+    // The server keeps a job for an hour and a helper may run for fifteen
+    // minutes after a slow pull, so wait longer than any job can take; past
+    // that, say tracking was lost rather than call it failed. A brief network
+    // blip is not a failure — keep asking.
+    const deadline = Date.now() + 40 * 60 * 1000;
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 2000));
       try {
@@ -827,7 +843,7 @@
         if (job.done) return job.result || { ok: false, message: "No result recorded." };
       } catch (err) { /* transient — try again */ }
     }
-    return { ok: false, message: "Lost track of this update after ten minutes — check the stack in Portainer." };
+    return { ok: false, message: "Lost track of this update after forty minutes — it was not seen to fail; check the stack in Portainer." };
   }
 
   async function waitForBackend(seconds) {
@@ -1134,11 +1150,14 @@
       list.querySelectorAll(".inst-move").forEach((btn) =>
         btn.addEventListener("click", async () => {
           btn.disabled = true;
-          await fetch(`/api/instances/${btn.dataset.id}/move`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ direction: btn.dataset.dir }),
-          }).catch(() => {});
+          try {
+            const res = await fetch(`/api/instances/${btn.dataset.id}/move`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ direction: btn.dataset.dir }),
+            });
+            if (!res.ok) alert(`Could not reorder (HTTP ${res.status}).`);
+          } catch (err) { alert(`Could not reorder: ${err.message}`); }
           loadInstances();
         }));
       list.querySelectorAll(".inst-edit").forEach((btn) =>
@@ -1150,6 +1169,10 @@
             "Restruo will forget this Portainer instance and its credentials. Nothing on the machine itself is touched.");
           if (!yes) return;
           const res = await fetch(`/api/instances/${btn.dataset.id}`, { method: "DELETE" });
+          if (!res.ok) {
+            const body = await res.json().catch(() => ({}));
+            alert(`Could not remove it: ${body.detail || `HTTP ${res.status}`}`);
+          }
           if (res.ok && editingId === Number(btn.dataset.id)) fillForm(null);
           loadInstances();
         }));
@@ -1237,7 +1260,12 @@
     window.scrollTo({ top: 0, behavior: "smooth" });
   });
   $("#signout-btn").addEventListener("click", async () => {
-    try { await fetch("/api/logout", { method: "POST" }); } catch (err) { /* cookie may already be gone */ }
+    try {
+      const res = await fetch("/api/logout", { method: "POST" });
+      if (!res.ok && res.status !== 401) { alert(`Sign-out failed (HTTP ${res.status}) — the session may still be valid.`); return; }
+    } catch (err) { /* already unreachable: nothing to keep */ }
+    data = []; updates = { instances: [] };
+    $("#stacks").innerHTML = "";
     showLogin(true);
   });
 

@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, ConfigDict
@@ -97,11 +98,29 @@ async def lifespan(app: FastAPI):
     yield
     if checker_task:
         checker_task.cancel()
+        try:
+            await checker_task
+        except (asyncio.CancelledError, Exception):
+            pass
     await manager.aclose()
     await app.state.registry.aclose()
 
 
-app = FastAPI(title="Restruo", lifespan=lifespan)
+# No generated API docs: the API is documented in the README, and the
+# OpenAPI routes would be three more public pages describing every endpoint.
+app = FastAPI(title="Restruo", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_without_the_input(request: Request, exc: RequestValidationError):
+    """FastAPI's default 422 quotes the offending input back — which, for a
+    login or an instance form, is a password or an API key. Say what was
+    wrong with it, never what it was."""
+    errors = [
+        {"loc": e.get("loc"), "msg": e.get("msg"), "type": e.get("type")}
+        for e in exc.errors()
+    ]
+    return JSONResponse(status_code=422, content={"detail": errors})
 
 
 @app.middleware("http")
@@ -295,7 +314,7 @@ async def _probe_record(record: InstanceRecord) -> dict:
     except PortainerError as exc:
         return {"ok": False, "error": exc.message, "endpoints": 0}
     except Exception as exc:
-        return {"ok": False, "error": str(exc), "endpoints": 0}
+        return {"ok": False, "error": describe(exc), "endpoints": 0}
     finally:
         await client.aclose()
 
@@ -312,7 +331,7 @@ async def list_instances(request: Request):
             logger.warning("Instance %r unreachable: %s", record.name, exc.message)
             await client.reconnect()
         except Exception as exc:
-            entry.update(reachable=False, error=str(exc))
+            entry.update(reachable=False, error=describe(exc))
             logger.warning(
                 "Instance %r unreachable: %s: %s", record.name, type(exc).__name__, exc
             )
@@ -324,6 +343,12 @@ async def list_instances(request: Request):
     )
 
 
+def _audit(request: Request, what: str, *args) -> None:
+    """One line per change made through the API, with where it came from.
+    Failed logins were already logged; the things a login lets you do were not."""
+    logger.info("[%s] " + what, _client_addr(request), *args)
+
+
 @app.post("/api/instances", dependencies=[Depends(require_auth)])
 async def add_instance(request: Request, body: InstanceInput):
     store: InstanceStore = request.app.state.store
@@ -331,6 +356,7 @@ async def add_instance(request: Request, body: InstanceInput):
         record = await store.add(body.to_fields())
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+    _audit(request, "added instance %r (%s)", record.name, destination(record.base_url))
     await _manager(request).refresh()
     return record.public()
 
@@ -344,6 +370,7 @@ async def edit_instance(request: Request, iid: int, body: InstanceInput):
         raise HTTPException(status_code=422, detail=str(exc))
     if record is None:
         raise HTTPException(status_code=404, detail=f"No instance with id {iid}")
+    _audit(request, "edited instance %r (%s)", record.name, destination(record.base_url))
     await _manager(request).refresh()
     return record.public()
 
@@ -370,6 +397,7 @@ async def move_instance(request: Request, iid: int, body: MoveInput):
 async def delete_instance(request: Request, iid: int):
     if not await request.app.state.store.delete(iid):
         raise HTTPException(status_code=404, detail=f"No instance with id {iid}")
+    _audit(request, "deleted instance %d", iid)
     await _manager(request).refresh()
     return {"ok": True}
 
@@ -398,11 +426,14 @@ async def test_instance(request: Request, body: InstanceInput, id: int | None = 
     try:
         record = InstanceRecord.model_validate({**fields, "id": 0})
     except ValueError as exc:
-        return {"ok": False, "error": str(exc), "endpoints": 0}
+        return {"ok": False, "error": describe(exc), "endpoints": 0}
     return await _probe_record(record)
 
 
 # --- stacks -------------------------------------------------------------------
+
+
+DASHBOARD_CONCURRENCY = 6
 
 
 async def _stacks_for_instance(iid: int, name: str, client: PortainerClient) -> dict:
@@ -423,7 +454,7 @@ async def _stacks_for_instance(iid: int, name: str, client: PortainerClient) -> 
         await client.reconnect()
         return result
     except Exception as exc:
-        result.update(reachable=False, error=str(exc))
+        result.update(reachable=False, error=describe(exc))
         logger.warning(
             "Instance %r unreachable: %s: %s", name, type(exc).__name__, exc
         )
@@ -473,8 +504,16 @@ async def _stacks_for_instance(iid: int, name: str, client: PortainerClient) -> 
         stack_containers(stack, containers_by_endpoint.get(stack.get("EndpointId"), []))
         for stack in stacks
     ]
+    # Thirty stacks at once is thirty file fetches in the same instant at one
+    # Portainer; a few at a time is plenty for a page load.
+    gate = asyncio.Semaphore(DASHBOARD_CONCURRENCY)
+
+    async def images_gated(stack: dict, own: list[dict]) -> list[str]:
+        async with gate:
+            return await images_for(stack, own)
+
     image_lists = await asyncio.gather(
-        *(images_for(stack, own) for stack, own in zip(stacks, owned))
+        *(images_gated(stack, own) for stack, own in zip(stacks, owned))
     )
     for stack, images, own in zip(stacks, image_lists, owned):
         normalized = normalize_stack(stack, images)
@@ -497,7 +536,8 @@ async def _stacks_for_instance(iid: int, name: str, client: PortainerClient) -> 
 
     async def standalone_row(endpoint_id: int, c: dict) -> dict:
         normalized = normalize_container(c, endpoint_id)
-        normalized["image"] = await resolve_image_name(client, endpoint_id, c)
+        async with gate:
+            normalized["image"] = await resolve_image_name(client, endpoint_id, c)
         normalized["environment"] = environments.get(endpoint_id, "")
         return normalized
 
@@ -819,6 +859,7 @@ def describe(exc: Exception) -> str:
 
 @app.get("/api/jobs/{job_id}", dependencies=[Depends(require_auth)])
 async def get_job(request: Request, job_id: str):
+    _prune_jobs(request.app.state.jobs)
     job = request.app.state.jobs.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="No such job — it may have expired.")
@@ -844,7 +885,7 @@ async def _update_one(client: PortainerClient, stack: dict) -> dict:
             "ok": False,
             "stack": name,
             "durationMs": int((time.monotonic() - started) * 1000),
-            "message": str(exc),
+            "message": describe(exc),
         }
     outcome = await _await_deploy(client, stack, before)
     return {
@@ -916,6 +957,7 @@ async def _set_stack_state(request: Request, iid: int, sid: int, action: str):
         raise HTTPException(status_code=502, detail=f"Could not fetch stack: {exc.message}")
 
     name = stack.get("Name", f"stack {sid}")
+    _audit(request, "%s stack %r on instance %d", action, name, iid)
     if action == "stop":
         images = await _stack_image_names(client, stack, name, "stop")
         if any(is_self_critical_image(i) for i in images):
@@ -930,7 +972,7 @@ async def _set_stack_state(request: Request, iid: int, sid: int, action: str):
     except HTTPException:
         raise
     except Exception as exc:
-        message = exc.message if isinstance(exc, PortainerError) else str(exc)
+        message = describe(exc)
         return JSONResponse(status_code=502, content=_timed(started, name, message, ok=False))
     return _timed(started, name, "Started." if action == "start" else "Stopped.")
 
@@ -956,10 +998,11 @@ async def _set_container_state(
     except HTTPException:
         raise
     except Exception as exc:
-        message = exc.message if isinstance(exc, PortainerError) else str(exc)
+        message = describe(exc)
         raise HTTPException(status_code=502, detail=f"Could not find container: {message}")
 
     name = container_name(container)
+    _audit(request, "%s container %r on instance %d env %d", action, name, iid, endpoint_id)
     image = await resolve_image_name(client, endpoint_id, container)
     if action == "stop" and is_self_critical_image(image):
         raise HTTPException(
@@ -973,7 +1016,7 @@ async def _set_container_state(
     except HTTPException:
         raise
     except Exception as exc:
-        message = exc.message if isinstance(exc, PortainerError) else str(exc)
+        message = describe(exc)
         return JSONResponse(status_code=502, content=_timed(started, name, message, ok=False))
     return _timed(started, name, "Started." if action == "start" else "Stopped.")
 
@@ -1005,6 +1048,7 @@ async def update_stack(request: Request, iid: int, sid: int):
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Could not fetch stack: {exc}")
 
+    _audit(request, "update stack %r on instance %d", stack.get("Name", sid), iid)
     images = await _stack_image_names(client, stack, stack.get("Name", str(sid)), "redeploy")
     if any(cannot_recreate_image(i) for i in images):
         raise HTTPException(
@@ -1042,6 +1086,7 @@ async def update_container(
         raise HTTPException(status_code=502, detail=f"Could not find container: {describe(exc)}")
 
     name = container_name(container)
+    _audit(request, "update container %r (%s) on instance %d env %d", name, resolved_image, iid, endpoint_id)
 
     if cannot_recreate_image(resolved_image):
         # Portainer's own recreate stops the container that is carrying the
@@ -1089,6 +1134,8 @@ class PruneRequest(BaseModel):
 async def prune_instance(request: Request, iid: int, body: PruneRequest):
     """Remove unused Docker leftovers on every environment of one instance."""
     client = _get_client(request, iid)
+    _audit(request, "prune instance %d (images=%s all=%s networks=%s volumes=%s)",
+           iid, body.images, body.allImages, body.networks, body.volumes)
     summary = {
         "ok": True, "spaceReclaimed": 0,
         "images": 0, "networks": 0, "volumes": 0, "errors": [],
@@ -1096,11 +1143,11 @@ async def prune_instance(request: Request, iid: int, body: PruneRequest):
     try:
         endpoints = await client.list_endpoints()
     except Exception as exc:
-        message = exc.message if isinstance(exc, PortainerError) else str(exc)
+        message = describe(exc)
         raise HTTPException(status_code=502, detail=f"Could not list environments: {message}")
 
     def _msg(exc: Exception) -> str:
-        return exc.message if isinstance(exc, PortainerError) else str(exc)
+        return describe(exc)
 
     async with _exclusive(request, ("prune", iid)):
         await _prune_endpoints(client, endpoints, body, summary, _msg)

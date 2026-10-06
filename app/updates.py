@@ -1,8 +1,9 @@
 """Update checker: compares local image digests against registry digests.
 
-Only images tracking :latest (or untagged) are checked; pinned tags are
-reported as "pinned" and skipped. Runs on a schedule and on demand; results
-are cached in memory for the dashboard.
+Images on a channel tag (latest, lts, stable, … — see config.MOVING_TAGS, or
+RESTRUO_FLOATING_TAGS) are checked; a tag naming a version is reported as
+"pinned" and left alone. Runs on a schedule and on demand; results are
+cached in memory for the dashboard.
 """
 
 import asyncio
@@ -447,6 +448,12 @@ class UpdateChecker:
         saying the same thing is noise. It also leaves the record of what has
         been announced untouched, so the next scheduled check still reports
         anything that is new since the last mail."""
+        if self._lock.locked():
+            # A check is already running. Its result will be exactly as fresh
+            # as one started now, so wait for it instead of scanning every
+            # registry a second time.
+            async with self._lock:
+                return self.snapshot()
         async with self._lock:
             self.checking = True
             self._remote_tasks = {}

@@ -14,6 +14,8 @@ two logins never share a token.
 
 import hashlib
 import hmac
+import os
+import re
 import secrets
 import threading
 import time
@@ -24,6 +26,9 @@ SESSION_TTL_SECONDS = 30 * 86400
 # expiry(10 digits) . nonce(16 hex) . signature(64 hex) — anything longer is
 # not ours. Bounding it also keeps int() from choking on a pathological cookie.
 MAX_TOKEN_LENGTH = 128
+# Exactly what issue() produces. Anything else is not ours and is not parsed
+# — isdigit() accepts digits int() does not, and compare_digest wants ASCII.
+TOKEN_RE = re.compile(r"\A([0-9]{10,12})\.([0-9a-f]{16})\.([0-9a-f]{64})\Z")
 
 
 class SessionManager:
@@ -33,7 +38,10 @@ class SessionManager:
             secret = secret_path.read_bytes()
         else:
             secret = secrets.token_bytes(32)
-            secret_path.write_bytes(secret)
+            # Created private — never world-readable for the instant before a chmod.
+            fd = os.open(secret_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(secret)
         secret_path.chmod(0o600)
         self._key = hmac.new(secret, (password or "").encode(), hashlib.sha256).digest()
 
@@ -46,13 +54,13 @@ class SessionManager:
         return f"{payload}.{self._sign(payload)}"
 
     def verify(self, token: str) -> bool:
-        if not token or len(token) > MAX_TOKEN_LENGTH:
+        if not isinstance(token, str) or len(token) > MAX_TOKEN_LENGTH:
             return False
-        parts = token.split(".")
-        if len(parts) != 3:
+        match = TOKEN_RE.match(token)
+        if match is None:
             return False
-        expiry, nonce, signature = parts
-        if not expiry.isdigit() or len(expiry) > 12 or int(expiry) < time.time():
+        expiry, nonce, signature = match.groups()
+        if int(expiry) < time.time():
             return False
         return hmac.compare_digest(signature, self._sign(f"{expiry}.{nonce}"))
 
@@ -90,6 +98,11 @@ class LoginLimiter:
         with self._lock:
             now = time.time()
             self._failures[addr] = self._recent(addr, now) + [now]
+            if len(self._failures) > 512:
+                # Addresses are only expired when revisited; sweep the rest so
+                # a scan from many addresses cannot grow this without bound.
+                for addr_ in list(self._failures):
+                    self._recent(addr_, now)  # drops the address when nothing recent remains
 
     def reset(self, addr: str) -> None:
         with self._lock:

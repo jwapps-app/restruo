@@ -3,7 +3,9 @@ FROM python:3.14-slim
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# The installer itself is part of the supply chain: keep it current.
+RUN pip install --no-cache-dir --upgrade pip \
+ && pip install --no-cache-dir -r requirements.txt
 
 # The app never needs root: it talks to Portainer over HTTP and writes one
 # directory. Dropping privileges limits what a bug in it, or in a dependency,

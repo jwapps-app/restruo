@@ -377,8 +377,7 @@ def test_quick_update_answers_inline_and_slow_one_becomes_a_job(client, monkeypa
 
     class Slow:
         instance = type("I", (), {"name": "p"})()
-        gate = asyncio.Event()
-
+    
         async def get_stack(self, sid):
             return {"Id": sid, "Name": "s", "EndpointId": 1, "Env": []}
 

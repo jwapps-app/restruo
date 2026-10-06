@@ -22,9 +22,6 @@ def checker_with_one_update():
     capture = Capture()
     checker = UpdateChecker(lambda: [], registry=None, interval_hours=6, notifiers=[capture])
 
-    async def fake_instance_results():
-        return None
-
     # No instances to scan, so plant the finding a scan would have produced.
     original = checker._notify_new
 

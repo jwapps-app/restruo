@@ -17,6 +17,15 @@ from pydantic import BaseModel, Field, field_validator
 SMTP_SECURITY = ("starttls", "ssl", "none")
 
 
+def check_base_url(value: str) -> str:
+    """http(s)://host[:port] — anything else fails here, with a reason, rather
+    than when the first request to it is attempted."""
+    v = (value or "").strip().rstrip("/")
+    if not v.lower().startswith(("http://", "https://")) or "://" not in v or not v.split("://", 1)[1]:
+        raise ValueError(f"base_url must start with http:// or https:// — got {value!r}")
+    return v
+
+
 class InstanceConfig(BaseModel):
     name: str
     base_url: str
@@ -26,12 +35,12 @@ class InstanceConfig(BaseModel):
     @field_validator("base_url")
     @classmethod
     def strip_trailing_slash(cls, v: str) -> str:
-        return v.rstrip("/")
+        return check_base_url(v)
 
 
 class AuthConfig(BaseModel):
     enabled: bool = True
-    username: str = Field(default_factory=lambda: os.environ.get("RESTRUO_USERNAME", "admin"))
+    username: str = Field(default_factory=lambda: _env_str("RESTRUO_USERNAME") or "admin")
     password_env: str = "DASHBOARD_PASSWORD"
 
     @property
@@ -39,19 +48,23 @@ class AuthConfig(BaseModel):
         return os.environ.get(self.password_env)
 
 
+def _env_str(name: str, default: str = "") -> str:
+    return os.environ.get(name, default).strip()
+
+
 def _refresh_seconds_default() -> int:
     try:
-        return max(0, int(os.environ.get("RESTRUO_REFRESH_SECONDS", "180")))
+        return max(0, int(_env_str("RESTRUO_REFRESH_SECONDS") or "180"))
     except ValueError:
         return 180
 
 
 class UIConfig(BaseModel):
-    title: str = Field(default_factory=lambda: os.environ.get("RESTRUO_TITLE", "Restruo"))
+    title: str = Field(default_factory=lambda: _env_str("RESTRUO_TITLE") or "Restruo")
     auth: AuthConfig = Field(default_factory=AuthConfig)
     # Auto-refresh cadence for the open dashboard (stack/container state only,
     # never registry scans). 0 disables.
-    refresh_seconds: int = Field(default_factory=_refresh_seconds_default)
+    refresh_seconds: int = Field(default_factory=_refresh_seconds_default, ge=0)
 
 
 # Tags that name a channel rather than a version, so they move under you.
@@ -61,7 +74,9 @@ MOVING_TAGS = "latest,lts,stable,release,edge,main,master,nightly,rolling,dev"
 
 
 def _floating_tags_default() -> list[str]:
-    raw = os.environ.get("RESTRUO_FLOATING_TAGS", MOVING_TAGS)
+    # An empty variable is the same as an unset one: a compose file that
+    # passes every setting through as ${VAR:-} must not switch checks off.
+    raw = _env_str("RESTRUO_FLOATING_TAGS") or MOVING_TAGS
     return [tag.strip() for tag in raw.split(",") if tag.strip()]
 
 
@@ -86,9 +101,22 @@ class UpdatesConfig(BaseModel):
     # host -> "username:token"
     registry_auth: dict[str, str] = Field(default_factory=_registry_auth_default)
 
+    @field_validator("registry_auth")
+    @classmethod
+    def logins_have_a_user_and_a_secret(cls, value: dict[str, str]) -> dict[str, str]:
+        for host, creds in value.items():
+            if ":" not in (creds or ""):
+                raise ValueError(
+                    f"registry_auth for {host!r} must be 'username:token' — got no colon"
+                )
+        return value
 
-def _env_str(name: str, default: str = "") -> str:
-    return os.environ.get(name, default).strip()
+    @field_validator("interval_hours")
+    @classmethod
+    def sane_interval(cls, value: float) -> float:
+        if value < 0.1:
+            raise ValueError("updates.interval_hours must be at least 0.1")
+        return value
 
 
 # Setting a server by hand is the boring part, and the address already says
@@ -128,7 +156,7 @@ def _recipients_default() -> list[str]:
 class EmailConfig(BaseModel):
     """Outbound-only notifications: nothing has to be exposed to send mail."""
     host: str = Field(default_factory=_smtp_host_default)
-    port: int = Field(default_factory=lambda: int(_env_str("RESTRUO_SMTP_PORT", "587") or 587))
+    port: int = Field(default_factory=lambda: int(_env_str("RESTRUO_SMTP_PORT") or 587), ge=1, le=65535)
     username: str = Field(default_factory=lambda: _env_str("RESTRUO_SMTP_USER"))
     password_env: str = "RESTRUO_SMTP_PASSWORD"
     sender: str = Field(default_factory=lambda: _env_str("RESTRUO_EMAIL_FROM"))

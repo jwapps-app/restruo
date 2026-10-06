@@ -149,6 +149,8 @@ class RegistryClient:
         if response.status_code == 401:
             challenge = response.headers.get("www-authenticate", "")
             token = await self._fetch_token(challenge, ref)
+            if len(self._tokens) >= 256:
+                self._tokens.pop(next(iter(self._tokens)))  # oldest first
             self._tokens[(host, ref.repository)] = token
             headers["Authorization"] = f"Bearer {token}"
             response = await self._client.head(url, headers=headers)

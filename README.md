@@ -187,6 +187,10 @@ The environment is unreachable for about twenty seconds while an agent is swappe
 - **Stopping** either is still refused — there would be nothing left to start it with.
 - A *stack* that contains Portainer or an agent is still refused; the helper replaces
   single containers. Set `RESTRUO_HELPER_IMAGE` to run the helper from a mirror.
+- What the helper assumes: a Linux host with the Engine socket at
+  `/var/run/docker.sock`; that the target's image can be pulled without a login (it does
+  not carry registry credentials); and that the container was created with the Engine
+  API's standard fields — exotic settings are copied as found, not interpreted.
 
 ## Cleaning up
 
@@ -224,8 +228,10 @@ A few behaviours worth knowing:
 
 ## API
 
-Every endpoint except `/healthz`, `/api/login` and the static shell requires auth (session
-cookie or HTTP basic, so `curl -u` works).
+Every endpoint except `/healthz`, `/api/login`, `/api/ui-config` (which answers with only
+the title, version and whether auth is on until you are signed in) and the static shell
+requires auth (session cookie or HTTP basic, so `curl -u` works). There are no generated
+API docs routes.
 
 | Method | Path | Purpose |
 |--------|------|---------|
@@ -237,8 +243,8 @@ cookie or HTTP basic, so `curl -u` works).
 | GET | `/api/stacks` | All stacks and standalone containers, with state |
 | POST | `/api/instances/{iid}/stacks/{sid}/update` | Repull + redeploy one stack |
 | POST | `/api/instances/{iid}/stacks/{sid}/start`, `/stop` | Start or stop a stack |
-| POST | `/api/instances/{iid}/containers/{cid}/update` | Repull + recreate one container |
-| POST | `/api/instances/{iid}/containers/{cid}/start`, `/stop` | Start or stop a container |
+| POST | `/api/instances/{iid}/containers/{cid}/update?endpointId=` | Repull + recreate one container. `endpointId` is required: ids are unique per host, and cloned hosts share them |
+| POST | `/api/instances/{iid}/containers/{cid}/start`, `/stop` — `?endpointId=` | Start or stop a container |
 | POST | `/api/instances/{iid}/prune` | Remove unused images/networks/volumes |
 | GET | `/api/jobs/{id}` | Progress of a redeploy that outlived its request (see below) |
 | GET | `/api/updates` | Cached update-check results |
@@ -253,6 +259,13 @@ update behind a reverse proxy isn't cut off mid-deploy by the proxy's timeout.
 
 Session-cookie requests that change something must also send `X-Restruo: 1`; basic auth
 (`curl -u`) does not need it.
+
+## Deployment notes
+
+Restruo runs as a single process. Jobs in progress, the one-at-a-time rules, login
+throttling and the update cache live in that process, so run **one** replica with one
+worker (the default command does). Updating Restruo itself restarts it, which forgets any
+job that was in flight — the deploy it started carries on in Portainer regardless.
 
 ## Development
 

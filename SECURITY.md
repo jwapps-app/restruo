@@ -48,4 +48,8 @@ internet, and it can redeploy every stack on every machine you connect to it.
   removed when it finishes.
 - The container starts as root only to make its data volume writable by the unprivileged
   `restruo` user (uid 1000), then drops privileges before the app runs.
+- Every change made through the API — instance edits, start, stop, update, prune — is
+  logged with the address it came from, as failed logins are.
+- Restruo is a single-process application: its locks, jobs and throttling are not shared
+  between replicas. Run one.
 - There is no per-user access control — one dashboard login, full access.

@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
+from .config import check_base_url
 from .portainer import PortainerClient
 
 DEFAULT_DATA_PATH = "/data/instances.json"
@@ -51,7 +52,7 @@ class InstanceRecord(BaseModel):
     @field_validator("base_url")
     @classmethod
     def strip_trailing_slash(cls, v: str) -> str:
-        return v.rstrip("/")
+        return check_base_url(v)
 
     @model_validator(mode="after")
     def check_auth_fields(self):

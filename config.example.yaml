@@ -22,7 +22,9 @@ updates:
   interval_hours: 6
   # Tags treated as rolling. Add others if you run projects that ship on them,
   # e.g. immich's :release. Equivalent to RESTRUO_FLOATING_TAGS.
-  floating_tags: ["latest"]
+  # Tags checked as rolling. Leave out to get the default list (latest, lts,
+  # stable, release, edge, main, master, nightly, rolling, dev).
+  # floating_tags: ["latest", "release"]
 
 ui:
   title: "Restruo"
