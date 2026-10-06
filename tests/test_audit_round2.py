@@ -605,8 +605,11 @@ async def test_switching_auth_mode_retires_the_other_credential(tmp_path):
     assert updated.api_key is None and updated.password == "p"
 
 
-def test_app_logger_emits_info(capsys):
+def test_app_logger_has_a_handler_at_info():
+    """Uvicorn configures only its own loggers; without a handler of its own,
+    the app's INFO lines (the operation log, "Emailed N updates") were lost."""
     import logging
     import app.main  # noqa: F401  (configures the handler on import)
-    logging.getLogger("restruo").info("probe line")
-    assert "probe line" in capsys.readouterr().err
+    log = logging.getLogger("restruo")
+    assert any(isinstance(h, logging.StreamHandler) for h in log.handlers)
+    assert log.getEffectiveLevel() <= logging.INFO
