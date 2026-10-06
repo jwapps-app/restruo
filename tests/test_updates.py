@@ -186,6 +186,7 @@ def container_aware_transport(running_digest: str, tag_digest: str) -> httpx.Moc
             return httpx.Response(200, json={"StackFileContent": COMPOSE_YAML})
         if path == "/api/endpoints/2/docker/containers/json":
             return httpx.Response(200, json=[{
+                "Id": "c0ffee000002",
                 "Image": "registry.test/acme/web:latest",
                 "ImageID": "sha256:running-image-id",
                 "Labels": {"com.docker.compose.project": "mystack"},
