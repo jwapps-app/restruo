@@ -603,3 +603,10 @@ async def test_switching_auth_mode_retires_the_other_credential(tmp_path):
     updated = await store.update(rec.id, {"name": "n", "base_url": "https://h", "auth_type": "credentials",
                                           "username": "u", "password": "p"})
     assert updated.api_key is None and updated.password == "p"
+
+
+def test_app_logger_emits_info(capsys):
+    import logging
+    import app.main  # noqa: F401  (configures the handler on import)
+    logging.getLogger("restruo").info("probe line")
+    assert "probe line" in capsys.readouterr().err

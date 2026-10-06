@@ -40,6 +40,23 @@ from .updates import UpdateChecker
 
 logger = logging.getLogger("restruo")
 
+
+def _configure_logging() -> None:
+    """Uvicorn sets up its own loggers and nothing else, so the app's INFO
+    lines — the operation log, "Emailed N updates", the instance import —
+    went nowhere. Give the app's logger a handler of its own, once."""
+    root = logging.getLogger("restruo")
+    if root.handlers:
+        return
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s: %(message)s"))
+    root.addHandler(handler)
+    root.setLevel(os.environ.get("RESTRUO_LOG_LEVEL", "INFO").upper())
+    root.propagate = False
+
+
+_configure_logging()
+
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
 
