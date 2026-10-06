@@ -330,7 +330,7 @@ def standalone_transport(running_digest: str) -> httpx.MockTransport:
             return httpx.Response(200, json=[{"Id": 2}])
         if path == "/api/endpoints/2/docker/containers/json":
             return httpx.Response(200, json=[{
-                "Id": "ctr-1",
+                "Id": "c0ffee000001",
                 "Names": ["/adguard"],
                 "Image": "registry.test/acme/web:latest",
                 "ImageID": "sha256:running-image-id",

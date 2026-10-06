@@ -11,10 +11,13 @@ Secrets are never logged.
 
 import asyncio
 import json
+import logging
 import re
 
 import httpx
 import yaml
+
+logger = logging.getLogger("restruo.portainer")
 
 # Reads (list/get) should fail fast; a redeploy legitimately takes minutes
 # because Portainer pulls images before recreating containers.
@@ -139,6 +142,39 @@ def profiled_images(file_content: str, env: dict[str, str] | None = None) -> set
             if resolved:
                 out.add(resolved)
     return out
+
+
+_CONTAINER_ID_RE = re.compile(r"[0-9a-fA-F]{12,64}")
+
+
+def _is_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def well_formed(items, kind: str, check) -> list[dict]:
+    """Keep only entries whose identifiers have the shape the rest of the code
+    assumes. Ids end up in URLs and in the page; one that is not a number or
+    a hex string is not something to act on, whatever sent it."""
+    kept = []
+    for item in items if isinstance(items, list) else []:
+        if isinstance(item, dict) and check(item):
+            kept.append(item)
+        else:
+            logger.warning("Ignoring a %s with a malformed id: %r", kind, str(item)[:80])
+    return kept
+
+
+def stack_is_well_formed(stack: dict) -> bool:
+    return _is_int(stack.get("Id")) and _is_int(stack.get("EndpointId"))
+
+
+def endpoint_is_well_formed(endpoint: dict) -> bool:
+    return _is_int(endpoint.get("Id"))
+
+
+def container_is_well_formed(container: dict) -> bool:
+    cid = container.get("Id")
+    return isinstance(cid, str) and bool(_CONTAINER_ID_RE.fullmatch(cid))
 
 
 class PortainerClient:
@@ -330,12 +366,12 @@ class PortainerClient:
     async def list_endpoints(self) -> list[dict]:
         response = await self._request("GET", "/api/endpoints")
         self._check(response)
-        return response.json()
+        return well_formed(response.json(), "environment", endpoint_is_well_formed)
 
     async def list_stacks(self) -> list[dict]:
         response = await self._request("GET", "/api/stacks")
         self._check(response)
-        return response.json()
+        return well_formed(response.json(), "stack", stack_is_well_formed)
 
     async def get_stack(self, stack_id: int) -> dict:
         response = await self._request("GET", f"/api/stacks/{stack_id}")
@@ -355,7 +391,7 @@ class PortainerClient:
             params={"all": "1"},
         )
         self._check(response)
-        return response.json()
+        return well_formed(response.json(), "container", container_is_well_formed)
 
     async def get_container_info(self, endpoint_id: int, container_id: str) -> dict:
         """Inspect a container on the environment's Docker engine. Its

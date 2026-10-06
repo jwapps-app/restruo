@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict
 
 from .auth import SESSION_COOKIE, SESSION_TTL_SECONDS, LoginLimiter, SessionManager
 from .config import AppConfig, load_config
-from .instances import ClientManager, InstanceRecord, InstanceStore
+from .instances import ClientManager, InstanceRecord, InstanceStore, destination
 from .notifiers import EmailNotifier, UpdateEvent, build_notifiers, compose_body
 from .portainer import (
     PortainerClient,
@@ -284,11 +284,6 @@ class InstanceInput(BaseModel):
         }
 
 
-def _host_of(url: str) -> str:
-    from urllib.parse import urlsplit
-    return (urlsplit(url).netloc or url).lower()
-
-
 async def _probe_record(record: InstanceRecord) -> dict:
     """Try listing endpoints with the record's credentials."""
     client = PortainerClient(record)
@@ -387,7 +382,7 @@ async def test_instance(request: Request, body: InstanceInput, id: int | None = 
         if existing:
             reusing = (fields["auth_type"] == "api_key" and not fields["api_key"]) or \
                 (fields["auth_type"] == "credentials" and not fields["password"])
-            if reusing and _host_of(fields["base_url"]) != _host_of(existing.base_url):
+            if reusing and destination(fields["base_url"]) != destination(existing.base_url):
                 # A stored secret is only ever sent to the address it was
                 # saved for. Anything else would let a request that names a
                 # new URL collect the credential from the server.
@@ -827,6 +822,27 @@ def _timed(started: float, name: str, message: str, ok: bool = True) -> dict:
     }
 
 
+async def _stack_image_names(
+    client: PortainerClient, stack: dict, name: str, verb: str
+) -> list[str]:
+    """What the stack's containers actually run, resolved past a moved tag.
+
+    This feeds the guards that keep Portainer and its agents from being
+    stopped or redeployed through themselves. A guard that cannot look must
+    not pass — so a failed listing refuses the action rather than allowing it.
+    """
+    endpoint_id = stack["EndpointId"]
+    try:
+        own = stack_containers(stack, await client.list_containers(endpoint_id))
+        return [await resolve_image_name(client, endpoint_id, c) for c in own]
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Couldn't confirm what “{name}” runs ({describe(exc)}) — refusing "
+                   f"to {verb} it until that can be checked.",
+        )
+
+
 async def _set_stack_state(request: Request, iid: int, sid: int, action: str):
     """Start or stop a stack."""
     client = _get_client(request, iid)
@@ -840,13 +856,8 @@ async def _set_stack_state(request: Request, iid: int, sid: int, action: str):
 
     name = stack.get("Name", f"stack {sid}")
     if action == "stop":
-        try:
-            containers = stack_containers(
-                stack, await client.list_containers(stack["EndpointId"])
-            )
-        except Exception:
-            containers = []
-        if any(is_self_critical_image(c.get("Image", "")) for c in containers):
+        images = await _stack_image_names(client, stack, name, "stop")
+        if any(is_self_critical_image(i) for i in images):
             raise HTTPException(
                 status_code=400,
                 detail=f"“{name}” runs Portainer or Restruo itself — stopping it from here "
@@ -927,14 +938,8 @@ async def update_stack(request: Request, iid: int, sid: int):
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Could not fetch stack: {exc}")
 
-    try:
-        own = stack_containers(stack, await client.list_containers(stack["EndpointId"]))
-    except Exception:
-        own = []
-    blocked = next(
-        (c for c in own if cannot_recreate_image(c.get("Image", ""))), None
-    )
-    if blocked is not None:
+    images = await _stack_image_names(client, stack, stack.get("Name", str(sid)), "redeploy")
+    if any(cannot_recreate_image(i) for i in images):
         raise HTTPException(
             status_code=400,
             detail=f"“{stack.get('Name', sid)}” runs Portainer or a Portainer agent. "

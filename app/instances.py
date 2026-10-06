@@ -13,12 +13,22 @@ import json
 import os
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from .portainer import PortainerClient
 
 DEFAULT_DATA_PATH = "/data/instances.json"
+
+
+def destination(url: str) -> str:
+    """Scheme and host:port — what decides where a credential is sent. The
+    scheme matters: https to http on the same host is a different place."""
+    parts = urlsplit((url or "").strip())
+    if parts.netloc:
+        return f"{parts.scheme.lower()}://{parts.netloc.lower()}"
+    return (url or "").strip().lower()
 
 
 class InstanceRecord(BaseModel):
@@ -105,7 +115,17 @@ class InstanceStore:
             if existing is None:
                 return None
             merged = existing.model_dump()
-            # Blank/absent secrets mean "keep the stored one".
+            # Blank/absent secrets mean "keep the stored one" — but only for
+            # the address it was stored for. A saved credential is never sent
+            # anywhere the person did not type it for.
+            new_url = fields.get("base_url") or existing.base_url
+            auth_type = fields.get("auth_type") or existing.auth_type
+            supplied = fields.get("api_key") if auth_type == "api_key" else fields.get("password")
+            if destination(new_url) != destination(existing.base_url) and not supplied:
+                raise ValueError(
+                    "The address changed — enter the API key or password again, so the "
+                    "stored one is never sent somewhere it was not saved for."
+                )
             for key, value in fields.items():
                 if key in ("api_key", "password") and not value:
                     continue
