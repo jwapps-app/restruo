@@ -26,6 +26,11 @@ from .portainer import (
     container_is_down,
     container_name,
     cannot_recreate_image,
+    extract_images,
+    interpolate,
+    profiled_images,
+    registry_id_for,
+    stack_env,
     is_self_critical_image,
     normalize_container,
     normalize_stack,
@@ -107,6 +112,7 @@ async def lifespan(app: FastAPI):
         notifiers=build_notifiers(config),
         floating_tags=config.updates.floating_tags,
         state_path=store.path.parent / "notified.json",
+        check_version_tags=config.updates.check_version_tags,
     )
     checker_task = None
     if config.updates.enabled:
@@ -883,6 +889,83 @@ async def get_job(request: Request, job_id: str):
     return {"done": job["done"], "result": job["result"]}
 
 
+STACK_INACTIVE = 2          # Portainer's Status for a stack that has been stopped
+STOPPED_STACK_PULLS = 2     # images pulled at once for a stopped stack
+
+
+async def _update_stopped_stack(client: PortainerClient, stack: dict) -> dict:
+    """Update a stack that is stopped, and leave it stopped.
+
+    A redeploy is the wrong tool here: Portainer brings the stack up and marks
+    it active, so something stopped on purpose is running again after every
+    update. Redeploying and then stopping it again would still start it for a
+    while — and a stack may be stopped precisely because it must not run.
+
+    So nothing is started at all. The stack's images are pulled on its
+    environment; the tags then point at the new images, and that is what the
+    stack starts on, whenever it is next started.
+    """
+    name = stack.get("Name", f"stack {stack.get('Id')}")
+    started = time.monotonic()
+
+    def result(ok: bool, message: str) -> dict:
+        return {"ok": ok, "stack": name, "message": message,
+                "durationMs": int((time.monotonic() - started) * 1000)}
+
+    try:
+        content = await client.get_stack_file(stack["Id"])
+    except Exception as exc:
+        return result(False, f"Could not read the stack file: {describe(exc)}. "
+                             "Nothing was changed; the stack is still stopped.")
+    env = stack_env(stack)
+    behind_profile = profiled_images(content, env)
+    images: list[str] = []
+    unresolved: list[str] = []
+    for raw in extract_images(content):
+        if raw in behind_profile:
+            continue  # never deployed, so nothing to keep current
+        resolved = interpolate(raw, env)
+        if resolved is None:
+            unresolved.append(raw)
+        elif resolved not in images:
+            images.append(resolved)
+    if not images:
+        return result(False, "No image could be read from the stack file, so there was "
+                             "nothing to pull. The stack is still stopped.")
+
+    try:
+        registries = await client.list_registries()
+    except Exception:
+        registries = []  # anonymous pulls still work for public images
+    gate = asyncio.Semaphore(STOPPED_STACK_PULLS)
+
+    async def pull(image: str) -> str | None:
+        async with gate:
+            try:
+                await client.pull_image(
+                    stack["EndpointId"], image, registry_id_for(image, registries)
+                )
+                return None
+            except Exception as exc:
+                return f"{image} ({describe(exc)})"
+
+    failures = [f for f in await asyncio.gather(*(pull(i) for i in images)) if f]
+    pulled = len(images) - len(failures)
+    if failures or unresolved:
+        problems = [f"could not pull {f}" for f in failures] + [
+            f"could not resolve {u} — it uses a variable Portainer has no value for"
+            for u in unresolved
+        ]
+        return result(False, f"Pulled {pulled} of {len(images) + len(unresolved)} images; "
+                             f"{'; '.join(problems)}. The stack is still stopped.")
+    note = (" Its compose file was not re-read from git — that happens when a running "
+            "stack is redeployed.") if stack.get("GitConfig") else ""
+    return result(True, f"Pulled {pulled} image{'' if pulled == 1 else 's'}. The stack was "
+                        f"stopped and stays stopped — the new "
+                        f"{'image is' if pulled == 1 else 'images are'} used the next "
+                        f"time it is started.{note}")
+
+
 async def _update_one(client: PortainerClient, stack: dict) -> dict:
     name = stack.get("Name", f"stack {stack.get('Id')}")
     started = time.monotonic()
@@ -1076,12 +1159,33 @@ async def update_stack(request: Request, iid: int, sid: int):
         )
 
     async def work() -> dict:
-        result = await _update_one(client, stack)
+        if stack.get("Status") == STACK_INACTIVE:
+            result = await _update_stopped_stack(client, stack)
+        else:
+            result = await _update_one(client, stack)
         if result["ok"]:
             request.app.state.checker.mark_updated(iid, stack_id=sid)
         return result
 
     return await _run_job(request, ("stack", iid, stack["EndpointId"], sid), work)
+
+
+async def _stop_again(client: PortainerClient, endpoint_id: int, name: str) -> str:
+    """Stop the replacement of a container that was stopped before its update.
+    The replacement has a new id; its name is what carries over."""
+    try:
+        new = next(
+            c for c in await client.list_containers(endpoint_id) if container_name(c) == name
+        )
+        await client.set_container_state(endpoint_id, new["Id"], running=False)
+    except StopIteration:
+        return ("Repulled and recreated — but the new container could not be found to "
+                "stop it again. It was stopped before; check it on that host.")
+    except Exception as exc:
+        return (f"Repulled and recreated — but stopping it again failed ({describe(exc)}). "
+                "It was stopped before and is running now.")
+    return ("Repulled and recreated. It was stopped before, so it was stopped again — "
+            "Portainer's recreate starts a container, so it ran for a moment.")
 
 
 @app.post("/api/instances/{iid}/containers/{cid}/update", dependencies=[Depends(require_auth)])
@@ -1122,6 +1226,10 @@ async def update_container(
         kind = "portainer" if "portainer/portainer" in resolved_image.lower() else "agent"
         return await _run_job(request, (kind, iid, endpoint_id, cid), helper_work)
 
+    # Portainer's recreate always starts what it creates, whatever state the
+    # original was in. A container that was stopped is stopped again after.
+    was_stopped = (container.get("State") or "").lower() in ("exited", "created", "dead")
+
     async def work() -> dict:
         try:
             await client.recreate_container(endpoint_id, cid)
@@ -1132,9 +1240,12 @@ async def update_container(
         request.app.state.checker.mark_updated(
             iid, container_id=cid, endpoint_id=endpoint_id
         )
+        message = "Repulled and recreated."
+        if was_stopped:
+            message = await _stop_again(client, endpoint_id, name)
         return {"ok": True, "stack": name,
                 "durationMs": int((time.monotonic() - started) * 1000),
-                "message": "Repulled and recreated."}
+                "message": message}
 
     return await _run_job(request, ("container", iid, endpoint_id, cid), work)
 

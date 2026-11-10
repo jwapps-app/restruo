@@ -80,6 +80,10 @@ def _floating_tags_default() -> list[str]:
     return [tag.strip() for tag in raw.split(",") if tag.strip()]
 
 
+def _env_flag(name: str) -> bool:
+    return _env_str(name).lower() in ("1", "true", "yes", "on")
+
+
 def _registry_auth_default() -> dict[str, str]:
     """RESTRUO_REGISTRY_AUTH="ghcr.io=user:token,registry.lan=user:pw" — logins
     used when checking private images for updates."""
@@ -98,6 +102,13 @@ class UpdatesConfig(BaseModel):
     # is considered pinned. Some projects use rolling tags besides latest,
     # e.g. immich's :release.
     floating_tags: list[str] = Field(default_factory=_floating_tags_default)
+    # Also check tags that name a version (mariadb:10.11, postgres:16-alpine).
+    # Such a tag is republished under the same name for patch releases and
+    # base-image fixes, so "the tag did not change" does not mean "the image
+    # did not". Off by default: a version tag is left alone unless asked.
+    check_version_tags: bool = Field(
+        default_factory=lambda: _env_flag("RESTRUO_CHECK_VERSION_TAGS")
+    )
     # host -> "username:token"
     registry_auth: dict[str, str] = Field(default_factory=_registry_auth_default)
 

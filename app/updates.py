@@ -58,11 +58,13 @@ class UpdateChecker:
         notifiers: list[Notifier] | None = None,
         floating_tags: tuple[str, ...] | list[str] = ("latest",),
         state_path: Path | None = None,
+        check_version_tags: bool = False,
     ):
         # get_clients: callable returning [(instance_id, PortainerClient), ...],
         # so the checker always sees the current set of managed instances.
         self.get_clients = get_clients
         self.floating_tags = set(floating_tags)
+        self.check_version_tags = check_version_tags
         self.registry = registry
         self.interval_hours = interval_hours
         self.notifiers = notifiers or []
@@ -201,8 +203,19 @@ class UpdateChecker:
         if ref is None:
             return {"image": raw, "status": STATUS_UNKNOWN,
                     "detail": "image reference uses variables or is unparseable"}
-        if ref.pinned_digest or ref.tag not in self.floating_tags:
-            return {"image": raw, "status": STATUS_PINNED}
+        if ref.pinned_digest:
+            return {"image": raw, "status": STATUS_PINNED,
+                    "detail": "Pinned to a digest — it names one exact image and cannot change"}
+        # Three kinds of tag. A channel tag (latest, stable…) moves by design
+        # and is always checked. A version tag (10.11, 16-alpine) looks fixed
+        # but is republished under the same name — patch releases, base-image
+        # fixes — so it is checked when asked. Either way the test is the
+        # same: does the registry's digest for this tag match what is running.
+        version_tag = ref.tag not in self.floating_tags
+        if version_tag and not self.check_version_tags:
+            return {"image": raw, "status": STATUS_PINNED,
+                    "detail": "Version tag — not checked. It can still be republished under "
+                              "the same name; set RESTRUO_CHECK_VERSION_TAGS=true to watch for that"}
 
         # Local first: an image with no repo digest never came from a registry
         # (built on the box, or created by the NAS itself), so there is nothing
@@ -246,6 +259,7 @@ class UpdateChecker:
                     "status": STATUS_UPDATE_AVAILABLE,
                     "detail": f"running {running_short} · {tag_id.removeprefix('sha256:')[:12]} "
                               "already pulled — recreate to apply",
+                    **({"rebuild": True} if version_tag else {}),
                 }
             return {"image": raw, "status": STATUS_LOCAL,
                     "detail": "built or loaded locally — not published to a registry"}
@@ -259,9 +273,7 @@ class UpdateChecker:
                                   "set RESTRUO_REGISTRY_AUTH"}
             if exc.status_code == 429:
                 return {"image": raw, "status": STATUS_UNKNOWN,
-                        "detail": f"{ref.registry} is rate-limiting this address — "
-                                  "manifest checks count toward Docker Hub's pull limit; "
-                                  "try again later"}
+                        "detail": f"{ref.registry} is rate-limiting this address — try again later"}
             return {"image": raw, "status": STATUS_UNKNOWN,
                     "detail": f"{ref.registry}: {describe_error(exc)}"}
         except Exception as exc:
@@ -275,6 +287,15 @@ class UpdateChecker:
         # Show both digests so a stuck badge is diagnosable from the tooltip.
         shown = ({d for i in behind for d in per_image[i]} if per_image else local_digests)
         local_short = ", ".join(sorted(d.removeprefix("sha256:")[:12] for d in shown)) or "no digest"
+        if version_tag:
+            # Same tag, different image: the name did not move, its contents did.
+            return {
+                "image": raw,
+                "status": STATUS_UPDATE_AVAILABLE,
+                "rebuild": True,
+                "detail": f"a newer build was published under the same tag · running "
+                          f"{local_short} · registry {remote_digest.removeprefix('sha256:')[:12]}",
+            }
         return {
             "image": raw,
             "status": STATUS_UPDATE_AVAILABLE,

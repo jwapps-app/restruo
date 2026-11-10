@@ -83,6 +83,7 @@ Everything is optional except the password.
 | `RESTRUO_USERNAME` | `admin` | Dashboard login username |
 | `RESTRUO_TITLE` | `Restruo` | Dashboard title |
 | `RESTRUO_FLOATING_TAGS` | channel tags | Comma-separated tags treated as rolling. Defaults to the tags that name a channel rather than a version — `latest`, `lts`, `stable`, `release`, `edge`, `main`, `master`, `nightly`, `rolling`, `dev`. Set it to override |
+| `RESTRUO_CHECK_VERSION_TAGS` | `false` | Also check tags that name a version (`mariadb:10.11`, `postgres:16-alpine`). They are republished under the same name, so they can have an update too — see [How updates work](#how-updates-work) |
 | `RESTRUO_REFRESH_SECONDS` | `180` | How often an open dashboard re-reads container state. `0` disables |
 | `RESTRUO_SMTP_USER` / `RESTRUO_SMTP_PASSWORD` | — | Your mail address and password — enough on its own for Gmail, Outlook, Yahoo, iCloud, or Fastmail |
 | `RESTRUO_SMTP_HOST` | inferred from the address | Only needed for a provider not in that list, or your own relay |
@@ -98,7 +99,13 @@ file at `/config/config.yaml` — see [`config.example.yaml`](config.example.yam
 
 ## How updates work
 
-**Applying an update** does exactly what the Portainer UI does:
+**A stopped stack stays stopped.** Redeploying one would start it, so Restruo doesn't:
+it pulls the stack's images on that environment and leaves everything else alone, and the
+stack starts on the new images whenever you next start it. A stopped standalone container
+is recreated on the new image and then stopped again — Portainer's recreate always starts
+what it creates, so it does run for a moment.
+
+**Applying an update** to anything running does exactly what the Portainer UI does:
 
 - **Git-based stack**: `PUT /api/stacks/{id}/git/redeploy` with
   `RepullImageAndRedeploy: true`.
@@ -117,6 +124,15 @@ performs as a rolling service update.
   are checked by default. A tag containing a digit names a *version* you chose
   (`postgres:16-alpine`, `app:2026.07.2`), reads as **pinned**, and is left alone, which
   is the point of pinning. Override the list with `RESTRUO_FLOATING_TAGS`.
+- A version tag is not as fixed as it looks. `mariadb:10.11` is published again under the
+  same name for every 10.11.x patch release, and again whenever its base image gets a
+  security fix; the tag stays put while the image behind it changes. Set
+  `RESTRUO_CHECK_VERSION_TAGS=true` to have those checked too: a tag whose registry digest
+  no longer matches what you run shows as **new build**, counts as an update, and is
+  included in **Update all** and in notifications. Only an image pinned by digest
+  (`name@sha256:…`) can never change, and that is never checked. Be aware of what turning
+  this on means for a database: a newer build of `postgres:16` is a patch upgrade, and
+  **Update all** will apply it.
 - The comparison uses the digest of the image the container is *actually running*, not
   what the local tag points at — those drift apart when something re-pulls a tag without
   recreating the container.

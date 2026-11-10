@@ -11,6 +11,7 @@ Secrets are never logged.
 """
 
 import asyncio
+import base64
 import json
 import logging
 import re
@@ -145,6 +146,25 @@ def stack_images(stack: dict, file_content: str, containers: list[dict]) -> list
     # Nothing to fall back on (a stopped stack, say) — keep the raw references
     # so the row still shows something recognisable.
     return resolved or declared
+
+
+def registry_id_for(image: str, registries: list[dict]) -> int | None:
+    """The Portainer registry whose login applies to this image, if any."""
+    # Same rule the registry client uses: the first path segment is a host
+    # only when it looks like one; otherwise the image lives on Docker Hub.
+    first, _, rest = (image or "").partition("/")
+    host = first.lower() if rest and ("." in first or ":" in first or first == "localhost") \
+        else "docker.io"
+    for registry in registries:
+        if not registry.get("Authentication") or not _is_int(registry.get("Id")):
+            continue
+        url = str(registry.get("URL") or "").lower()
+        url = url.split("://", 1)[-1].split("/", 1)[0]
+        if url in ("registry-1.docker.io", "index.docker.io", "registry.hub.docker.com"):
+            url = "docker.io"
+        if url and url == host:
+            return registry["Id"]
+    return None
 
 
 def profiled_images(file_content: str, env: dict[str, str] | None = None) -> set[str]:
@@ -550,11 +570,29 @@ class PortainerClient:
     # --- plain Docker calls through Portainer's proxy, used to run the helper
     # that replaces containers Portainer cannot recreate itself ---------------
 
-    async def pull_image(self, endpoint_id: int, image: str) -> None:
+    async def list_registries(self) -> list[dict]:
+        """Registries configured in Portainer itself (Registries in its menu)."""
+        response = await self._request("GET", "/api/registries")
+        self._check(response)
+        body = response.json()
+        return body if isinstance(body, list) else []
+
+    async def pull_image(
+        self, endpoint_id: int, image: str, registry_id: int | None = None
+    ) -> None:
+        """Pull an image on the environment. `registry_id` names a registry
+        configured in Portainer: its proxy swaps that reference for the stored
+        login, which is how Portainer's own UI pulls a private image."""
+        headers = {}
+        if registry_id is not None:
+            headers["X-Registry-Auth"] = base64.b64encode(
+                json.dumps({"registryId": registry_id}).encode()
+            ).decode()
         response = await self._request(
             "POST",
             f"/api/endpoints/{endpoint_id}/docker/images/create",
             params={"fromImage": image},
+            headers=headers,
             timeout=REDEPLOY_TIMEOUT,
         )
         self._check(response)

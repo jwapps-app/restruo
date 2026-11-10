@@ -348,9 +348,9 @@
 
   function imgLine(img) {
     if (img.status === "update-available")
-      return `<span class="img-line upd" title="${esc(img.detail || "A newer image is available from the registry")}">⬆ ${esc(img.image)} <span class="img-note">new version</span></span>`;
+      return `<span class="img-line upd" title="${esc(img.detail || "A newer image is available from the registry")}">⬆ ${esc(img.image)} <span class="img-note">${img.rebuild ? "new build" : "new version"}</span></span>`;
     if (img.status === "pinned")
-      return `<span class="img-line" title="Pinned to a specific version — not checked">${esc(img.image)} <span class="img-note">pinned</span></span>`;
+      return `<span class="img-line" title="${esc(img.detail || "Pinned to a specific version — not checked")}">${esc(img.image)} <span class="img-note">pinned</span></span>`;
     if (img.status === "up-to-date")
       return `<span class="img-line" title="Up to date with the registry">${esc(img.image)}</span>`;
     if (img.status === "local")
@@ -494,7 +494,8 @@
               ${s.updateProtected
                 ? '<button class="update-btn" disabled title="This stack runs Portainer or a Portainer agent — redeploying it would stop the container carrying the command, so it could never finish. Update it from that host.">Update</button>'
                 : `<button class="update-btn${hasUpd ? " has-upd" : ""}" data-kind="stack"
-                data-iid="${esc(String(iid))}" data-sid="${esc(String(s.id))}" data-name="${esc(s.name)}">${hasUpd ? "⬆ Update" : "Update"}</button>`}
+                data-iid="${esc(String(iid))}" data-sid="${esc(String(s.id))}" data-name="${esc(s.name)}"
+                data-stopped="${s.status === "inactive" ? "1" : ""}">${hasUpd ? "⬆ Update" : "Update"}</button>`}
               ${powerBtn({ kind: "stack", iid, id: s.id, name: s.name,
                            running: s.status !== "inactive", protected: s.selfCritical })}
               <span class="result-msg" id="msg-${esc(String(iid))}-${esc(String(s.id))}"></span>
@@ -507,7 +508,7 @@
           const hasUpd = !!(cInfo && cInfo.status === "update-available");
           const isPortainer = cannotRecreate(c.image);
           const imagesCell = cInfo
-            ? imgLine({ image: c.image, status: cInfo.status, detail: cInfo.detail })
+            ? imgLine({ image: c.image, status: cInfo.status, detail: cInfo.detail, rebuild: cInfo.rebuild })
             : esc(c.image);
           const downBadge = c.down
             ? ` <span class="badge err" title="${esc(c.statusText || c.state)}">● down</span>` : "";
@@ -521,6 +522,7 @@
               <button class="update-btn${hasUpd ? " has-upd" : ""}" data-kind="container"
                 data-iid="${esc(String(iid))}" data-cid="${esc(c.id)}" data-eid="${esc(String(c.endpointId ?? ""))}" data-name="${esc(c.name)}"
                 data-helper="${helperKind(c.image)}"
+                data-stopped="${["exited", "created", "dead"].includes(c.state) ? "1" : ""}"
                 ${isPortainer ? 'title="Replaced by a short-lived helper the Docker daemon runs — Portainer can\'t recreate this one itself"' : ""}>${hasUpd ? "⬆ Update" : "Update"}</button>
               ${powerBtn({ kind: "container", iid, id: c.id, eid: c.endpointId, name: c.name,
                            running: !c.down || c.state === "running", protected: isPortainer })}
@@ -997,6 +999,10 @@
         : inst?.stacks?.find((s) => s.id === Number(sid))?.images || [];
       if (images.some((i) => i.toLowerCase().includes("restruo")))
         text += " This looks like Restruo itself — the page will disconnect while it restarts, then reload automatically.";
+      if (updateBtn.dataset.stopped)
+        text = kind === "container"
+          ? "This container is stopped. It is recreated on the freshly pulled image and then stopped again — Portainer's recreate starts it, so it runs for a moment."
+          : "This stack is stopped, and it stays stopped: its images are pulled so that it starts on the new version next time. Nothing is started.";
       const helper = updateBtn.dataset.helper;
       if (helper === "agent")
         text = "Portainer can't recreate its own agent — the command travels through it. " +

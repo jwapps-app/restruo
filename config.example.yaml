@@ -25,6 +25,9 @@ updates:
   # Tags checked as rolling. Leave out to get the default list (latest, lts,
   # stable, release, edge, main, master, nightly, rolling, dev).
   # floating_tags: ["latest", "release"]
+  # Also check version tags (mariadb:10.11) for a newer build published under
+  # the same name. Equivalent to RESTRUO_CHECK_VERSION_TAGS=true.
+  # check_version_tags: true
 
 ui:
   title: "Restruo"
