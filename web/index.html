@@ -881,7 +881,7 @@
       <label class="chk"><input type="checkbox" id="cl-images" checked>
         <span>Leftover images — the old versions left behind by updates</span></label>
       <label class="chk"><input type="checkbox" id="cl-networks" checked>
-        <span>Unused networks</span></label>
+        <span>Networks that no container uses — a stopped container's network is kept</span></label>
       ${stoppedWarning}
       <label class="chk"><input type="checkbox" id="cl-all-images">
         <span>Also every image no container uses — <span class="danger">includes stopped stacks</span>, which then need a re-pull before they can start</span></label>

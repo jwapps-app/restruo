@@ -148,6 +148,42 @@ def stack_images(stack: dict, file_content: str, containers: list[dict]) -> list
     return resolved or declared
 
 
+PREDEFINED_NETWORKS = ("bridge", "host", "none")
+
+
+def networks_safe_to_remove(networks: list[dict], containers: list[dict]) -> list[dict]:
+    """Networks that no container — running or stopped — refers to.
+
+    Docker's built-in networks are never candidates, and neither is anything
+    that is not a plain local network: swarm and ingress networks belong to
+    the cluster, not to the containers on this one host.
+    """
+    used_ids: set[str] = set()
+    used_names: set[str] = set()
+    for container in containers:
+        mode = (container.get("HostConfig") or {}).get("NetworkMode")
+        if mode:
+            used_names.add(mode)
+        attached = (container.get("NetworkSettings") or {}).get("Networks") or {}
+        for name, settings in attached.items():
+            used_names.add(name)
+            if isinstance(settings, dict) and settings.get("NetworkID"):
+                used_ids.add(settings["NetworkID"])
+    out = []
+    for network in networks:
+        name, network_id = network.get("Name"), network.get("Id")
+        if not isinstance(network_id, str) or not network_id:
+            continue
+        if name in PREDEFINED_NETWORKS or network.get("Ingress"):
+            continue
+        if (network.get("Scope") or "local") != "local":
+            continue
+        if network_id in used_ids or name in used_names:
+            continue
+        out.append(network)
+    return out
+
+
 def registry_id_for(image: str, registries: list[dict]) -> int | None:
     """The Portainer registry whose login applies to this image, if any."""
     # Same rule the registry client uses: the first path segment is a host
@@ -499,14 +535,41 @@ class PortainerClient:
         self._check(response)
         return response.json()
 
-    async def prune_networks(self, endpoint_id: int) -> dict:
+    async def list_networks(self, endpoint_id: int) -> list[dict]:
         response = await self._request(
-            "POST",
-            f"/api/endpoints/{endpoint_id}/docker/networks/prune",
-            timeout=REDEPLOY_TIMEOUT,
+            "GET", f"/api/endpoints/{endpoint_id}/docker/networks"
         )
         self._check(response)
-        return response.json()
+        body = response.json()
+        return body if isinstance(body, list) else []
+
+    async def remove_network(self, endpoint_id: int, network_id: str) -> None:
+        response = await self._request(
+            "DELETE", f"/api/endpoints/{endpoint_id}/docker/networks/{network_id}"
+        )
+        self._check(response)
+
+    async def remove_unused_networks(self, endpoint_id: int) -> tuple[int, list[str]]:
+        """Remove networks no container refers to. Returns (removed, errors).
+
+        Not Docker's own prune: that counts a network as unused when nothing
+        *running* is attached, so it deletes the network of a container that
+        is merely stopped — or that crashed a moment ago — and that container
+        can then never start again ("network … not found"). Here a network is
+        kept if any container, running or not, still points at it. If the
+        containers cannot be listed, nothing is removed.
+        """
+        containers = await self.list_containers(endpoint_id)
+        networks = await self.list_networks(endpoint_id)
+        removed, errors = 0, []
+        for network in networks_safe_to_remove(networks, containers):
+            try:
+                await self.remove_network(endpoint_id, network["Id"])
+                removed += 1
+            except Exception as exc:
+                message = exc.message if isinstance(exc, PortainerError) else str(exc)
+                errors.append(f"{network.get('Name')}: {message}")
+        return removed, errors
 
     async def prune_volumes(self, endpoint_id: int) -> dict:
         """Remove ALL volumes no container references — named ones included.

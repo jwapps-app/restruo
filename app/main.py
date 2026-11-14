@@ -1170,6 +1170,82 @@ async def update_stack(request: Request, iid: int, sid: int):
     return await _run_job(request, ("stack", iid, stack["EndpointId"], sid), work)
 
 
+CONTAINER_POLL_SECONDS = 2.0
+CONTAINER_POLLS = 30           # a minute to prove itself
+CONTAINER_STABLE_POLLS = 4     # up, and not restarting, this many polls running
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+async def _last_log_line(client: PortainerClient, endpoint_id: int, cid: str) -> str:
+    """What the container said last — usually the reason it died."""
+    try:
+        logs = await client.container_logs(endpoint_id, cid)
+    except Exception:
+        return ""
+    lines = [_ANSI_RE.sub("", line).strip() for line in logs.splitlines()]
+    lines = [line for line in lines if line]
+    return lines[-1][:400] if lines else ""
+
+
+async def _await_container(client: PortainerClient, endpoint_id: int, name: str) -> dict:
+    """Watch a freshly recreated container until it has stayed up, or failed.
+
+    A new image can refuse the old configuration and exit within seconds of
+    starting — after Portainer has already answered that the recreate worked.
+    Returns {"ok", "message"}; a failure carries the container's last log
+    line, which is usually the whole explanation.
+    """
+    cid: str | None = None
+    stable = 0
+    ran = False
+    for _ in range(CONTAINER_POLLS):
+        await asyncio.sleep(CONTAINER_POLL_SECONDS)
+        try:
+            if cid is None:
+                cid = next(
+                    (c["Id"] for c in await client.list_containers(endpoint_id)
+                     if container_name(c) == name), None)
+                if cid is None:
+                    continue
+            info = await client.get_container_info(endpoint_id, cid)
+        except Exception:
+            continue  # a failed poll says nothing about the container
+        state = info.get("State") or {}
+        health = (state.get("Health") or {}).get("Status")
+        restarting = bool(state.get("Restarting")) or (info.get("RestartCount") or 0) > 0
+        exited = not state.get("Running") and not state.get("Restarting")
+
+        if exited and state.get("ExitCode") == 0 and not restarting:
+            return {"ok": True,
+                    "message": "Repulled and recreated. It ran and finished cleanly."}
+        if exited or restarting or health == "unhealthy":
+            if restarting and not exited:
+                what = "keeps crashing and restarting"
+            elif exited:
+                what = f"exited right away (exit code {state.get('ExitCode')})"
+            else:
+                what = "is running but failing its health check"
+            said = await _last_log_line(client, endpoint_id, cid)
+            return {"ok": False,
+                    "message": f"Recreated on the new image, but it {what}."
+                               + (f" Its last log line: {said}" if said else "")}
+        ran = True
+        if health == "starting":
+            stable = 0
+            continue
+        stable += 1
+        if stable >= CONTAINER_STABLE_POLLS:
+            return {"ok": True, "message": "Repulled and recreated — running."}
+    if ran:
+        # Up for the whole minute; only a slow health check is undecided.
+        return {"ok": True, "message": "Repulled and recreated — running; its health "
+                                       "check had not finished starting after a minute."}
+    return {"ok": False,
+            "message": f"Recreated, but “{name}” could not be found afterwards to confirm "
+                       "it is running. Check it on that host."}
+
+
 async def _stop_again(client: PortainerClient, endpoint_id: int, name: str) -> str:
     """Stop the replacement of a container that was stopped before its update.
     The replacement has a new id; its name is what carries over."""
@@ -1237,15 +1313,20 @@ async def update_container(
             return {"ok": False, "stack": name,
                     "durationMs": int((time.monotonic() - started) * 1000),
                     "message": describe(exc)}
-        request.app.state.checker.mark_updated(
-            iid, container_id=cid, endpoint_id=endpoint_id
-        )
-        message = "Repulled and recreated."
         if was_stopped:
-            message = await _stop_again(client, endpoint_id, name)
-        return {"ok": True, "stack": name,
+            outcome = {"ok": True, "message": await _stop_again(client, endpoint_id, name)}
+        else:
+            # Portainer answers as soon as the new container has been started.
+            # Whether it then stays up is a separate question, and the one
+            # that matters.
+            outcome = await _await_container(client, endpoint_id, name)
+        if outcome["ok"]:
+            request.app.state.checker.mark_updated(
+                iid, container_id=cid, endpoint_id=endpoint_id
+            )
+        return {"ok": outcome["ok"], "stack": name,
                 "durationMs": int((time.monotonic() - started) * 1000),
-                "message": message}
+                "message": outcome["message"]}
 
     return await _run_job(request, ("container", iid, endpoint_id, cid), work)
 
@@ -1295,8 +1376,9 @@ async def _prune_endpoints(client, endpoints, body, summary, _msg) -> None:
                 summary["errors"].append(f"images: {_msg(exc)}")
         if body.networks:
             try:
-                pruned = await client.prune_networks(endpoint_id)
-                summary["networks"] += len(pruned.get("NetworksDeleted") or [])
+                removed, failures = await client.remove_unused_networks(endpoint_id)
+                summary["networks"] += removed
+                summary["errors"].extend(f"networks: {f}" for f in failures)
             except Exception as exc:
                 summary["errors"].append(f"networks: {_msg(exc)}")
         if body.volumes:

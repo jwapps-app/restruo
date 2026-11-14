@@ -253,8 +253,16 @@ class ContainerHost:
         assert running is False
         self.stopped.append(cid)
 
+    async def get_container_info(self, endpoint_id, cid):
+        return {"State": {"Running": True, "Restarting": False}, "RestartCount": 0}
+
     async def aclose(self):
         pass
+
+
+@pytest.fixture(autouse=True)
+def _fast_container_polls(monkeypatch):
+    monkeypatch.setattr(main, "CONTAINER_POLL_SECONDS", 0.001)
 
 
 def test_a_stopped_container_is_stopped_again_after_its_update(client):
@@ -271,7 +279,7 @@ def test_a_running_container_is_left_running(client):
     app.state.manager._clients[7] = host
     r = client.post(f"/api/instances/7/containers/{'a' * 12}/update?endpointId=3", auth=BASIC)
     assert r.status_code == 200 and host.stopped == []
-    assert r.json()["message"] == "Repulled and recreated."
+    assert r.json()["message"] == "Repulled and recreated — running."
 
 
 # ---------------------------------------------------------------- registry-aware pulls

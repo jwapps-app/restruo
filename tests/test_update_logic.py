@@ -229,15 +229,28 @@ async def test_prune_volumes_includes_named_with_fallback():
     assert pruned["VolumesDeleted"] == ["v1"]
 
 
-async def test_prune_networks():
+async def test_unused_networks_are_removed_one_by_one_never_with_dockers_prune():
+    """Docker's prune deletes the network of a stopped container; see
+    tests/test_container_outcome.py for the full story."""
+    removed = []
+
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/api/endpoints/2/docker/networks/prune"
-        return httpx.Response(200, json={"NetworksDeleted": ["a", "b"]})
+        path = request.url.path
+        assert not path.endswith("/networks/prune"), "Docker's own prune must not be used"
+        if path == "/api/endpoints/2/docker/containers/json":
+            return httpx.Response(200, json=[])
+        if path == "/api/endpoints/2/docker/networks" and request.method == "GET":
+            return httpx.Response(200, json=[{"Id": "n1", "Name": "old_default", "Scope": "local"},
+                                             {"Id": "n2", "Name": "bridge", "Scope": "local"}])
+        if request.method == "DELETE":
+            removed.append(path.rsplit("/", 1)[-1])
+            return httpx.Response(204)
+        return httpx.Response(404)
 
     client, _ = make_client(handler)
-    pruned = await client.prune_networks(2)
+    count, errors = await client.remove_unused_networks(2)
     await client.aclose()
-    assert len(pruned["NetworksDeleted"]) == 2
+    assert (count, errors, removed) == (1, [], ["n1"])
 
 
 async def test_portainer_error_surfaces_message():

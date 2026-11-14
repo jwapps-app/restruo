@@ -27,7 +27,7 @@ separately.
 - **Start / stop** per stack and container, so you can bring something back without
   logging into that machine's Portainer.
 - **Cleans up after itself**: prune the leftover images your `:latest` updates leave
-  behind, plus unused networks, and — only if you explicitly ask — every unused image
+  behind, plus networks no container uses, and — only if you explicitly ask — every unused image
   or unused volumes. (Careful with those two: stopping a stack removes its containers,
   so its images look unused.)
 - **Installs as a web app.** Add it to your phone's home screen; a 30-day session means a
@@ -112,6 +112,12 @@ what it creates, so it does run for a moment.
 - **Compose/editor stack**: fetches the current stack file, then `PUT /api/stacks/{id}`
   re-sending file and env vars with `PullImage: true`.
 - **Standalone container**: Portainer's recreate action with a fresh pull.
+
+Either way Restruo then watches the result. A stack is a success when its containers were
+replaced and are all running; a standalone container when it has stayed up — not
+restarting, and not failing its health check — for a few polls. A new image that rejects
+the old configuration and exits is reported as a failure, with the container's last log
+line, instead of a tick.
 
 Env vars and the stack's `EndpointId` are always re-sent from the live stack object, so a
 redeploy never wipes your environment. Swarm stacks use the compose path, which Portainer
@@ -212,7 +218,11 @@ The environment is unreachable for about twenty seconds while an agent is swappe
 
 **Clean up** (per instance) prunes, by default, only *dangling* images — the untagged
 old versions a re-pull leaves behind, which is where update leftovers accumulate — plus
-unused networks. Two options are off by default because they can destroy something you
+networks that no container refers to. That is deliberately narrower than Docker's own
+`network prune`, which treats a network as unused the moment nothing *running* is attached
+and so deletes the network of a container that is merely stopped, or that crashed a few
+seconds ago — after which that container can never start again. Restruo keeps any network
+a container still points at, running or not. Two options are off by default because they can destroy something you
 still want:
 
 - **Every image no container uses.** Stopping a stack in Portainer *removes* its
