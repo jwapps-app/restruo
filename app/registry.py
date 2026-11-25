@@ -15,9 +15,10 @@ from urllib.parse import urlsplit
 
 import httpx
 
-logger = logging.getLogger("restruo.updates")
+from . import timing
+from .errors import RegistryError
 
-REGISTRY_TIMEOUT = 15.0
+logger = logging.getLogger("restruo.registry")
 
 # Accept both manifest lists (multi-arch) and single manifests so the returned
 # Docker-Content-Digest matches what `docker pull` records in RepoDigests.
@@ -31,12 +32,6 @@ MANIFEST_ACCEPT = ", ".join(
 )
 
 _CHALLENGE_FIELD_RE = re.compile(r'(\w+)="([^"]*)"')
-
-
-class RegistryError(Exception):
-    def __init__(self, message: str, status_code: int | None = None):
-        self.status_code = status_code
-        super().__init__(message)
 
 
 @dataclass(frozen=True)
@@ -122,7 +117,7 @@ class RegistryClient:
         credentials: dict[str, tuple[str, str]] | None = None,
     ):
         kwargs = {} if transport is None else {"transport": transport}
-        self._client = httpx.AsyncClient(timeout=REGISTRY_TIMEOUT, **kwargs)
+        self._client = httpx.AsyncClient(timeout=timing.REGISTRY_TIMEOUT, **kwargs)
         self._tokens: dict[tuple[str, str], str] = {}
         # Per-registry login, so private images can be checked too. Keyed by the
         # name as written in the image (ghcr.io, docker.io, …).

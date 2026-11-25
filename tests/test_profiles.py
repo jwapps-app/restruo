@@ -12,6 +12,7 @@ from app.instances import InstanceRecord
 from app.portainer import PortainerClient, profiled_images
 from app.registry import RegistryClient
 from app.updates import STATUS_NOT_DEPLOYED, STATUS_UNKNOWN, UpdateChecker
+from tests.fakes import update_settings
 
 QUAERO = """
 services:
@@ -71,7 +72,7 @@ async def test_profiled_image_reads_not_deployed_rather_than_unknown():
         InstanceRecord(id=5, name="Proxmox", base_url="https://p.test", auth_type="api_key", api_key="k"),
         transport=httpx.MockTransport(portainer))
     checker = UpdateChecker(lambda: [(5, client)], RegistryClient(transport=httpx.MockTransport(registry)),
-                            interval_hours=6)
+                            update_settings())
     snapshot = await checker.check_all()
     by_image = {i["image"]: i for i in snapshot["instances"][0]["stacks"][0]["images"]}
 

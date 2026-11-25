@@ -25,12 +25,10 @@ import time
 
 import httpx
 
+from . import health, timing
+
 DOCKER_SOCKET = "/var/run/docker.sock"
 OLD_SUFFIX = "-restruo-old"
-# Let the request that started this container finish its round trip before
-# the container carrying that request is stopped.
-STARTUP_GRACE_SECONDS = 3.0
-STOP_TIMEOUT_SECONDS = 20
 
 # Config fields a container inherits from its image. Where the old container
 # merely carried the old image's value, the new image's value should win.
@@ -50,7 +48,9 @@ class Docker:
         self._client = httpx.Client(
             transport=transport or httpx.HTTPTransport(uds=DOCKER_SOCKET),
             base_url="http://docker",
-            timeout=httpx.Timeout(30.0, read=1800.0),  # a pull can be slow
+            timeout=httpx.Timeout(
+                timing.HELPER_CONNECT_SECONDS, read=timing.HELPER_PULL_READ_SECONDS
+            ),
         )
 
     def _check(self, response: httpx.Response, what: str) -> httpx.Response:
@@ -83,7 +83,7 @@ class Docker:
 
     def stop(self, ref: str) -> None:
         response = self._client.post(
-            f"/containers/{ref}/stop", params={"t": STOP_TIMEOUT_SECONDS}
+            f"/containers/{ref}/stop", params={"t": timing.HELPER_STOP_TIMEOUT_SECONDS}
         )
         if response.status_code != 304:  # already stopped
             self._check(response, "stop")
@@ -249,11 +249,6 @@ def build_create_body(container: dict, old_image_config: dict) -> tuple[dict, di
     return body, extra
 
 
-READY_POLL_SECONDS = 2.0
-READY_POLLS = 45            # 90 s for a healthcheck to pass
-READY_STABLE_POLLS = 4      # running (and healthy, if checked) this long in a row
-
-
 def wait_ready(docker: Docker, ref: str, sleep=time.sleep) -> None:
     """Block until the container has proven itself, or raise.
 
@@ -263,20 +258,22 @@ def wait_ready(docker: Docker, ref: str, sleep=time.sleep) -> None:
     healthy, and it must hold that for several polls in a row.
     """
     stable = 0
-    for _ in range(READY_POLLS):
-        sleep(READY_POLL_SECONDS)
-        state = docker.inspect_container(ref).get("State") or {}
-        if not state.get("Running") or state.get("Restarting"):
-            code = state.get("ExitCode")
-            raise HelperError(f"the new container stopped (exit code {code})")
-        health = (state.get("Health") or {}).get("Status")
-        if health == "unhealthy":
+    for _ in range(timing.READY_POLLS):
+        sleep(timing.READY_POLL_SECONDS)
+        info = docker.inspect_container(ref)
+        verdict = health.judge(info)
+        # Here a stop is a failure whatever the exit code: the containers this
+        # replaces are services, never one-shot jobs.
+        if verdict in (health.EXITED, health.RESTARTING):
+            raise HelperError(
+                f"the new container stopped (exit code {health.exit_code(info)})")
+        if verdict == health.UNHEALTHY:
             raise HelperError("the new container is running but reports unhealthy")
-        if health == "starting":
+        if verdict == health.STARTING:
             stable = 0
             continue
         stable += 1
-        if stable >= READY_STABLE_POLLS:
+        if stable >= timing.READY_STABLE_POLLS:
             return
     raise HelperError("the new container did not become healthy in time")
 
@@ -365,7 +362,7 @@ def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print(json.dumps({"ok": False, "message": "usage: python -m app.helper <container>"}))
         return 1
-    time.sleep(STARTUP_GRACE_SECONDS)
+    time.sleep(timing.HELPER_STARTUP_GRACE_SECONDS)
     try:
         message = replace(Docker(), argv[1])
     except Exception as exc:

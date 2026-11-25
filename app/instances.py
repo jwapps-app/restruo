@@ -1,8 +1,8 @@
 """Persistent store for Portainer instances, managed from the settings UI.
 
-Instances live in a JSON file on a writable volume (default /data/instances.json,
-override with DATA_PATH). Each instance authenticates with either an API token
-or a username/password. Secrets are stored server-side only and never returned
+Instances live in a JSON file on a writable volume (config.data_path: by
+default /data/instances.json, overridden with DATA_PATH). Each instance
+authenticates with either an API token or a username/password. Secrets are stored server-side only and never returned
 by the API.
 """
 
@@ -17,13 +17,9 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
+from . import timing
 from .config import check_base_url
 from .portainer import PortainerClient
-
-DEFAULT_DATA_PATH = "/data/instances.json"
-# Longer than any one job can run (a helper gets fifteen minutes), so a
-# replaced client is never closed under something still using it.
-RETIRE_AFTER_SECONDS = 20 * 60
 
 
 def destination(url: str) -> str:
@@ -93,8 +89,8 @@ def _write_private(path: Path, text: str) -> None:
 
 
 class InstanceStore:
-    def __init__(self, path: str | Path | None = None):
-        self.path = Path(path or os.environ.get("DATA_PATH", DEFAULT_DATA_PATH))
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
         self._lock = asyncio.Lock()
         self._records: list[InstanceRecord] = []
         self._next = 1
@@ -256,7 +252,7 @@ class ClientManager:
 
     async def _close_later(self, client: PortainerClient) -> None:
         try:
-            await asyncio.sleep(RETIRE_AFTER_SECONDS)
+            await asyncio.sleep(timing.RETIRE_AFTER_SECONDS)
         finally:
             try:
                 await client.aclose()

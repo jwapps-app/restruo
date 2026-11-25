@@ -13,9 +13,9 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from email.message import EmailMessage
 
-logger = logging.getLogger("restruo.updates")
+from . import timing
 
-SMTP_TIMEOUT = 30
+logger = logging.getLogger("restruo.notifiers")
 
 
 @dataclass(frozen=True)
@@ -78,10 +78,10 @@ class EmailNotifier(Notifier):
         if security == "ssl":
             server = smtplib.SMTP_SSL(
                 self.config.host, self.config.port,
-                timeout=SMTP_TIMEOUT, context=ssl.create_default_context(),
+                timeout=timing.SMTP_TIMEOUT, context=ssl.create_default_context(),
             )
         else:
-            server = smtplib.SMTP(self.config.host, self.config.port, timeout=SMTP_TIMEOUT)
+            server = smtplib.SMTP(self.config.host, self.config.port, timeout=timing.SMTP_TIMEOUT)
         try:
             if security == "starttls":
                 server.starttls(context=ssl.create_default_context())

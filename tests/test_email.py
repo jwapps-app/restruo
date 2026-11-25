@@ -8,6 +8,7 @@ import pytest
 
 from app.config import EmailConfig
 from app.notifiers import EmailNotifier, UpdateEvent, build_notifiers, compose_body
+from tests.fakes import update_settings
 
 
 class FakeSMTP(threading.Thread):
@@ -105,7 +106,7 @@ async def test_send_failure_is_raised_so_the_checker_can_retry():
     notifier = EmailNotifier(config)
     with pytest.raises(Exception):
         await notifier.send(EVENTS)
-    checker = UpdateChecker(lambda: [], registry=None, interval_hours=6, notifiers=[notifier])
+    checker = UpdateChecker(lambda: [], None, update_settings(), notifiers=[notifier])
     checker.results = [{"instance": {"id": 1, "name": "n"}, "stacks": [
         {"id": 1, "name": "s", "images": [{"image": "x:latest", "status": "update-available"}]}],
         "containers": []}]

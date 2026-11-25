@@ -12,19 +12,12 @@ import logging
 import time
 from pathlib import Path
 
+from .config import UpdatesConfig
+from .errors import RegistryError, describe
+from .inventory import StackEntry, read_inventory
 from .notifiers import Notifier, UpdateEvent
-from .portainer import (
-    PortainerClient,
-    normalize_container,
-    profiled_images,
-    resolve_image_name,
-    stack_containers,
-    stack_env,
-    stack_images,
-    stack_names_by_endpoint,
-    standalone_containers,
-)
-from .registry import RegistryClient, RegistryError, parse_image_ref
+from .portainer import PortainerClient, normalize_container, profiled_images, stack_env
+from .registry import RegistryClient, parse_image_ref
 
 logger = logging.getLogger("restruo.updates")
 
@@ -37,36 +30,24 @@ STATUS_PRIVATE = "private"
 STATUS_NOT_DEPLOYED = "not-deployed"
 
 
-def describe_error(exc: Exception) -> str:
-    """Some failures stringify to nothing — httpx timeouts in particular — so
-    always name the exception type. An error you can't read is a bug report you
-    can't act on."""
-    if isinstance(exc, RegistryError):
-        text = str(exc).strip()
-        return text or f"HTTP {exc.status_code}"
-    text = str(exc).strip()
-    name = type(exc).__name__
-    return f"{name}: {text}" if text else name
-
-
 class UpdateChecker:
     def __init__(
         self,
         get_clients,
         registry: RegistryClient,
-        interval_hours: float,
+        settings: UpdatesConfig,
         notifiers: list[Notifier] | None = None,
-        floating_tags: tuple[str, ...] | list[str] = ("latest",),
         state_path: Path | None = None,
-        check_version_tags: bool = False,
     ):
         # get_clients: callable returning [(instance_id, PortainerClient), ...],
         # so the checker always sees the current set of managed instances.
         self.get_clients = get_clients
-        self.floating_tags = set(floating_tags)
-        self.check_version_tags = check_version_tags
+        # settings is config.updates: which tags float, whether version tags
+        # are checked too, and how often a scheduled check runs.
+        self.floating_tags = set(settings.floating_tags)
+        self.check_version_tags = settings.check_version_tags
         self.registry = registry
-        self.interval_hours = interval_hours
+        self.interval_hours = settings.interval_hours
         self.notifiers = notifiers or []
         self.checked_at: float | None = None
         self.results: list[dict] = []
@@ -96,36 +77,6 @@ class UpdateChecker:
             task = asyncio.ensure_future(client.get_image_info(endpoint_id, image))
             self._inspect_tasks[key] = task
         return await task
-
-    async def _container_info(
-        self, client: PortainerClient, endpoint_id: int, container_id: str
-    ) -> dict:
-        key = (id(client), endpoint_id, "container", container_id)
-        task = self._inspect_tasks.get(key)
-        if task is None:
-            task = asyncio.ensure_future(
-                client.get_container_info(endpoint_id, container_id)
-            )
-            self._inspect_tasks[key] = task
-        return await task
-
-    async def _container_ref(
-        self, client: PortainerClient, endpoint_id: int, container: dict
-    ) -> str:
-        """What this container was created from.
-
-        A container whose tag has since been re-pulled reports a bare image id,
-        which matches no image name — so it would silently drop out of the
-        comparison it most needs to be in.
-        """
-        ref = container.get("Image") or ""
-        if not ref.startswith("sha256:"):
-            return ref
-        try:
-            info = await self._container_info(client, endpoint_id, container.get("Id") or "")
-            return ((info.get("Config") or {}).get("Image") or "").strip() or ref
-        except Exception:
-            return ref
 
     def _load_notified(self) -> set[tuple]:
         if self._state_path is None or not self._state_path.is_file():
@@ -160,19 +111,17 @@ class UpdateChecker:
         last = base.rsplit("/", 1)[-1]
         return base if ":" in last else f"{base}:latest"
 
-    async def _running_image_ids(
-        self, client: PortainerClient, endpoint_id: int, raw: str, containers: list[dict]
-    ) -> set[str] | None:
+    def _running_image_ids(self, raw: str, containers: list[dict], ref_of) -> set[str] | None:
         """Image ids of the containers running this reference, or None if none
-        of them do."""
+        of them do. `ref_of(container)` is the reference a container was
+        created from — its Image field is a bare id once its tag has moved,
+        which matches no image name, and that container is the one that most
+        needs to be in this comparison."""
         wanted = self._normalize_image(raw)
-        ids: set[str] = set()
-        for container in containers:
-            if not container.get("ImageID"):
-                continue
-            ref = await self._container_ref(client, endpoint_id, container)
-            if self._normalize_image(ref) == wanted:
-                ids.add(container["ImageID"])
+        ids = {
+            container["ImageID"] for container in containers
+            if container.get("ImageID") and self._normalize_image(ref_of(container)) == wanted
+        }
         return ids or None
 
     async def _running_digests(
@@ -197,7 +146,8 @@ class UpdateChecker:
         return out
 
     async def _check_image(
-        self, client: PortainerClient, endpoint_id: int, raw: str, containers: list[dict]
+        self, client: PortainerClient, endpoint_id: int, raw: str, containers: list[dict],
+        ref_of,
     ) -> dict:
         ref = parse_image_ref(raw)
         if ref is None:
@@ -220,12 +170,12 @@ class UpdateChecker:
         # Local first: an image with no repo digest never came from a registry
         # (built on the box, or created by the NAS itself), so there is nothing
         # to compare against and no point asking a registry about it.
-        running_ids = await self._running_image_ids(client, endpoint_id, raw, containers)
+        running_ids = self._running_image_ids(raw, containers, ref_of)
         try:
             per_image = await self._running_digests(client, endpoint_id, running_ids)
         except Exception as exc:
             return {"image": raw, "status": STATUS_UNKNOWN,
-                    "detail": f"running image: {describe_error(exc)}"}
+                    "detail": f"running image: {describe(exc)}"}
         local_digests = set().union(*per_image.values()) if per_image else None
         if local_digests is None:
             # No matching container found — fall back to what the tag points at.
@@ -236,7 +186,7 @@ class UpdateChecker:
                 }
             except Exception as exc:
                 return {"image": raw, "status": STATUS_UNKNOWN,
-                        "detail": f"local image: {describe_error(exc)}"}
+                        "detail": f"local image: {describe(exc)}"}
 
         if not local_digests:
             # No repo digest at all. Either the image was built on the box, or
@@ -275,10 +225,10 @@ class UpdateChecker:
                 return {"image": raw, "status": STATUS_UNKNOWN,
                         "detail": f"{ref.registry} is rate-limiting this address — try again later"}
             return {"image": raw, "status": STATUS_UNKNOWN,
-                    "detail": f"{ref.registry}: {describe_error(exc)}"}
+                    "detail": f"{ref.registry}: {describe(exc)}"}
         except Exception as exc:
             return {"image": raw, "status": STATUS_UNKNOWN,
-                    "detail": f"{ref.registry}: {describe_error(exc)}"}
+                    "detail": f"{ref.registry}: {describe(exc)}"}
 
         behind = ({i for i, d in (per_image or {}).items() if remote_digest not in d}
                   if per_image else ({"tag"} if remote_digest not in local_digests else set()))
@@ -310,84 +260,52 @@ class UpdateChecker:
             "error": None,
         }
         try:
-            stacks = await client.list_stacks()
+            inventory = await read_inventory(client)
         except Exception as exc:
-            result["error"] = str(exc)
+            result["error"] = describe(exc)
             return result
-
-        container_tasks: dict[int, asyncio.Task] = {}
-        listing_errors: dict[int, str] = {}
-
-        def containers_for(endpoint_id: int) -> asyncio.Task:
-            if endpoint_id not in container_tasks:
-                async def fetch() -> list[dict]:
-                    try:
-                        return await client.list_containers(endpoint_id)
-                    except Exception as exc:
-                        # Not "no containers": "could not look". Everything
-                        # on this environment reads as unchecked, not as fine.
-                        listing_errors[endpoint_id] = describe_error(exc)
-                        return []
-                container_tasks[endpoint_id] = asyncio.ensure_future(fetch())
-            return container_tasks[endpoint_id]
 
         # Be gentle with each Portainer: bounded concurrency per instance.
         semaphore = asyncio.Semaphore(6)
 
         async def check_image_bounded(endpoint_id: int, raw: str, containers: list[dict]) -> dict:
-            async with semaphore:
-                return await self._check_image(client, endpoint_id, raw, containers)
+            def ref_of(container: dict) -> str:
+                return inventory.ref(endpoint_id, container)
 
-        async def check_stack(stack: dict) -> dict:
-            own_containers = stack_containers(
-                stack, await containers_for(stack["EndpointId"])
-            )
-            if stack["EndpointId"] in listing_errors:
-                reason = listing_errors[stack["EndpointId"]]
-                content = ""
-                try:
-                    content = await client.get_stack_file(stack["Id"])
-                except Exception:
-                    pass
+            async with semaphore:
+                return await self._check_image(client, endpoint_id, raw, containers, ref_of)
+
+        async def check_stack(entry: StackEntry) -> dict:
+            stack, endpoint_id = entry.stack, entry.stack["EndpointId"]
+            if endpoint_id in inventory.container_errors:
+                # Not "no containers": "could not look". Everything on this
+                # environment reads as unchecked, not as fine.
+                reason = inventory.container_errors[endpoint_id]
                 return {
                     "id": stack["Id"], "name": stack.get("Name", ""),
                     "images": [{"image": raw, "status": STATUS_UNKNOWN,
                                 "detail": f"could not list this environment's containers: {reason}"}
-                               for raw in stack_images(stack, content, [])],
+                               for raw in entry.images],
                     "updatesAvailable": 0,
                 }
-            # Every stack is checked at once; without the semaphore here, a
-            # Portainer with thirty stacks gets thirty file fetches in the same
-            # instant before any image check has even started.
-            async with semaphore:
-                try:
-                    content = await client.get_stack_file(stack["Id"])
-                except Exception:
-                    content = ""
-            images = stack_images(stack, content, own_containers)
             # A service behind a compose profile is never started by Portainer:
             # its image is declared but not deployed, and there is nothing on
             # the host to compare. Say so instead of reporting a failed check.
-            inactive = profiled_images(content, stack_env(stack))
-
-            async def runs_in_this_stack(raw: str) -> bool:
-                wanted = self._normalize_image(raw)
-                for c in own_containers:
-                    ref = await self._container_ref(client, stack["EndpointId"], c)
-                    if self._normalize_image(ref) == wanted:
-                        return True
-                return False
+            inactive = profiled_images(entry.file, stack_env(stack))
+            running = {
+                self._normalize_image(inventory.ref(endpoint_id, c)) for c in entry.containers
+            }
 
             async def check_or_skip(raw: str) -> dict:
                 # Behind a profile — unless some active service runs the same
                 # image, in which case there is a container to check.
-                if raw in inactive and not await runs_in_this_stack(raw):
+                if raw in inactive and self._normalize_image(raw) not in running:
                     return {"image": raw, "status": STATUS_NOT_DEPLOYED,
                             "detail": "service is behind a compose profile, which "
                                       "Portainer never activates — not running"}
-                return await check_image_bounded(stack["EndpointId"], raw, own_containers)
+                return await check_image_bounded(endpoint_id, raw, entry.containers)
 
-            checked = list(await asyncio.gather(*(check_or_skip(raw) for raw in images)))
+            checked = list(await asyncio.gather(*(check_or_skip(raw) for raw in entry.images)))
             return {
                 "id": stack["Id"],
                 "name": stack.get("Name", ""),
@@ -397,42 +315,22 @@ class UpdateChecker:
                 ),
             }
 
-        result["stacks"] = list(await asyncio.gather(*(check_stack(s) for s in stacks)))
-
-        # Containers that live outside any Portainer stack.
-        names_by_endpoint = stack_names_by_endpoint(stacks)
-        environments: dict[int, str] = {}
-        try:
-            endpoints = await client.list_endpoints()
-            endpoint_ids = [e["Id"] for e in endpoints]
-            environments = {
-                e["Id"]: e.get("Name") or f"env {e['Id']}" for e in endpoints
-            }
-        except Exception:
-            endpoint_ids = list(container_tasks)
-
-        async def check_standalone(endpoint_id: int, raw_container: dict) -> dict:
-            normalized = normalize_container(raw_container, endpoint_id)
-            normalized["image"] = await resolve_image_name(
-                client, endpoint_id, raw_container
-            )
-            checked = await check_image_bounded(
-                endpoint_id, normalized["image"], [raw_container]
-            )
-            environment = environments.get(endpoint_id)
+        async def check_standalone(endpoint_id: int, container: dict) -> dict:
+            normalized = normalize_container(container, endpoint_id)
+            normalized["image"] = inventory.ref(endpoint_id, container)
+            checked = await check_image_bounded(endpoint_id, normalized["image"], [container])
+            environment = inventory.environments.get(endpoint_id)
             return {**normalized, **checked,
                     **({"environment": environment} if environment else {})}
 
-        standalone_jobs = []
-        for endpoint_id in endpoint_ids:
-            for raw_container in standalone_containers(
-                await containers_for(endpoint_id), names_by_endpoint.get(endpoint_id, set())
-            ):
-                standalone_jobs.append(check_standalone(endpoint_id, raw_container))
-        result["containers"] = list(await asyncio.gather(*standalone_jobs))
-        if listing_errors:
+        result["stacks"], result["containers"] = await asyncio.gather(
+            asyncio.gather(*(check_stack(entry) for entry in inventory.stacks)),
+            asyncio.gather(*(check_standalone(e, c) for e, c in inventory.standalone)),
+        )
+        if inventory.container_errors:
             result["environmentErrors"] = {
-                environments.get(eid, f"env {eid}"): reason for eid, reason in listing_errors.items()
+                inventory.environment_name(endpoint_id): reason
+                for endpoint_id, reason in inventory.container_errors.items()
             }
         return result
 

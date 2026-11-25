@@ -8,7 +8,8 @@ unhealthy, settles just the same. Only replaced AND working is a success.
 """
 import pytest
 
-import app.main as main
+from app import timing
+from app.outcome import await_deploy, fingerprint, stack_containers_now
 
 
 class FakeClient:
@@ -34,14 +35,14 @@ def container(cid, status="Up 2 seconds", state="running", image="sha256:img"):
 
 @pytest.fixture(autouse=True)
 def _fast_polling(monkeypatch):
-    monkeypatch.setattr(main, "DEPLOY_POLL_SECONDS", 0.001)
-    monkeypatch.setattr(main, "DEPLOY_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(timing, "DEPLOY_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(timing, "DEPLOY_TIMEOUT_SECONDS", 1.0)
 
 
 async def run(listings):
     client = FakeClient(listings)
-    before = main._fingerprint(await main._stack_containers_now(client, STACK))
-    return await main._await_deploy(client, STACK, before)
+    before = fingerprint(await stack_containers_now(client, STACK))
+    return await await_deploy(client, STACK, before)
 
 
 @pytest.mark.asyncio
@@ -72,8 +73,8 @@ async def test_a_deploy_still_running_at_the_timeout_is_not_called_done():
             return [container(f"c{NeverSettles.calls}")]
 
     client = NeverSettles()
-    before = main._fingerprint(await main._stack_containers_now(client, STACK))
-    outcome = await main._await_deploy(client, STACK, before)
+    before = fingerprint(await stack_containers_now(client, STACK))
+    outcome = await await_deploy(client, STACK, before)
     assert outcome["ok"] is False and "not confirmed" in outcome["message"]
 
 
@@ -123,6 +124,6 @@ async def test_transient_listing_error_is_ignored_not_read_as_a_change():
             return same
 
     client = Flaky()
-    before = main._fingerprint(await main._stack_containers_now(client, STACK))
-    outcome = await main._await_deploy(client, STACK, before)
+    before = fingerprint(await stack_containers_now(client, STACK))
+    outcome = await await_deploy(client, STACK, before)
     assert outcome["ok"] is False and "nothing about the stack's containers changed" in outcome["message"]

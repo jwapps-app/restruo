@@ -11,13 +11,14 @@ all: "network … not found". Both halves were confirmed against a real Engine.
 """
 import pytest
 
-import app.main as main
+from app import timing
+from app.outcome import await_container
 from app.portainer import networks_safe_to_remove
 
 
 @pytest.fixture(autouse=True)
 def _fast(monkeypatch):
-    monkeypatch.setattr(main, "CONTAINER_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(timing, "CONTAINER_POLL_SECONDS", 0.001)
 
 
 class Host:
@@ -58,7 +59,7 @@ ARCANE_LOG = ('2026/11/14 22:25:19 \x1b[31mERROR\x1b[0m Failed to run Arcane err
 
 @pytest.mark.asyncio
 async def test_a_container_that_exits_is_a_failure_with_its_own_explanation():
-    outcome = await main._await_container(Host([up(), exited(1)], ARCANE_LOG), 18, "arcane")
+    outcome = await await_container(Host([up(), exited(1)], ARCANE_LOG), 18, "arcane")
     assert outcome["ok"] is False
     assert "exited right away (exit code 1)" in outcome["message"]
     assert "rename APP_URL to ARCANE_APP_URL" in outcome["message"]
@@ -68,43 +69,43 @@ async def test_a_container_that_exits_is_a_failure_with_its_own_explanation():
 @pytest.mark.asyncio
 async def test_a_crash_loop_is_a_failure_even_while_it_reads_as_running():
     """restart: unless-stopped — between crashes the container is 'running'."""
-    outcome = await main._await_container(Host([up(restarts=3)], ARCANE_LOG), 18, "arcane")
+    outcome = await await_container(Host([up(restarts=3)], ARCANE_LOG), 18, "arcane")
     assert outcome["ok"] is False and "keeps crashing and restarting" in outcome["message"]
 
 
 @pytest.mark.asyncio
 async def test_a_container_that_stays_up_is_a_success():
     host = Host([up()])
-    outcome = await main._await_container(host, 18, "arcane")
+    outcome = await await_container(host, 18, "arcane")
     assert outcome == {"ok": True, "message": "Repulled and recreated — running."}
-    assert host.calls == main.CONTAINER_STABLE_POLLS, "watched for several polls, not one"
+    assert host.calls == timing.CONTAINER_STABLE_POLLS, "watched for several polls, not one"
 
 
 @pytest.mark.asyncio
 async def test_unhealthy_is_a_failure_and_a_passing_healthcheck_is_waited_for():
-    sick = await main._await_container(Host([up("starting"), up("unhealthy")]), 18, "arcane")
+    sick = await await_container(Host([up("starting"), up("unhealthy")]), 18, "arcane")
     assert sick["ok"] is False and "health check" in sick["message"]
-    well = await main._await_container(Host([up("starting"), up("starting"), up("healthy")]), 18, "arcane")
+    well = await await_container(Host([up("starting"), up("starting"), up("healthy")]), 18, "arcane")
     assert well["ok"] is True
 
 
 @pytest.mark.asyncio
 async def test_a_slow_healthcheck_is_not_called_a_failure():
-    outcome = await main._await_container(Host([up("starting")]), 18, "arcane")
+    outcome = await await_container(Host([up("starting")]), 18, "arcane")
     assert outcome["ok"] is True and "health check had not finished" in outcome["message"]
 
 
 @pytest.mark.asyncio
 async def test_a_one_shot_container_that_finishes_cleanly_is_fine():
-    outcome = await main._await_container(Host([exited(0)]), 18, "arcane")
+    outcome = await await_container(Host([exited(0)]), 18, "arcane")
     assert outcome["ok"] is True and "finished cleanly" in outcome["message"]
 
 
 @pytest.mark.asyncio
 async def test_failed_polls_are_ignored_and_a_missing_container_is_reported():
-    flaky = await main._await_container(Host([RuntimeError("proxy"), up()]), 18, "arcane")
+    flaky = await await_container(Host([RuntimeError("proxy"), up()]), 18, "arcane")
     assert flaky["ok"] is True
-    gone = await main._await_container(Host([up()], name="something-else"), 18, "arcane")
+    gone = await await_container(Host([up()], name="something-else"), 18, "arcane")
     assert gone["ok"] is False and "could not be found" in gone["message"]
 
 

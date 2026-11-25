@@ -1,45 +1,32 @@
-"""Restruo — multi-instance Portainer stack updater dashboard."""
+"""Restruo — multi-instance Portainer stack updater dashboard.
+
+This module is the HTTP surface and the wiring. A route parses the request,
+calls one function and shapes the response; what the buttons do lives in
+actions.py, what may run at once in operations.py, and who may ask in auth.py.
+"""
 
 import asyncio
-import json
 import logging
-import os
-import re
-import secrets
-import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.security import HTTPBasicCredentials
 from pydantic import BaseModel, ConfigDict
 
-from .auth import SESSION_COOKIE, SESSION_TTL_SECONDS, LoginLimiter, SessionManager
+from . import actions, auth, timing
+from .actions import Actions
+from .auth import SESSION_COOKIE, SESSION_TTL_SECONDS, LoginLimiter, SessionManager, require_auth
 from .config import AppConfig, load_config
+from .dashboard import instance_view
+from .errors import Refused, describe
+from .helper_runner import default_helper_image
 from .instances import ClientManager, InstanceRecord, InstanceStore, destination
 from .notifiers import EmailNotifier, UpdateEvent, build_notifiers, compose_body
-from .portainer import (
-    PortainerClient,
-    PortainerError,
-    container_is_down,
-    container_name,
-    cannot_recreate_image,
-    extract_images,
-    interpolate,
-    profiled_images,
-    registry_id_for,
-    stack_env,
-    is_self_critical_image,
-    normalize_container,
-    normalize_stack,
-    resolve_image_name,
-    stack_containers,
-    stack_images,
-    stack_names_by_endpoint,
-    standalone_containers,
-)
+from .operations import Job, Operations
+from .portainer import PortainerClient
 from .registry import RegistryClient
 from .updates import UpdateChecker
 
@@ -49,14 +36,15 @@ logger = logging.getLogger("restruo")
 def _configure_logging() -> None:
     """Uvicorn sets up its own loggers and nothing else, so the app's INFO
     lines — the operation log, "Emailed N updates", the instance import —
-    went nowhere. Give the app's logger a handler of its own, once."""
+    went nowhere. Give the app's logger a handler of its own, once. The level
+    is INFO until the lifespan has read the configured one."""
     root = logging.getLogger("restruo")
     if root.handlers:
         return
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s: %(message)s"))
     root.addHandler(handler)
-    root.setLevel(os.environ.get("RESTRUO_LOG_LEVEL", "INFO").upper())
+    root.setLevel(logging.INFO)
     root.propagate = False
 
 
@@ -69,12 +57,10 @@ WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 async def lifespan(app: FastAPI):
     config: AppConfig = getattr(app.state, "config", None) or load_config()
     app.state.config = config
+    logger.setLevel(config.log_level)
 
-    store: InstanceStore = getattr(app.state, "store", None) or InstanceStore()
+    store: InstanceStore = getattr(app.state, "store", None) or InstanceStore(config.data_path)
     app.state.store = store
-    # Redeploys in progress, so a second request for the same one is refused
-    # with a reason instead of colliding inside Portainer.
-    app.state.in_flight: set = set()
     if not store.exists and config.instances:
         # One-time import of instances defined in config.yaml.
         await store.seed(
@@ -98,8 +84,6 @@ async def lifespan(app: FastAPI):
         store.path.parent / "session_secret", config.ui.auth.password
     )
     app.state.limiter = LoginLimiter()
-    # Redeploys that outlived the request that started them; see _run_job.
-    app.state.jobs: dict[str, dict] = {}
 
     app.state.registry = RegistryClient(credentials={
         host: (creds.split(":", 1)[0], creds.split(":", 1)[1])
@@ -108,11 +92,16 @@ async def lifespan(app: FastAPI):
     app.state.checker = UpdateChecker(
         manager.items,
         app.state.registry,
-        interval_hours=config.updates.interval_hours,
+        config.updates,
         notifiers=build_notifiers(config),
-        floating_tags=config.updates.floating_tags,
         state_path=store.path.parent / "notified.json",
-        check_version_tags=config.updates.check_version_tags,
+    )
+    # What is running right now, and the jobs that outlived their request.
+    app.state.ops = Operations()
+    app.state.actions = Actions(
+        app.state.ops,
+        app.state.checker,
+        helper_image=config.helper_image or default_helper_image(config.version),
     )
     checker_task = None
     if config.updates.enabled:
@@ -146,6 +135,13 @@ async def validation_error_without_the_input(request: Request, exc: RequestValid
     return JSONResponse(status_code=422, content={"detail": errors})
 
 
+@app.exception_handler(Refused)
+async def refused(request: Request, exc: Refused):
+    """An action that was not attempted, answered the way FastAPI answers an
+    HTTPException: the reason in `detail`."""
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+
 @app.middleware("http")
 async def response_headers(request: Request, call_next):
     """Live state must never be served from a browser cache — a stale
@@ -161,93 +157,6 @@ async def response_headers(request: Request, call_next):
     response.headers["Referrer-Policy"] = "same-origin"
     return response
 
-_basic = HTTPBasic(auto_error=False)
-
-
-def _credentials_valid(request: Request, username: str, password: str) -> bool:
-    auth = request.app.state.config.ui.auth
-    return (
-        secrets.compare_digest(username.encode(), auth.username.encode())
-        and secrets.compare_digest(password.encode(), (auth.password or "").encode())
-    )
-
-
-SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
-# A cookie-authenticated request that changes something must carry this
-# header. A form or a no-cors fetch from another page cannot add a custom
-# header, so it cannot ride the session cookie — which SameSite=Lax alone does
-# not prevent from a page on another port of the same host. Basic-auth callers
-# (curl, scripts) never carry the cookie and are unaffected.
-CSRF_HEADER = "X-Restruo"
-
-
-def _client_addr(request: Request) -> str:
-    return request.client.host if request.client else "unknown"
-
-
-def _is_https(request: Request) -> bool:
-    return request.url.scheme == "https" or \
-        request.headers.get("x-forwarded-proto", "").lower() == "https"
-
-
-def _session_valid(request: Request) -> bool:
-    token = request.cookies.get(SESSION_COOKIE)
-    return bool(token) and request.app.state.sessions.verify(token)
-
-
-def _require_csrf_header(request: Request) -> None:
-    if request.method in SAFE_METHODS:
-        return
-    if request.headers.get(CSRF_HEADER) != "1":
-        raise HTTPException(
-            status_code=403,
-            detail=f"Missing {CSRF_HEADER} header — a browser session must send it "
-                   "on every request that changes something.",
-        )
-
-
-def _basic_auth_ok(request: Request, credentials: HTTPBasicCredentials | None) -> bool:
-    if credentials is None:
-        return False
-    limiter: LoginLimiter = request.app.state.limiter
-    addr = _client_addr(request)
-    if limiter.blocked(addr):
-        raise HTTPException(
-            status_code=429, detail="Too many failed logins — try again later."
-        )
-    if _credentials_valid(request, credentials.username, credentials.password):
-        limiter.reset(addr)
-        return True
-    limiter.record_failure(addr)
-    logger.warning("Failed login for %r from %s", credentials.username, addr)
-    return False
-
-
-def require_auth(request: Request, credentials: HTTPBasicCredentials | None = Depends(_basic)):
-    auth = request.app.state.config.ui.auth
-    if not auth.enabled:
-        return
-    if _session_valid(request):
-        _require_csrf_header(request)
-        return
-    if _basic_auth_ok(request, credentials):
-        return
-    # No WWW-Authenticate header: the app has its own login form, and the
-    # header would make browsers pop the (slow) native basic-auth dialog.
-    raise HTTPException(status_code=401, detail="Unauthorized")
-
-
-def _authenticated(request: Request, credentials: HTTPBasicCredentials | None) -> bool:
-    """Like require_auth, but a question rather than a gate."""
-    if not request.app.state.config.ui.auth.enabled:
-        return True
-    if _session_valid(request):
-        return True
-    try:
-        return _basic_auth_ok(request, credentials)
-    except HTTPException:
-        return False
-
 
 class LoginRequest(BaseModel):
     model_config = ConfigDict(hide_input_in_errors=True)
@@ -258,20 +167,10 @@ class LoginRequest(BaseModel):
 
 @app.post("/api/login")
 async def login(request: Request, body: LoginRequest):
-    auth = request.app.state.config.ui.auth
-    if auth.enabled:
-        limiter: LoginLimiter = request.app.state.limiter
-        addr = _client_addr(request)
-        if limiter.blocked(addr):
-            raise HTTPException(
-                status_code=429, detail="Too many failed logins — try again later."
-            )
-        if not _credentials_valid(request, body.username, body.password):
-            limiter.record_failure(addr)
-            logger.warning("Failed login for %r from %s", body.username, addr)
+    if request.app.state.config.ui.auth.enabled:
+        if not auth.check_login(request, body.username, body.password):
             await asyncio.sleep(1)
             raise HTTPException(status_code=401, detail="Wrong username or password.")
-        limiter.reset(addr)
     response = JSONResponse({"ok": True})
     response.set_cookie(
         SESSION_COOKIE,
@@ -279,15 +178,15 @@ async def login(request: Request, body: LoginRequest):
         max_age=SESSION_TTL_SECONDS,
         httponly=True,
         samesite="lax",
-        secure=_is_https(request),
+        secure=auth.is_https(request),
     )
     return response
 
 
 @app.post("/api/logout")
 async def logout(request: Request):
-    if _session_valid(request):
-        _require_csrf_header(request)
+    if auth.session_valid(request):
+        auth.require_csrf_header(request)
     response = JSONResponse({"ok": True})
     response.delete_cookie(SESSION_COOKIE)
     return response
@@ -295,6 +194,38 @@ async def logout(request: Request):
 
 def _manager(request: Request) -> ClientManager:
     return request.app.state.manager
+
+
+def _get_client(request: Request, iid: int) -> PortainerClient:
+    client = _manager(request).get(iid)
+    if client is None:
+        raise HTTPException(status_code=404, detail=f"No instance with id {iid}")
+    return client
+
+
+def _actions(request: Request) -> Actions:
+    return request.app.state.actions
+
+
+def _audit(request: Request, what: str, *args) -> None:
+    """One line per change made through the API, with where it came from.
+    Failed logins were already logged; the things a login lets you do were not."""
+    logger.info("[%s] " + what, auth.client_addr(request), *args)
+
+
+def _result_response(result: dict) -> JSONResponse:
+    """Every action answers with the same body; the status says how it went."""
+    return JSONResponse(status_code=200 if result.get("ok") else 502, content=result)
+
+
+def _job_response(job: Job) -> JSONResponse:
+    """The result when the work was quick, otherwise an id to ask about."""
+    if not job.done:
+        return JSONResponse(status_code=202, content={
+            "ok": None, "jobId": job.id,
+            "message": "Still deploying — Restruo keeps watching it.",
+        })
+    return _result_response(job.result or {"ok": False, "message": "No result recorded."})
 
 
 @app.get("/healthz")
@@ -334,8 +265,6 @@ async def _probe_record(record: InstanceRecord) -> dict:
     try:
         endpoints = await client.list_endpoints()
         return {"ok": True, "error": None, "endpoints": len(endpoints)}
-    except PortainerError as exc:
-        return {"ok": False, "error": exc.message, "endpoints": 0}
     except Exception as exc:
         return {"ok": False, "error": describe(exc), "endpoints": 0}
     finally:
@@ -349,27 +278,15 @@ async def list_instances(request: Request):
         entry = {**record.public(), "reachable": True, "error": None}
         try:
             await client.list_endpoints()
-        except PortainerError as exc:
-            entry.update(reachable=False, error=exc.message)
-            logger.warning("Instance %r unreachable: %s", record.name, exc.message)
-            await client.reconnect()
         except Exception as exc:
             entry.update(reachable=False, error=describe(exc))
-            logger.warning(
-                "Instance %r unreachable: %s: %s", record.name, type(exc).__name__, exc
-            )
+            logger.warning("Instance %r unreachable: %s", record.name, describe(exc))
             await client.reconnect()
         return entry
 
     return await asyncio.gather(
         *(probe(iid, client) for iid, client in _manager(request).items())
     )
-
-
-def _audit(request: Request, what: str, *args) -> None:
-    """One line per change made through the API, with where it came from.
-    Failed logins were already logged; the things a login lets you do were not."""
-    logger.info("[%s] " + what, _client_addr(request), *args)
 
 
 @app.post("/api/instances", dependencies=[Depends(require_auth)])
@@ -449,632 +366,42 @@ async def test_instance(request: Request, body: InstanceInput, id: int | None = 
     try:
         record = InstanceRecord.model_validate({**fields, "id": 0})
     except ValueError as exc:
-        return {"ok": False, "error": describe(exc), "endpoints": 0}
+        # Not a failure to report but the form's own mistake, in pydantic's words.
+        return {"ok": False, "error": str(exc), "endpoints": 0}
     return await _probe_record(record)
 
 
 # --- stacks -------------------------------------------------------------------
 
 
-DASHBOARD_CONCURRENCY = 6
-
-
-async def _stacks_for_instance(iid: int, name: str, client: PortainerClient) -> dict:
-    result = {
-        "instance": {"id": iid, "name": name},
-        "stacks": [],
-        "containers": [],
-        "reachable": True,
-        "error": None,
-    }
-    try:
-        stacks = await client.list_stacks()
-    except PortainerError as exc:
-        result.update(reachable=False, error=exc.message)
-        logger.warning("Instance %r unreachable: %s", name, exc.message)
-        # Whatever went wrong, start the next poll from a clean connection and
-        # a fresh login — the same reset that re-saving the instance performs.
-        await client.reconnect()
-        return result
-    except Exception as exc:
-        result.update(reachable=False, error=describe(exc))
-        logger.warning(
-            "Instance %r unreachable: %s: %s", name, type(exc).__name__, exc
-        )
-        await client.reconnect()
-        return result
-
-    async def images_for(stack: dict, own: list[dict]) -> list[str]:
-        try:
-            content = await client.get_stack_file(stack["Id"])
-        except Exception:
-            return []
-        return stack_images(stack, content, own)
-
-    containers_by_endpoint: dict[int, list[dict]] = {}
-    # One Portainer can manage several environments (agents, remote hosts) —
-    # keep their names so each row can say where it actually runs.
-    environments: dict[int, str] = {}
-    # What could not be read is reported as such — never as "nothing there".
-    environment_errors: dict[str, str] = {}
-    try:
-        endpoints = await client.list_endpoints()
-    except Exception as exc:
-        endpoints = []
-        environment_errors["(all)"] = f"could not list environments: {describe(exc)}"
-    for endpoint in endpoints:
-        environments[endpoint["Id"]] = endpoint.get("Name") or f"env {endpoint['Id']}"
-
-    async def containers_of(endpoint_id: int) -> tuple[int, list[dict] | None, str | None]:
-        try:
-            return endpoint_id, await client.list_containers(endpoint_id), None
-        except Exception as exc:
-            return endpoint_id, None, describe(exc)
-
-    # Environments are independent hosts; asking them one after another
-    # makes the page wait on the slowest agent times the number of agents.
-    for endpoint_id, containers, error in await asyncio.gather(
-        *(containers_of(e["Id"]) for e in endpoints)
-    ):
-        if containers is not None:
-            containers_by_endpoint[endpoint_id] = containers
-        else:
-            environment_errors[environments[endpoint_id]] = f"could not list containers: {error}"
-    result["environments"] = len(environments)
-    result["environmentErrors"] = environment_errors
-
-    owned = [
-        stack_containers(stack, containers_by_endpoint.get(stack.get("EndpointId"), []))
-        for stack in stacks
-    ]
-    # Thirty stacks at once is thirty file fetches in the same instant at one
-    # Portainer; a few at a time is plenty for a page load.
-    gate = asyncio.Semaphore(DASHBOARD_CONCURRENCY)
-
-    async def images_gated(stack: dict, own: list[dict]) -> list[str]:
-        async with gate:
-            return await images_for(stack, own)
-
-    image_lists = await asyncio.gather(
-        *(images_gated(stack, own) for stack, own in zip(stacks, owned))
-    )
-    for stack, images, own in zip(stacks, image_lists, owned):
-        normalized = normalize_stack(stack, images)
-        normalized["containersTotal"] = len(own)
-        normalized["downNames"] = [container_name(c) for c in own if container_is_down(c)]
-        # Unknown is not the same as fine.
-        normalized["unchecked"] = stack.get("EndpointId") not in containers_by_endpoint
-        normalized["environment"] = environments.get(stack.get("EndpointId"), "")
-        # Stacks running Portainer or Restruo can't be stopped from here.
-        normalized["selfCritical"] = any(
-            is_self_critical_image(c.get("Image", "")) for c in own
-        ) or any(is_self_critical_image(i) for i in images)
-        normalized["updateProtected"] = any(
-            cannot_recreate_image(c.get("Image", "")) for c in own
-        ) or any(cannot_recreate_image(i) for i in images)
-        result["stacks"].append(normalized)
-
-    # Containers that live outside any Portainer stack.
-    names_by_endpoint = stack_names_by_endpoint(stacks)
-
-    async def standalone_row(endpoint_id: int, c: dict) -> dict:
-        normalized = normalize_container(c, endpoint_id)
-        async with gate:
-            normalized["image"] = await resolve_image_name(client, endpoint_id, c)
-        normalized["environment"] = environments.get(endpoint_id, "")
-        return normalized
-
-    result["containers"] = list(await asyncio.gather(*(
-        standalone_row(endpoint_id, c)
-        for endpoint_id, containers in containers_by_endpoint.items()
-        for c in standalone_containers(containers, names_by_endpoint.get(endpoint_id, set()))
-    )))
-    return result
-
-
 @app.get("/api/stacks", dependencies=[Depends(require_auth)])
 async def list_all_stacks(request: Request):
     return await asyncio.gather(
         *(
-            _stacks_for_instance(iid, client.instance.name, client)
+            instance_view(iid, client.instance.name, client)
             for iid, client in _manager(request).items()
         )
     )
 
 
-def _get_client(request: Request, iid: int) -> PortainerClient:
-    client = _manager(request).get(iid)
-    if client is None:
-        raise HTTPException(status_code=404, detail=f"No instance with id {iid}")
-    return client
-
-
-def _conflicts(key: tuple, held: tuple) -> str | None:
-    """Why `key` cannot run while `held` is in flight, or None if it can.
-
-    Keys: ("stack", iid, eid, sid), ("container", iid, eid, cid),
-    ("agent", iid, eid, cid) for replacing the environment's own agent,
-    ("portainer", iid) for replacing Portainer itself, ("prune", iid).
-    """
-    if key == held:
-        return "an update is already running for this one"
-    if key[1] != held[1]:
-        return None  # different instances never conflict
-    kinds = {key[0], held[0]}
-    if "portainer" in kinds:
-        return "Portainer itself is being replaced on this instance"
-    if "prune" in kinds:
-        return "a clean-up is running on this instance" if held[0] == "prune" \
-            else "an update is running on this instance"
-    if "agent" in kinds and key[2] == held[2]:
-        # Every stack on an environment deploys through its agent.
-        return "this environment's agent is being replaced" if held[0] == "agent" \
-            else "a deploy is running on this environment"
-    return None
-
-
-@asynccontextmanager
-async def _exclusive(request: Request, key: tuple):
-    """One operation at a time per target — and none that would pull the
-    ground from under another: no stack deploy while its environment's agent
-    is being replaced, nothing at all while Portainer itself is, no prune
-    while anything deploys.
-
-    Portainer refuses a second deploy of the same stack while one is running,
-    and answers with a generic "Unable to update stack" — which reads as a
-    failure of the update rather than of the timing. A redeploy can take a
-    minute while compose waits on a healthcheck, which is ample time to click
-    again, or to click from another tab.
-    """
-    in_flight = request.app.state.in_flight
-    for held in in_flight:
-        reason = _conflicts(key, held)
-        if reason:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Not now — {reason}. It takes a moment while Portainer waits "
-                       "for the containers to come up.",
-            )
-    in_flight.add(key)
-    try:
-        yield
-    finally:
-        in_flight.discard(key)
-
-
-# Portainer accepts a stack deploy and returns immediately, running compose in
-# the background — a redeploy the API "completed" in 68ms can still be pulling
-# an image a minute later. So watch the stack's containers until they settle,
-# then check that what settled is actually working, and report that.
-DEPLOY_POLL_SECONDS = 2.0
-DEPLOY_SETTLE_POLLS = 3      # unchanged this many times running = settled
-DEPLOY_TIMEOUT_SECONDS = 600.0
-
-
-async def _stack_containers_now(client: PortainerClient, stack: dict) -> list[dict] | None:
-    """The stack's containers, or None when the listing itself failed — which
-    says nothing about the stack and must not be read as "all gone"."""
-    try:
-        return stack_containers(stack, await client.list_containers(stack["EndpointId"]))
-    except Exception:
-        return None
-
-
-def _fingerprint(containers: list[dict]) -> frozenset:
-    """Identity and state only. Docker's human-readable Status ("Up 5
-    seconds") changes on every poll for a minute, which once made every
-    deploy look like it took exactly that long to settle."""
-    return frozenset((c.get("Id"), c.get("State"), c.get("ImageID")) for c in containers)
-
-
-_EXIT_CODE_RE = re.compile(r"Exited \((\d+)\)")
-
-
-def _container_working(c: dict) -> bool:
-    """Running and not failing its healthcheck — or finished cleanly, which
-    is what a one-shot service (a backup job, a migration) is meant to do."""
-    state = (c.get("State") or "").lower()
-    status = c.get("Status") or ""
-    if state == "running":
-        return "(unhealthy)" not in status
-    if state == "exited":
-        match = _EXIT_CODE_RE.search(status)
-        return bool(match) and match.group(1) == "0"
-    return False
-
-
-async def _await_deploy(client: PortainerClient, stack: dict, before: frozenset) -> dict:
-    """Block until the deploy settles, then judge it. Returns
-    {"ok": bool, "message": str}; ok means the stack's containers were
-    replaced and are all working — nothing less is called a success."""
-    deadline = time.monotonic() + DEPLOY_TIMEOUT_SECONDS
-    changed = False
-    last = before
-    last_containers: list[dict] = []
-    stable = 0
-    while time.monotonic() < deadline:
-        await asyncio.sleep(DEPLOY_POLL_SECONDS)
-        containers = await _stack_containers_now(client, stack)
-        if containers is None:
-            continue
-        current = _fingerprint(containers)
-        if current != last:
-            changed, last, last_containers, stable = True, current, containers, 0
-            continue
-        last_containers = containers
-        if changed:
-            stable += 1
-            if stable >= DEPLOY_SETTLE_POLLS:
-                break
-    else:
-        if not changed:
-            return {"ok": False, "message": (
-                f"Portainer accepted the redeploy, but nothing about the stack's containers "
-                f"changed in {int(DEPLOY_TIMEOUT_SECONDS)}s — not confirmed.")}
-        return {"ok": False, "message": (
-            f"Still changing after {int(DEPLOY_TIMEOUT_SECONDS)}s — the deploy may finish in "
-            "the background, but it is not confirmed. Check the stack in Portainer.")}
-
-    if not last_containers:
-        return {"ok": False, "message": "The deploy settled with no containers in the stack."}
-    broken = [container_name(c) for c in last_containers if not _container_working(c)]
-    if broken:
-        return {"ok": False, "message": (
-            f"Redeployed, but not working: {', '.join(sorted(broken))} "
-            f"({'is' if len(broken) == 1 else 'are'} stopped, restarting, or unhealthy).")}
-    recreated = len({c[0] for c in last} - {c[0] for c in before})
-    return {"ok": True, "message": f"Redeployed {recreated} container{'' if recreated == 1 else 's'}, all running."}
-
-
-# A redeploy can run for minutes. Answer inline when it finishes quickly, and
-# otherwise hand the page a job id to poll — an HTTP request that stays open
-# for four minutes is fine on a LAN and dead on arrival behind most proxies,
-# which cut it off around 100 s while the deploy carries on regardless.
-JOB_SYNC_WAIT_SECONDS = 25.0
-JOB_RETENTION_SECONDS = 3600.0
-
-
-def _prune_jobs(jobs: dict[str, dict]) -> None:
-    cutoff = time.time() - JOB_RETENTION_SECONDS
-    for job_id in [j for j, job in jobs.items() if job["done"] and job["started"] < cutoff]:
-        del jobs[job_id]
-
-
-async def _run_job(request: Request, key: tuple, work) -> JSONResponse:
-    """Run `work()` under the per-target lock and report its result."""
-    app = request.app
-    for held in app.state.in_flight:
-        reason = _conflicts(key, held)
-        if reason:
-            raise HTTPException(status_code=409, detail=f"Not now — {reason}.")
-    job = {"id": secrets.token_hex(8), "done": False, "result": None,
-           "started": time.time()}
-    _prune_jobs(app.state.jobs)
-    app.state.jobs[job["id"]] = job
-
-    async def runner() -> None:
-        try:
-            async with _exclusive(request, key):
-                job["result"] = await work()
-        except HTTPException as exc:
-            job["result"] = {"ok": False, "message": exc.detail}
-        except Exception as exc:
-            job["result"] = {"ok": False, "message": describe(exc)}
-        finally:
-            job["done"] = True
-
-    task = asyncio.create_task(runner())
-    try:
-        await asyncio.wait_for(asyncio.shield(task), JOB_SYNC_WAIT_SECONDS)
-    except asyncio.TimeoutError:
-        return JSONResponse(status_code=202, content={
-            "ok": None, "jobId": job["id"],
-            "message": "Still deploying — Restruo keeps watching it.",
-        })
-    result = job["result"] or {"ok": False, "message": "No result recorded."}
-    return JSONResponse(status_code=200 if result.get("ok") else 502, content=result)
-
-
-HELPER_SOCKET = "/var/run/docker.sock"
-HELPER_POLL_SECONDS = 3.0
-HELPER_TIMEOUT_SECONDS = 900.0
-
-
-def helper_image() -> str:
-    """The same build as this dashboard, so the helper and the code that
-    reads its answer can never disagree. Every build is pushed under its
-    commit as well as :latest."""
-    explicit = os.environ.get("RESTRUO_HELPER_IMAGE", "").strip()
-    if explicit:
-        return explicit
-    version = os.environ.get("RESTRUO_VERSION", "dev")
-    tag = version if version and version != "dev" else "latest"
-    return f"ghcr.io/jwapps-app/restruo:{tag}"
-
-
-def helper_spec(image: str, target: str) -> dict:
-    """A container that can reach the Docker socket and nothing else: no
-    network, no environment, and it replaces exactly one named container."""
-    return {
-        "Image": image,
-        "Entrypoint": ["python", "-m", "app.helper"],
-        "Cmd": [target],
-        "User": "0",  # the socket is root's
-        "Env": [],
-        "Labels": {"restruo.helper": "1"},
-        "HostConfig": {
-            "Binds": [f"{HELPER_SOCKET}:{HELPER_SOCKET}"],
-            "NetworkMode": "none",
-            "AutoRemove": False,  # its exit status and last line are the result
-        },
-    }
-
-
-def parse_helper_result(logs: str, exit_code: int | None) -> dict:
-    for line in reversed(logs.strip().splitlines()):
-        try:
-            parsed = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(parsed, dict) and "ok" in parsed:
-            return {"ok": bool(parsed["ok"]), "message": str(parsed.get("message", ""))}
-    tail = logs.strip().splitlines()[-1] if logs.strip() else "no output"
-    return {"ok": False, "message": f"The helper exited with status {exit_code}: {tail}"}
-
-
-async def _remove_helper(client: PortainerClient, endpoint_id: int, helper_id: str) -> None:
-    """Remove a helper we started — and only that: the id is checked for the
-    label the helper is created with before anything is deleted."""
-    try:
-        info = await client.get_container_info(endpoint_id, helper_id)
-        labels = ((info.get("Config") or {}).get("Labels") or {})
-        if labels.get("restruo.helper") != "1":
-            logger.warning("Not removing %s: it does not carry the helper label", helper_id[:12])
-            return
-        await client.remove_container(endpoint_id, helper_id, force=True)
-    except Exception as exc:
-        logger.warning("Could not remove helper %s: %s", helper_id[:12], describe(exc))
-
-
-async def _replace_with_helper(
-    client: PortainerClient, endpoint_id: int, cid: str, name: str
-) -> dict:
-    image = helper_image()
-    # A name of our own, unique per run: nothing is ever removed on the
-    # strength of a predictable name, and two runs cannot collide.
-    helper_name = f"restruo-helper-{cid[:12]}-{secrets.token_hex(3)}"
-    try:
-        await client.pull_image(endpoint_id, image)
-        helper_id = await client.create_container(
-            endpoint_id, helper_name, helper_spec(image, cid)
-        )
-        await client.set_container_state(endpoint_id, helper_id, running=True)
-    except Exception as exc:
-        return {"ok": False, "message": f"Could not start the update helper: {describe(exc)}"}
-
-    # From here the agent — or Portainer itself — goes away and comes back, so
-    # a failed poll is expected and means nothing. Only the helper's own exit
-    # says how it went.
-    deadline = time.monotonic() + HELPER_TIMEOUT_SECONDS
-    while time.monotonic() < deadline:
-        await asyncio.sleep(HELPER_POLL_SECONDS)
-        try:
-            state = (await client.get_container_info(endpoint_id, helper_id)).get("State") or {}
-        except Exception:
-            continue
-        if state.get("Running") or state.get("Status") in ("created", "restarting"):
-            continue
-        try:
-            logs = await client.container_logs(endpoint_id, helper_id)
-        except Exception:
-            logs = ""
-        result = parse_helper_result(logs, state.get("ExitCode"))
-        await _remove_helper(client, endpoint_id, helper_id)
-        return result
-    return {"ok": False,
-            "message": f"Lost track of the update after {int(HELPER_TIMEOUT_SECONDS / 60)} "
-                       f"minutes — check “{name}” on that host."}
-
-
-def describe(exc: Exception) -> str:
-    return exc.message if isinstance(exc, PortainerError) else (str(exc) or type(exc).__name__)
-
-
-@app.get("/api/jobs/{job_id}", dependencies=[Depends(require_auth)])
-async def get_job(request: Request, job_id: str):
-    _prune_jobs(request.app.state.jobs)
-    job = request.app.state.jobs.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="No such job — it may have expired.")
-    return {"done": job["done"], "result": job["result"]}
-
-
-STACK_INACTIVE = 2          # Portainer's Status for a stack that has been stopped
-STOPPED_STACK_PULLS = 2     # images pulled at once for a stopped stack
-
-
-async def _update_stopped_stack(client: PortainerClient, stack: dict) -> dict:
-    """Update a stack that is stopped, and leave it stopped.
-
-    A redeploy is the wrong tool here: Portainer brings the stack up and marks
-    it active, so something stopped on purpose is running again after every
-    update. Redeploying and then stopping it again would still start it for a
-    while — and a stack may be stopped precisely because it must not run.
-
-    So nothing is started at all. The stack's images are pulled on its
-    environment; the tags then point at the new images, and that is what the
-    stack starts on, whenever it is next started.
-    """
-    name = stack.get("Name", f"stack {stack.get('Id')}")
-    started = time.monotonic()
-
-    def result(ok: bool, message: str) -> dict:
-        return {"ok": ok, "stack": name, "message": message,
-                "durationMs": int((time.monotonic() - started) * 1000)}
-
-    try:
-        content = await client.get_stack_file(stack["Id"])
-    except Exception as exc:
-        return result(False, f"Could not read the stack file: {describe(exc)}. "
-                             "Nothing was changed; the stack is still stopped.")
-    env = stack_env(stack)
-    behind_profile = profiled_images(content, env)
-    images: list[str] = []
-    unresolved: list[str] = []
-    for raw in extract_images(content):
-        if raw in behind_profile:
-            continue  # never deployed, so nothing to keep current
-        resolved = interpolate(raw, env)
-        if resolved is None:
-            unresolved.append(raw)
-        elif resolved not in images:
-            images.append(resolved)
-    if not images:
-        return result(False, "No image could be read from the stack file, so there was "
-                             "nothing to pull. The stack is still stopped.")
-
-    try:
-        registries = await client.list_registries()
-    except Exception:
-        registries = []  # anonymous pulls still work for public images
-    gate = asyncio.Semaphore(STOPPED_STACK_PULLS)
-
-    async def pull(image: str) -> str | None:
-        async with gate:
-            try:
-                await client.pull_image(
-                    stack["EndpointId"], image, registry_id_for(image, registries)
-                )
-                return None
-            except Exception as exc:
-                return f"{image} ({describe(exc)})"
-
-    failures = [f for f in await asyncio.gather(*(pull(i) for i in images)) if f]
-    pulled = len(images) - len(failures)
-    if failures or unresolved:
-        problems = [f"could not pull {f}" for f in failures] + [
-            f"could not resolve {u} — it uses a variable Portainer has no value for"
-            for u in unresolved
-        ]
-        return result(False, f"Pulled {pulled} of {len(images) + len(unresolved)} images; "
-                             f"{'; '.join(problems)}. The stack is still stopped.")
-    note = (" Its compose file was not re-read from git — that happens when a running "
-            "stack is redeployed.") if stack.get("GitConfig") else ""
-    return result(True, f"Pulled {pulled} image{'' if pulled == 1 else 's'}. The stack was "
-                        f"stopped and stays stopped — the new "
-                        f"{'image is' if pulled == 1 else 'images are'} used the next "
-                        f"time it is started.{note}")
-
-
-async def _update_one(client: PortainerClient, stack: dict) -> dict:
-    name = stack.get("Name", f"stack {stack.get('Id')}")
-    started = time.monotonic()
-    containers = await _stack_containers_now(client, stack)
-    before = _fingerprint(containers or [])
-    try:
-        await client.update_stack(stack)
-    except PortainerError as exc:
-        return {
-            "ok": False,
-            "stack": name,
-            "durationMs": int((time.monotonic() - started) * 1000),
-            "message": exc.message,
-        }
-    except Exception as exc:
-        return {
-            "ok": False,
-            "stack": name,
-            "durationMs": int((time.monotonic() - started) * 1000),
-            "message": describe(exc),
-        }
-    outcome = await _await_deploy(client, stack, before)
-    return {
-        "ok": outcome["ok"],
-        "stack": name,
-        "durationMs": int((time.monotonic() - started) * 1000),
-        "message": outcome["message"],
-    }
-
-
-async def _find_container(
-    client: PortainerClient, cid: str, endpoint_id: int
-) -> tuple[int, dict]:
-    """Locate a container in one named environment.
-
-    Container ids are unique per host, not per Portainer: machines cloned from
-    a template carry the same ids. Scanning environments for a bare id would
-    act on whichever host happens to come first — a different machine than
-    the row that was clicked — so the environment is never optional.
-    """
-    for container in await client.list_containers(endpoint_id):
-        if container.get("Id") == cid:
-            return endpoint_id, container
-    raise HTTPException(
-        status_code=404,
-        detail=f"No container {cid[:12]} in environment {endpoint_id}",
-    )
-
-
-def _timed(started: float, name: str, message: str, ok: bool = True) -> dict:
-    return {
-        "ok": ok,
-        "stack": name,
-        "durationMs": int((time.monotonic() - started) * 1000),
-        "message": message,
-    }
-
-
-async def _stack_image_names(
-    client: PortainerClient, stack: dict, name: str, verb: str
-) -> list[str]:
-    """What the stack's containers actually run, resolved past a moved tag.
-
-    This feeds the guards that keep Portainer and its agents from being
-    stopped or redeployed through themselves. A guard that cannot look must
-    not pass — so a failed listing refuses the action rather than allowing it.
-    """
-    endpoint_id = stack["EndpointId"]
-    try:
-        own = stack_containers(stack, await client.list_containers(endpoint_id))
-        return [await resolve_image_name(client, endpoint_id, c) for c in own]
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Couldn't confirm what “{name}” runs ({describe(exc)}) — refusing "
-                   f"to {verb} it until that can be checked.",
-        )
+# --- actions --------------------------------------------------------------------
+
+
+@app.post("/api/instances/{iid}/stacks/{sid}/update", dependencies=[Depends(require_auth)])
+async def update_stack(request: Request, iid: int, sid: int):
+    client = _get_client(request, iid)
+    stack = await actions.fetch_stack(client, sid)
+    _audit(request, "update stack %r on instance %d", actions.stack_name(stack), iid)
+    return _job_response(await _actions(request).update_stack(client, iid, stack))
 
 
 async def _set_stack_state(request: Request, iid: int, sid: int, action: str):
-    """Start or stop a stack."""
     client = _get_client(request, iid)
-    started = time.monotonic()
-    try:
-        stack = await client.get_stack(sid)
-    except PortainerError as exc:
-        if exc.status_code == 404:
-            raise HTTPException(status_code=404, detail=f"No stack with id {sid} on this instance")
-        raise HTTPException(status_code=502, detail=f"Could not fetch stack: {exc.message}")
-
-    name = stack.get("Name", f"stack {sid}")
-    _audit(request, "%s stack %r on instance %d", action, name, iid)
-    if action == "stop":
-        images = await _stack_image_names(client, stack, name, "stop")
-        if any(is_self_critical_image(i) for i in images):
-            raise HTTPException(
-                status_code=400,
-                detail=f"“{name}” runs Portainer or Restruo itself — stopping it from here "
-                       "would cut off the connection needed to start it again.",
-            )
-    try:
-        async with _exclusive(request, ("stack", iid, stack["EndpointId"], sid)):
-            await client.set_stack_state(sid, stack["EndpointId"], running=action == "start")
-    except HTTPException:
-        raise
-    except Exception as exc:
-        message = describe(exc)
-        return JSONResponse(status_code=502, content=_timed(started, name, message, ok=False))
-    return _timed(started, name, "Started." if action == "start" else "Stopped.")
+    stack = await actions.fetch_stack(client, sid)
+    _audit(request, "%s stack %r on instance %d", action, actions.stack_name(stack), iid)
+    return _result_response(
+        await _actions(request).set_stack_state(client, iid, stack, running=action == "start")
+    )
 
 
 @app.post("/api/instances/{iid}/stacks/{sid}/start", dependencies=[Depends(require_auth)])
@@ -1087,248 +414,47 @@ async def stop_stack(request: Request, iid: int, sid: int):
     return await _set_stack_state(request, iid, sid, "stop")
 
 
-async def _set_container_state(
-    request: Request, iid: int, cid: str, action: str, endpoint_id: int
-):
-    """Start or stop a standalone container."""
-    client = _get_client(request, iid)
-    started = time.monotonic()
-    try:
-        endpoint_id, container = await _find_container(client, cid, endpoint_id)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        message = describe(exc)
-        raise HTTPException(status_code=502, detail=f"Could not find container: {message}")
-
-    name = container_name(container)
-    _audit(request, "%s container %r on instance %d env %d", action, name, iid, endpoint_id)
-    image = await resolve_image_name(client, endpoint_id, container)
-    if action == "stop" and is_self_critical_image(image):
-        raise HTTPException(
-            status_code=400,
-            detail=f"“{name}” is Portainer or Restruo itself — stopping it from here would "
-                   "cut off the connection needed to start it again.",
-        )
-    try:
-        async with _exclusive(request, ("container", iid, endpoint_id, cid)):
-            await client.set_container_state(endpoint_id, cid, running=action == "start")
-    except HTTPException:
-        raise
-    except Exception as exc:
-        message = describe(exc)
-        return JSONResponse(status_code=502, content=_timed(started, name, message, ok=False))
-    return _timed(started, name, "Started." if action == "start" else "Stopped.")
-
-
-@app.post("/api/instances/{iid}/containers/{cid}/start", dependencies=[Depends(require_auth)])
-async def start_container(
-    request: Request, iid: int, cid: str, endpointId: int
-):
-    return await _set_container_state(request, iid, cid, "start", endpointId)
-
-
-@app.post("/api/instances/{iid}/containers/{cid}/stop", dependencies=[Depends(require_auth)])
-async def stop_container(
-    request: Request, iid: int, cid: str, endpointId: int
-):
-    return await _set_container_state(request, iid, cid, "stop", endpointId)
-
-
-@app.post("/api/instances/{iid}/stacks/{sid}/update", dependencies=[Depends(require_auth)])
-async def update_stack(request: Request, iid: int, sid: int):
-    client = _get_client(request, iid)
-    # Re-fetch the stack so Env / EndpointId are current at redeploy time.
-    try:
-        stack = await client.get_stack(sid)
-    except PortainerError as exc:
-        if exc.status_code == 404:
-            raise HTTPException(status_code=404, detail=f"No stack with id {sid} on this instance")
-        raise HTTPException(status_code=502, detail=f"Could not fetch stack: {exc.message}")
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Could not fetch stack: {exc}")
-
-    _audit(request, "update stack %r on instance %d", stack.get("Name", sid), iid)
-    images = await _stack_image_names(client, stack, stack.get("Name", str(sid)), "redeploy")
-    if any(cannot_recreate_image(i) for i in images):
-        raise HTTPException(
-            status_code=400,
-            detail=f"“{stack.get('Name', sid)}” runs Portainer or a Portainer agent. "
-                   "Redeploying it would stop the container carrying the command, so "
-                   "the redeploy could never finish. Update it from that host instead.",
-        )
-
-    async def work() -> dict:
-        if stack.get("Status") == STACK_INACTIVE:
-            result = await _update_stopped_stack(client, stack)
-        else:
-            result = await _update_one(client, stack)
-        if result["ok"]:
-            request.app.state.checker.mark_updated(iid, stack_id=sid)
-        return result
-
-    return await _run_job(request, ("stack", iid, stack["EndpointId"], sid), work)
-
-
-CONTAINER_POLL_SECONDS = 2.0
-CONTAINER_POLLS = 30           # a minute to prove itself
-CONTAINER_STABLE_POLLS = 4     # up, and not restarting, this many polls running
-
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-
-
-async def _last_log_line(client: PortainerClient, endpoint_id: int, cid: str) -> str:
-    """What the container said last — usually the reason it died."""
-    try:
-        logs = await client.container_logs(endpoint_id, cid)
-    except Exception:
-        return ""
-    lines = [_ANSI_RE.sub("", line).strip() for line in logs.splitlines()]
-    lines = [line for line in lines if line]
-    return lines[-1][:400] if lines else ""
-
-
-async def _await_container(client: PortainerClient, endpoint_id: int, name: str) -> dict:
-    """Watch a freshly recreated container until it has stayed up, or failed.
-
-    A new image can refuse the old configuration and exit within seconds of
-    starting — after Portainer has already answered that the recreate worked.
-    Returns {"ok", "message"}; a failure carries the container's last log
-    line, which is usually the whole explanation.
-    """
-    cid: str | None = None
-    stable = 0
-    ran = False
-    for _ in range(CONTAINER_POLLS):
-        await asyncio.sleep(CONTAINER_POLL_SECONDS)
-        try:
-            if cid is None:
-                cid = next(
-                    (c["Id"] for c in await client.list_containers(endpoint_id)
-                     if container_name(c) == name), None)
-                if cid is None:
-                    continue
-            info = await client.get_container_info(endpoint_id, cid)
-        except Exception:
-            continue  # a failed poll says nothing about the container
-        state = info.get("State") or {}
-        health = (state.get("Health") or {}).get("Status")
-        restarting = bool(state.get("Restarting")) or (info.get("RestartCount") or 0) > 0
-        exited = not state.get("Running") and not state.get("Restarting")
-
-        if exited and state.get("ExitCode") == 0 and not restarting:
-            return {"ok": True,
-                    "message": "Repulled and recreated. It ran and finished cleanly."}
-        if exited or restarting or health == "unhealthy":
-            if restarting and not exited:
-                what = "keeps crashing and restarting"
-            elif exited:
-                what = f"exited right away (exit code {state.get('ExitCode')})"
-            else:
-                what = "is running but failing its health check"
-            said = await _last_log_line(client, endpoint_id, cid)
-            return {"ok": False,
-                    "message": f"Recreated on the new image, but it {what}."
-                               + (f" Its last log line: {said}" if said else "")}
-        ran = True
-        if health == "starting":
-            stable = 0
-            continue
-        stable += 1
-        if stable >= CONTAINER_STABLE_POLLS:
-            return {"ok": True, "message": "Repulled and recreated — running."}
-    if ran:
-        # Up for the whole minute; only a slow health check is undecided.
-        return {"ok": True, "message": "Repulled and recreated — running; its health "
-                                       "check had not finished starting after a minute."}
-    return {"ok": False,
-            "message": f"Recreated, but “{name}” could not be found afterwards to confirm "
-                       "it is running. Check it on that host."}
-
-
-async def _stop_again(client: PortainerClient, endpoint_id: int, name: str) -> str:
-    """Stop the replacement of a container that was stopped before its update.
-    The replacement has a new id; its name is what carries over."""
-    try:
-        new = next(
-            c for c in await client.list_containers(endpoint_id) if container_name(c) == name
-        )
-        await client.set_container_state(endpoint_id, new["Id"], running=False)
-    except StopIteration:
-        return ("Repulled and recreated — but the new container could not be found to "
-                "stop it again. It was stopped before; check it on that host.")
-    except Exception as exc:
-        return (f"Repulled and recreated — but stopping it again failed ({describe(exc)}). "
-                "It was stopped before and is running now.")
-    return ("Repulled and recreated. It was stopped before, so it was stopped again — "
-            "Portainer's recreate starts a container, so it ran for a moment.")
-
-
 @app.post("/api/instances/{iid}/containers/{cid}/update", dependencies=[Depends(require_auth)])
-async def update_container(
-    request: Request, iid: int, cid: str, endpointId: int
-):
+async def update_container(request: Request, iid: int, cid: str, endpointId: int):
     """Repull + recreate a standalone container. `endpointId` is required:
     container ids are unique per host, and cloned hosts share them, so a
     bare id can name several containers on several machines."""
-    """Repull + recreate a standalone container via Portainer's recreate action."""
     client = _get_client(request, iid)
-    started = time.monotonic()
-    try:
-        endpoint_id, container = await _find_container(client, cid, endpointId)
-        resolved_image = await resolve_image_name(client, endpoint_id, container)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Could not find container: {describe(exc)}")
+    target = await actions.locate_container(client, cid, endpointId)
+    _audit(request, "update container %r (%s) on instance %d env %d",
+           target.name, target.image, iid, endpointId)
+    return _job_response(await _actions(request).update_container(client, iid, target))
 
-    name = container_name(container)
-    _audit(request, "update container %r (%s) on instance %d env %d", name, resolved_image, iid, endpoint_id)
 
-    if cannot_recreate_image(resolved_image):
-        # Portainer's own recreate stops the container that is carrying the
-        # command, so the create that should follow is never sent. Hand the
-        # job to a helper the Docker daemon runs, which outlives it.
-        async def helper_work() -> dict:
-            result = await _replace_with_helper(client, endpoint_id, cid, name)
-            result.update(stack=name,
-                          durationMs=int((time.monotonic() - started) * 1000))
-            if result["ok"]:
-                request.app.state.checker.mark_updated(
-                    iid, container_id=cid, endpoint_id=endpoint_id
-                )
-            return result
+async def _set_container_state(
+    request: Request, iid: int, cid: str, endpoint_id: int, action: str
+):
+    client = _get_client(request, iid)
+    target = await actions.locate_container(client, cid, endpoint_id)
+    _audit(request, "%s container %r on instance %d env %d",
+           action, target.name, iid, endpoint_id)
+    return _result_response(
+        await _actions(request).set_container_state(
+            client, iid, target, running=action == "start")
+    )
 
-        kind = "portainer" if "portainer/portainer" in resolved_image.lower() else "agent"
-        return await _run_job(request, (kind, iid, endpoint_id, cid), helper_work)
 
-    # Portainer's recreate always starts what it creates, whatever state the
-    # original was in. A container that was stopped is stopped again after.
-    was_stopped = (container.get("State") or "").lower() in ("exited", "created", "dead")
+@app.post("/api/instances/{iid}/containers/{cid}/start", dependencies=[Depends(require_auth)])
+async def start_container(request: Request, iid: int, cid: str, endpointId: int):
+    return await _set_container_state(request, iid, cid, endpointId, "start")
 
-    async def work() -> dict:
-        try:
-            await client.recreate_container(endpoint_id, cid)
-        except Exception as exc:
-            return {"ok": False, "stack": name,
-                    "durationMs": int((time.monotonic() - started) * 1000),
-                    "message": describe(exc)}
-        if was_stopped:
-            outcome = {"ok": True, "message": await _stop_again(client, endpoint_id, name)}
-        else:
-            # Portainer answers as soon as the new container has been started.
-            # Whether it then stays up is a separate question, and the one
-            # that matters.
-            outcome = await _await_container(client, endpoint_id, name)
-        if outcome["ok"]:
-            request.app.state.checker.mark_updated(
-                iid, container_id=cid, endpoint_id=endpoint_id
-            )
-        return {"ok": outcome["ok"], "stack": name,
-                "durationMs": int((time.monotonic() - started) * 1000),
-                "message": outcome["message"]}
 
-    return await _run_job(request, ("container", iid, endpoint_id, cid), work)
+@app.post("/api/instances/{iid}/containers/{cid}/stop", dependencies=[Depends(require_auth)])
+async def stop_container(request: Request, iid: int, cid: str, endpointId: int):
+    return await _set_container_state(request, iid, cid, endpointId, "stop")
+
+
+@app.get("/api/jobs/{job_id}", dependencies=[Depends(require_auth)])
+async def get_job(request: Request, job_id: str):
+    job = request.app.state.ops.job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="No such job — it may have expired.")
+    return {"done": job.done, "result": job.result}
 
 
 class PruneRequest(BaseModel):
@@ -1345,49 +471,10 @@ async def prune_instance(request: Request, iid: int, body: PruneRequest):
     client = _get_client(request, iid)
     _audit(request, "prune instance %d (images=%s all=%s networks=%s volumes=%s)",
            iid, body.images, body.allImages, body.networks, body.volumes)
-    summary = {
-        "ok": True, "spaceReclaimed": 0,
-        "images": 0, "networks": 0, "volumes": 0, "errors": [],
-    }
-    try:
-        endpoints = await client.list_endpoints()
-    except Exception as exc:
-        message = describe(exc)
-        raise HTTPException(status_code=502, detail=f"Could not list environments: {message}")
-
-    def _msg(exc: Exception) -> str:
-        return describe(exc)
-
-    async with _exclusive(request, ("prune", iid)):
-        await _prune_endpoints(client, endpoints, body, summary, _msg)
-    summary["ok"] = not summary["errors"]
-    return summary
-
-
-async def _prune_endpoints(client, endpoints, body, summary, _msg) -> None:
-    for endpoint in endpoints:
-        endpoint_id = endpoint["Id"]
-        if body.images:
-            try:
-                pruned = await client.prune_images(endpoint_id, all_unused=body.allImages)
-                summary["images"] += len(pruned.get("ImagesDeleted") or [])
-                summary["spaceReclaimed"] += pruned.get("SpaceReclaimed") or 0
-            except Exception as exc:
-                summary["errors"].append(f"images: {_msg(exc)}")
-        if body.networks:
-            try:
-                removed, failures = await client.remove_unused_networks(endpoint_id)
-                summary["networks"] += removed
-                summary["errors"].extend(f"networks: {f}" for f in failures)
-            except Exception as exc:
-                summary["errors"].append(f"networks: {_msg(exc)}")
-        if body.volumes:
-            try:
-                pruned = await client.prune_volumes(endpoint_id)
-                summary["volumes"] += len(pruned.get("VolumesDeleted") or [])
-                summary["spaceReclaimed"] += pruned.get("SpaceReclaimed") or 0
-            except Exception as exc:
-                summary["errors"].append(f"volumes: {_msg(exc)}")
+    return await _actions(request).prune(
+        client, iid, images=body.images, all_images=body.allImages,
+        networks=body.networks, volumes=body.volumes,
+    )
 
 
 # --- updates & UI -------------------------------------------------------------
@@ -1404,7 +491,6 @@ async def check_updates(request: Request):
     return await request.app.state.checker.check_all(notify=False)
 
 
-# Title/version are cosmetic and shown on the login screen — no auth.
 @app.post("/api/test-email", dependencies=[Depends(require_auth)])
 async def test_email(request: Request):
     """Send a sample notification so SMTP settings can be proven now rather
@@ -1424,23 +510,26 @@ async def test_email(request: Request):
             + compose_body(sample),
         )
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"{type(exc).__name__}: {exc}")
+        raise HTTPException(status_code=502, detail=describe(exc))
     return {"ok": True, "sentTo": email.recipients}
 
 
 @app.get("/api/ui-config")
 async def ui_config(
-    request: Request, credentials: HTTPBasicCredentials | None = Depends(_basic)
+    request: Request,
+    credentials: HTTPBasicCredentials | None = Depends(auth.basic_credentials),
 ):
-    """What the login screen needs is public; who gets emailed is not."""
+    """Title and version are cosmetic and shown on the login screen, so they
+    need no auth. Who gets emailed is not public."""
     config = request.app.state.config
     out = {
         "title": config.ui.title,
-        "version": os.environ.get("RESTRUO_VERSION", "dev"),
+        "version": config.version,
         "authEnabled": config.ui.auth.enabled,
     }
-    if _authenticated(request, credentials):
+    if auth.is_authenticated(request, credentials):
         out["refreshSeconds"] = config.ui.refresh_seconds
+        out["jobWaitSeconds"] = timing.PAGE_JOB_WAIT_SECONDS
         out["email"] = {
             "configured": config.email.configured,
             "recipients": config.email.recipients,

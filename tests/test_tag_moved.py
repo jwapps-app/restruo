@@ -14,6 +14,7 @@ from app.instances import InstanceRecord
 from app.portainer import PortainerClient, resolve_image_name
 from app.registry import RegistryClient
 from app.updates import UpdateChecker
+from tests.fakes import update_settings
 
 OLD_ID = "sha256:" + "43c8bc9bafde".ljust(64, "0")
 NEW_ID = "sha256:" + "d63bfe57a106".ljust(64, "0")
@@ -60,9 +61,11 @@ async def test_already_pulled_reads_as_update_available_not_local():
     client = PortainerClient(RECORD, transport=engine())
     checker = UpdateChecker(
         lambda: [], RegistryClient(transport=httpx.MockTransport(
-            lambda r: httpx.Response(500))), interval_hours=6,
+            lambda r: httpx.Response(500))), update_settings(),
     )
-    result = await checker._check_image(client, 11, "portainer/agent:latest", [CONTAINER])
+    ref = await resolve_image_name(client, 11, CONTAINER)
+    result = await checker._check_image(
+        client, 11, "portainer/agent:latest", [CONTAINER], lambda c: ref)
 
     assert result["status"] == "update-available", result
     assert "already pulled" in result["detail"]
@@ -87,7 +90,9 @@ async def test_a_genuinely_local_image_is_still_local():
     client = PortainerClient(RECORD, transport=httpx.MockTransport(handler))
     checker = UpdateChecker(
         lambda: [], RegistryClient(transport=httpx.MockTransport(
-            lambda r: httpx.Response(500))), interval_hours=6,
+            lambda r: httpx.Response(500))), update_settings(),
     )
-    result = await checker._check_image(client, 11, "homebuilt/app:latest", [CONTAINER])
+    ref = await resolve_image_name(client, 11, CONTAINER)
+    result = await checker._check_image(
+        client, 11, "homebuilt/app:latest", [CONTAINER], lambda c: ref)
     assert result["status"] == "local", result

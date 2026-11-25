@@ -63,7 +63,7 @@ def test_identical_rows_notify_once_each_not_once_per_duplicate():
 async def test_action_targets_the_environment_it_was_clicked_in():
     """The dangerous one: without the endpoint, the first match wins and the
     wrong machine gets restarted."""
-    from app.main import _find_container
+    from app.actions import find_container
     from app.instances import InstanceRecord
     from app.portainer import PortainerClient
 
@@ -88,8 +88,7 @@ async def test_action_targets_the_environment_it_was_clicked_in():
         transport=httpx.MockTransport(handler),
     )
 
-    endpoint_id, container = await _find_container(client, SHARED_ID, endpoint_id=12)
+    container = await find_container(client, SHARED_ID, endpoint_id=12)
 
-    assert endpoint_id == 12
     assert container["Names"] == ["/agent-on-12"]
     assert 10 not in asked, "must not touch other environments"

@@ -93,6 +93,7 @@ Everything is optional except the password.
 | `RESTRUO_SMTP_SECURITY` | `starttls` | `starttls`, `ssl`, or `none` |
 | `RESTRUO_HELPER_IMAGE` | this build's image | Image the update helper runs from, for Portainer and agent updates — set it if your hosts pull from a mirror |
 | `RESTRUO_REGISTRY_AUTH` | — | Logins for private registries, `host=user:token` (comma-separate several) — e.g. `ghcr.io=me:ghp_…` with a `read:packages` token |
+| `RESTRUO_LOG_LEVEL` | `INFO` | How much Restruo logs: `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL` |
 
 For the rest (update-check interval, disabling auth, pre-seeding instances) mount a YAML
 file at `/config/config.yaml` — see [`config.example.yaml`](config.example.yaml).
@@ -304,6 +305,26 @@ DASHBOARD_PASSWORD=dev .venv/bin/uvicorn app.main:app --reload --port 8080
 The backend is FastAPI (`app/`), the frontend is one dependency-free `web/index.html`,
 and the tests mock Portainer and the registries with `httpx.MockTransport` — no live
 instance needed.
+
+Where things live in `app/`:
+
+| Module | What it holds |
+|--------|---------------|
+| `main.py` | Routes and wiring only: parse the request, call one function, shape the response |
+| `auth.py` | Sessions, the login limiter, and the dependency every data endpoint sits behind |
+| `actions.py` | What each button does: update, start, stop, clean up — and what it checks first |
+| `operations.py` | What may run at once, and the jobs that outlive their request |
+| `outcome.py` | Watching a redeploy or a recreated container until it has settled |
+| `inventory.py` | The one walk of an instance: stacks, their containers, and the rest |
+| `dashboard.py` | The rows the page is sent, with every flag the page needs to draw them |
+| `updates.py`, `registry.py` | The update check and the registry client behind it |
+| `portainer.py` | The Portainer client, and reading compose files and images |
+| `helper.py`, `helper_runner.py` | The helper that replaces Portainer or an agent, and the side that starts it |
+| `health.py`, `timing.py`, `errors.py` | The single definitions of "is it working", every deadline, and every error message |
+| `config.py`, `instances.py`, `notifiers.py` | Settings, the instance store, and mail |
+
+The page never decides anything from an image name or a state word: the server sends
+each row with what it needs (`helper`, `selfCritical`, `stopped`, `running`, `isSelf`).
 
 ## Alternatives
 

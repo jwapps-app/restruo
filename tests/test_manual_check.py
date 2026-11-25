@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.updates import UpdateChecker
+from tests.fakes import update_settings
 
 
 class Capture:
@@ -20,7 +21,7 @@ class Capture:
 
 def checker_with_one_update():
     capture = Capture()
-    checker = UpdateChecker(lambda: [], registry=None, interval_hours=6, notifiers=[capture])
+    checker = UpdateChecker(lambda: [], None, update_settings(), notifiers=[capture])
 
     # No instances to scan, so plant the finding a scan would have produced.
     original = checker._notify_new
@@ -57,14 +58,7 @@ async def test_scheduled_check_after_a_manual_one_still_reports_it_once():
     assert len(capture.sent) == 1, "and not again"
 
 
-def test_the_refresh_endpoint_asks_for_a_silent_check(tmp_path, monkeypatch):
-    monkeypatch.setenv("DASHBOARD_PASSWORD", "hunter2")
-    monkeypatch.setenv("RESTRUO_USERNAME", "admin")
-    monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "missing.yaml"))
-    monkeypatch.setenv("DATA_PATH", str(tmp_path / "instances.json"))
-    for attr in ("config", "store"):
-        if hasattr(app.state, attr):
-            delattr(app.state, attr)
+def test_the_refresh_endpoint_asks_for_a_silent_check(app_env):
     with TestClient(app) as client:
         seen = {}
 

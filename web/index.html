@@ -279,13 +279,69 @@
 <script>
 (() => {
   "use strict";
-  let data = [];
-  let updates = { checkedAt: null, instances: [] };
+
+  // --- state -----------------------------------------------------------------
+  // Everything on screen is drawn from these by render(). Nothing is read back
+  // out of the page, and nothing is patched into it after the fact.
+  let data = [];                                          // GET /api/stacks
+  let updates = { checkedAt: null, instances: [] };       // GET /api/updates
   const expanded = new Set();  // instances start collapsed; user opens what they need
+  // What each button is doing right now, by row key (or "<iid>:prune",
+  // "<iid>:all" for an instance's own buttons):
+  //   { action, phase: "busy" | "ok" | "err" | "settled", label, message }
+  // "settled" keeps a result message on its row until the next refresh.
+  const ops = new Map();
+
   const $ = (sel, el = document) => el.querySelector(sel);
 
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
     (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+  // The outcome of an update check, as app/updates.py names them.
+  const STATUS = {
+    UPDATE: "update-available", CURRENT: "up-to-date", PINNED: "pinned",
+    UNKNOWN: "unknown", LOCAL: "local", PRIVATE: "private", NOT_DEPLOYED: "not-deployed",
+  };
+
+  // How many redeploys "Update all" runs at once. Portainer handles separate
+  // stacks in parallel; the cap is about not saturating the host's disk and
+  // network with simultaneous image pulls.
+  const UPDATE_ALL_CONCURRENCY = 4;
+  const SPINNER = '<span class="spinner"></span>';
+
+  // --- talking to the server -------------------------------------------------
+
+  class ApiError extends Error {
+    constructor(message, status) { super(message); this.status = status; }
+  }
+
+  function errorText(body, status) {
+    const said = body && (body.message || body.detail);
+    if (Array.isArray(said)) return said.map((d) => d.msg || String(d)).join("; ");
+    return said || `HTTP ${status}`;
+  }
+
+  // Every call to our own API goes through here. It carries the X-Restruo
+  // header — the server refuses a cookie-authenticated change without it,
+  // which is what stops a page on another port of this host from riding the
+  // session cookie. It resolves to the parsed body, and rejects with an
+  // ApiError carrying the server's own words for anything else; being signed
+  // out shows the login screen. A network failure rejects as fetch does (a
+  // TypeError), so callers can tell "the server said no" from "no server".
+  async function api(path, { method = "GET", body, expectSignedOut = false } = {}) {
+    const init = { method, headers: { "X-Restruo": "1" } };
+    if (body !== undefined) {
+      init.headers["Content-Type"] = "application/json";
+      init.body = JSON.stringify(body);
+    }
+    const res = await fetch(path, init);
+    const parsed = await res.json().catch(() => ({}));
+    if (res.ok) return parsed;
+    if (res.status === 401 && !expectSignedOut) showLogin(true);
+    throw new ApiError(errorText(parsed, res.status), res.status);
+  }
+
+  // --- small formatters ------------------------------------------------------
 
   function fmtWhen(ts) {
     if (!ts) return "—";
@@ -293,6 +349,27 @@
     return new Date(ms).toLocaleString(undefined,
       { dateStyle: "medium", timeStyle: "short" });
   }
+
+  function ago(ts) {
+    const mins = Math.round((Date.now() / 1000 - ts) / 60);
+    if (mins < 1) return "just now";
+    if (mins < 60) return `${mins}m ago`;
+    return `${Math.round(mins / 60)}h ago`;
+  }
+
+  function fmtBytes(bytes) {
+    if (!bytes) return "0 B";
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    const i = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
+    return `${(bytes / 1024 ** i).toFixed(i ? 1 : 0)} ${units[i]}`;
+  }
+
+  const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+  // --- rows ------------------------------------------------------------------
+  // One entry per stack or container: the row the server sent, joined with
+  // what the last update check said about it. Rendering, the click handler
+  // and "Update all" all work from these.
 
   function updateInfoFor(iid, sid) {
     const inst = updates.instances.find((u) => u.instance.id === iid);
@@ -310,78 +387,259 @@
       || (eid == null ? list.find((c) => c.id === cid) : null);
   }
 
-  // Every call to our own API carries this header. The server refuses a
-  // cookie-authenticated change without it, which is what stops a page on
-  // another port of this host from riding the session cookie.
-  const nativeFetch = window.fetch.bind(window);
-  window.fetch = (url, opts = {}) => {
-    if (typeof url === "string" && url.startsWith("/api/")) {
-      const headers = new Headers(opts.headers || {});
-      headers.set("X-Restruo", "1");
-      opts = { ...opts, headers };
+  function entriesOf(inst) {
+    const iid = inst.instance.id;
+    const stacks = inst.stacks.map((s) => {
+      const info = updateInfoFor(iid, s.id);
+      const checked = (info && info.images) || [];
+      return {
+        kind: "stack", key: `${iid}:s:${s.id}`, iid, name: s.name, row: s,
+        images: s.images, checked,
+        updates: (info && info.updatesAvailable) || 0,
+        unknown: checked.filter((i) => i.status === STATUS.UNKNOWN),
+        down: s.stopped ? 1 : (s.downNames || []).length,
+        path: `/api/instances/${iid}/stacks/${s.id}`, query: "",
+      };
+    });
+    const containers = (inst.containers || []).map((c) => {
+      const info = updateInfoForCtr(iid, c.id, c.endpointId);
+      const checked = info
+        ? [{ image: c.image, status: info.status, detail: info.detail, rebuild: info.rebuild }] : [];
+      return {
+        kind: "container", key: `${iid}:c:${c.endpointId ?? ""}:${c.id}`, iid, name: c.name, row: c,
+        images: [c.image], checked,
+        updates: info && info.status === STATUS.UPDATE ? 1 : 0,
+        unknown: checked.filter((i) => i.status === STATUS.UNKNOWN),
+        down: c.down ? 1 : 0,
+        path: `/api/instances/${iid}/containers/${c.id}`,
+        query: c.endpointId == null ? "" : `?endpointId=${c.endpointId}`,
+      };
+    });
+    return [...stacks, ...containers];
+  }
+
+  function findEntry(key) {
+    for (const inst of data) {
+      const entry = entriesOf(inst).find((e) => e.key === key);
+      if (entry) return entry;
     }
-    return nativeFetch(url, opts);
+    return null;
+  }
+
+  const currentFilter = () => $("#search").value.trim().toLowerCase();
+
+  function matches(entry, filter) {
+    return !filter || entry.name.toLowerCase().includes(filter) ||
+      (entry.row.environment || "").toLowerCase().includes(filter) ||
+      entry.images.some((i) => i.toLowerCase().includes(filter));
+  }
+
+  // The op showing on a row's buttons, if any. A settled one only leaves its message.
+  const activeOp = (key, action) => {
+    const op = ops.get(key);
+    return op && op.action === action && op.phase !== "settled" ? op : null;
   };
+  const isBusy = (key) => (ops.get(key) || {}).phase === "busy";
+  const anyBusy = () => [...ops.values()].some((op) => op.phase === "busy");
 
-  // Portainer relays every command for an environment through its agent, so
-  // recreating either the agent or Portainer itself stops the container
-  // carrying the command and the replacement is never created. Matches
-  // cannot_recreate_image() on the server.
-  function cannotRecreate(image) {
-    const n = (image || "").toLowerCase();
-    return n.includes("portainer/portainer") || n.includes("portainer/agent");
+  function setOp(key, op) {
+    ops.set(key, op);
+    render();
+    return op;
   }
 
-  // "agent", "portainer", or "" — the two that need the helper, told apart
-  // because replacing Portainer migrates its database and an agent has none.
-  function helperKind(image) {
-    const n = (image || "").toLowerCase();
-    if (n.includes("portainer/agent")) return "agent";
-    if (n.includes("portainer/portainer")) return "portainer";
-    return "";
+  // After a few seconds the button goes back to normal; the message stays.
+  function settleLater(key, op) {
+    setTimeout(() => {
+      if (ops.get(key) !== op) return;
+      op.phase = "settled";
+      render();
+    }, 4000);
   }
 
-  // Unique per row, for DOM ids and result messages.
-  function ctrKey(c) {
-    return c.endpointId == null ? c.id : `${c.endpointId}-${c.id}`;
-  }
+  // --- drawing ---------------------------------------------------------------
 
   function imgLine(img) {
-    if (img.status === "update-available")
+    if (img.status === STATUS.UPDATE)
       return `<span class="img-line upd" title="${esc(img.detail || "A newer image is available from the registry")}">⬆ ${esc(img.image)} <span class="img-note">${img.rebuild ? "new build" : "new version"}</span></span>`;
-    if (img.status === "pinned")
+    if (img.status === STATUS.PINNED)
       return `<span class="img-line" title="${esc(img.detail || "Pinned to a specific version — not checked")}">${esc(img.image)} <span class="img-note">pinned</span></span>`;
-    if (img.status === "up-to-date")
+    if (img.status === STATUS.CURRENT)
       return `<span class="img-line" title="Up to date with the registry">${esc(img.image)}</span>`;
-    if (img.status === "local")
+    if (img.status === STATUS.LOCAL)
       return `<span class="img-line" title="${esc(img.detail || "Not from a registry")}">${esc(img.image)} <span class="img-note">local</span></span>`;
-    if (img.status === "private")
+    if (img.status === STATUS.PRIVATE)
       return `<span class="img-line unk" title="${esc(img.detail || "Private registry")}">${esc(img.image)} <span class="img-note">private</span></span>`;
-    if (img.status === "not-deployed")
+    if (img.status === STATUS.NOT_DEPLOYED)
       return `<span class="img-line" title="${esc(img.detail || "Declared in the stack file but not running")}">${esc(img.image)} <span class="img-note">not deployed</span></span>`;
     return `<span class="img-line unk" title="${esc(img.detail || "Could not check")}">${esc(img.image)} <span class="img-note">?</span></span>`;
   }
 
-  // How many redeploys "Update all" runs at once. Portainer handles separate
-  // stacks in parallel; the cap is about not saturating the host's disk and
-  // network with simultaneous image pulls.
-  const UPDATE_ALL_CONCURRENCY = 4;
-
-  function powerBtn(o) {
-    // Stopping Portainer (or Restruo) through Portainer's own API would kill
-    // the connection needed to start it again — the server refuses it too.
-    if (o.protected)
-      return `<button class="power-btn" disabled title="Can't be stopped from here — it's what Restruo talks to">${o.running ? "Stop" : "Start"}</button>`;
-    const act = o.running ? "stop" : "start";
-    return `<button class="power-btn${o.running ? "" : " start"}" data-power="${act}"
-      data-kind="${o.kind}" data-iid="${o.iid}" data-id="${esc(String(o.id))}"
-      data-eid="${esc(String(o.eid ?? ""))}" data-name="${esc(o.name)}">${o.running ? "Stop" : "Start"}</button>`;
+  function updateButton(e) {
+    // The server says which rows it will refuse; see app/dashboard.py.
+    if (e.row.updateProtected)
+      return '<button class="update-btn" disabled title="This stack runs Portainer or a Portainer agent — redeploying it would stop the container carrying the command, so it could never finish. Update it from that host.">Update</button>';
+    const op = activeOp(e.key, "update");
+    const label = !op ? (e.updates ? "⬆ Update" : "Update")
+      : op.phase === "busy" ? SPINNER + esc(op.label)
+      : op.phase === "ok" ? "✅ Updated" : "❌ Failed";
+    const title = e.row.helper
+      ? ' title="Replaced by a short-lived helper the Docker daemon runs — Portainer can\'t recreate this one itself"' : "";
+    return `<button class="update-btn${e.updates ? " has-upd" : ""}" data-act="update"
+      data-key="${esc(e.key)}" data-fk="${esc(e.key)}|update"${op || isBusy(e.key) ? " disabled" : ""}${title}>${label}</button>`;
   }
 
-  function renderImagesCell(stack, iid) {
-    const info = updateInfoFor(iid, stack.id);
-    if (!info || !info.images.length) return esc(stack.images.join(", ") || "—");
-    return info.images.map(imgLine).join("");
+  function powerButton(e) {
+    const word = e.row.running ? "Stop" : "Start";
+    // Stopping Portainer (or Restruo) through Portainer's own API would kill
+    // the connection needed to start it again — the server refuses it too.
+    if (e.row.selfCritical)
+      return `<button class="power-btn" disabled title="Can't be stopped from here — it's what Restruo talks to">${word}</button>`;
+    const op = activeOp(e.key, "power");
+    const label = !op ? word
+      : op.phase === "busy" ? SPINNER + (op.verb === "stop" ? "Stopping…" : "Starting…")
+      : op.phase === "ok" ? "✅ Done" : "❌ Failed";
+    return `<button class="power-btn${e.row.running ? "" : " start"}" data-act="${e.row.running ? "stop" : "start"}"
+      data-key="${esc(e.key)}" data-fk="${esc(e.key)}|power"${op || isBusy(e.key) ? " disabled" : ""}>${label}</button>`;
+  }
+
+  function resultMessage(e) {
+    const op = ops.get(e.key);
+    if (!op || !op.message) return '<span class="result-msg"></span>';
+    const tone = op.phase === "busy" ? "" : op.ok ? " ok" : " err";
+    return `<span class="result-msg${tone}">${esc(op.message)}</span>`;
+  }
+
+  // An image whose check failed (usually an environment we couldn't reach) is
+  // neither down nor out of date — but it IS unmonitored, and the Images
+  // column that says so is hidden on phones. "local" and "private" are
+  // inherent properties, not failures — only checks that actually broke count.
+  function unknownBadge(e) {
+    if (!e.unknown.length) return "";
+    const why = e.unknown.map((i) => `${i.image}: ${i.detail || "could not check"}`).join("\n");
+    return ` <span class="badge unk" title="${esc(why)}">? unchecked</span>`;
+  }
+
+  function rowHtml(e, multiEnv) {
+    const r = e.row;
+    const isStack = e.kind === "stack";
+    const envTag = multiEnv && r.environment
+      ? ` <span class="env-tag" title="Portainer environment">${esc(r.environment)}</span>` : "";
+    let downBadge = "";
+    if (isStack && r.stopped) downBadge = ' <span class="badge err">● stopped</span>';
+    else if (isStack && r.downNames && r.downNames.length)
+      downBadge = ` <span class="badge err" title="${esc(r.downNames.join(", "))}">● ${r.downNames.length} down</span>`;
+    else if (!isStack && r.down)
+      downBadge = ` <span class="badge err" title="${esc(r.statusText || r.state)}">● down</span>`;
+    const updBadge = !e.updates ? ""
+      : isStack ? ` <span class="badge upd">⬆ ${plural(e.updates, "update")}</span>`
+      : ' <span class="badge upd">⬆ update</span>';
+    const images = e.checked.length ? e.checked.map(imgLine).join("")
+      : esc(e.images.join(", ") || "—");
+    const type = isStack ? esc(r.git ? r.type + " · git" : r.type) : "container";
+    const when = isStack
+      ? `<td class="when hide-sm">${fmtWhen(r.updatedAt)}</td>`
+      : `<td class="when hide-sm"${r.down ? ' style="color:var(--err)"' : ""}>${esc(r.state)}</td>`;
+    return `
+          <tr>
+            <td><strong>${esc(e.name)}</strong>${envTag}${downBadge}${updBadge}${unknownBadge(e)}</td>
+            <td class="hide-sm"><span class="type-tag">${type}</span></td>
+            <td class="images hide-sm">${images}</td>
+            ${when}
+            <td>
+              ${updateButton(e)}
+              ${powerButton(e)}
+              ${resultMessage(e)}
+            </td>
+          </tr>`;
+  }
+
+  function render() {
+    const filter = currentFilter();
+    const root = $("#instances");
+    // Redrawing replaces every button; put the keyboard back where it was.
+    const focusKey = document.activeElement && root.contains(document.activeElement)
+      ? document.activeElement.dataset.fk : null;
+    root.innerHTML = "";
+    // Always by name: the environment is a label, not a grouping — a list
+    // that isn't strictly A–Z is hard to scan.
+    const byName = (a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
+
+    for (const inst of data) {
+      const iid = inst.instance.id;
+      // Only worth labelling when this Portainer manages more than one.
+      const multiEnv = (inst.environments || 1) > 1;
+      const all = entriesOf(inst);
+      // One combined A–Z list — stacks and containers interleaved.
+      const shown = all.filter((e) => matches(e, filter)).sort(byName);
+      if (filter && shown.length === 0 && inst.reachable) continue;
+
+      const open = !!(filter || expanded.has(iid));
+      const section = document.createElement("section");
+      section.className = "instance" + (open ? "" : " collapsed") + (inst.reachable ? "" : " greyed");
+      const badge = inst.reachable
+        ? '<span class="badge ok">● reachable</span>'
+        : `<span class="badge err" title="${esc(inst.error)}">● unreachable</span>`;
+
+      const envErrors = Object.entries(inst.environmentErrors || {});
+      const envNote = envErrors.length
+        ? `<div class="stack-body unreachable-note">Could not read ${envErrors.length === 1 ? "an environment" : envErrors.length + " environments"} — what is shown for ${esc(envErrors.map(([n]) => n).join(", "))} is incomplete, not fine. ${esc(envErrors[0][1])}</div>`
+        : "";
+      let body;
+      if (!inst.reachable) {
+        body = `<div class="stack-body unreachable-note">${esc(inst.error)}</div>`;
+      } else if (shown.length === 0) {
+        body = '<div class="stack-body unreachable-note" style="color:var(--muted)">No stacks or standalone containers.</div>';
+      } else {
+        body = `<div class="stack-body"><table>
+          <thead><tr><th>Stack / container</th><th class="hide-sm">Type</th><th class="hide-sm">Images</th>
+          <th class="hide-sm">Updated</th><th></th></tr></thead>
+          <tbody>${shown.map((e) => rowHtml(e, multiEnv)).join("")}</tbody></table></div>`;
+      }
+
+      // Counted from the rows that exist, not straight from the cached check:
+      // an entry for a stack that has since been recreated (new id), or for a
+      // container on an environment that didn't enumerate this round, has no
+      // row able to show it.
+      const updCount = all.reduce((n, e) => n + e.updates, 0);
+      const downCount = all.reduce((n, e) => n + e.down, 0);
+      const unchecked = all.filter((e) => e.unknown.length);
+      const unknownReasons = unchecked.flatMap((e) =>
+        e.unknown.map((i) => `${e.name} — ${i.image}: ${i.detail || "could not check"}`));
+      const ctrCount = (inst.containers || []).length;
+      const cleaning = ops.has(`${iid}:prune`);
+      const updatingAll = ops.has(`${iid}:all`);
+      section.innerHTML = `
+        <div class="instance-header" role="button" tabindex="0" data-fk="${esc(String(iid))}|header" aria-expanded="${open}" aria-label="${esc(inst.instance.name)}: ${open ? "collapse" : "expand"}">
+          <span class="caret" aria-hidden="true">▼</span>
+          <h2>${esc(inst.instance.name)}</h2>
+          <span class="count">${plural(inst.stacks.length, "stack")}${ctrCount ? ` · ${plural(ctrCount, "container")}` : ""}</span>
+          ${downCount ? `<span class="badge err">● ${downCount} down</span>` : ""}
+          ${updCount ? `<span class="badge upd">⬆ ${plural(updCount, "update")}</span>` : ""}
+          ${unchecked.length ? `<span class="badge unk" title="${esc(unknownReasons.slice(0, 40).join("\n"))}">? ${unchecked.length} unchecked</span>` : ""}
+          ${badge}
+          ${inst.reachable ? `<button class="cleanup-btn" data-act="cleanup" data-iid="${esc(String(iid))}" data-fk="${esc(String(iid))}|cleanup" title="Remove unused images, networks, and optionally volumes"${cleaning ? " disabled" : ""}>${cleaning ? SPINNER + "Cleaning…" : "Clean up"}</button>` : ""}
+          ${inst.reachable && all.length ?
+            `<button class="update-all-btn${updCount ? " has-upd" : ""}" data-act="update-all" data-iid="${esc(String(iid))}" data-fk="${esc(String(iid))}|all"${updatingAll ? " disabled" : ""}>${updatingAll ? SPINNER + "Updating…" : updCount ? "⬆ Update all" : "Update all"}</button>` : ""}
+        </div>${envNote}${body}`;
+
+      const header = $(".instance-header", section);
+      const toggle = (ev) => {
+        if (ev.target.closest("button")) return;
+        expanded.has(iid) ? expanded.delete(iid) : expanded.add(iid);
+        section.classList.toggle("collapsed");
+        header.setAttribute("aria-expanded", String(!section.classList.contains("collapsed")));
+      };
+      header.addEventListener("click", toggle);
+      header.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); toggle(ev); }
+      });
+      root.appendChild(section);
+    }
+    if (focusKey) {
+      const again = [...root.querySelectorAll("[data-fk]")].find((el) => el.dataset.fk === focusKey);
+      if (again && !again.disabled) again.focus();
+    }
   }
 
   // Modals are queued: several instances can finish a cleanup at once, and a
@@ -423,185 +681,9 @@
     return shown;
   }
 
-  function render() {
-    const filter = $("#search").value.trim().toLowerCase();
-    const root = $("#instances");
-    root.innerHTML = "";
-    for (const inst of data) {
-      const iid = inst.instance.id;
-      // Only worth labelling when this Portainer manages more than one.
-      const multiEnv = (inst.environments || 1) > 1;
-      // Always by name: the environment is a label, not a grouping — a list
-      // that isn't strictly A–Z is hard to scan.
-      const byName = (a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
-      const stacks = inst.stacks.filter((s) =>
-        !filter || s.name.toLowerCase().includes(filter) ||
-        (s.environment || "").toLowerCase().includes(filter) ||
-        s.images.some((i) => i.toLowerCase().includes(filter))).sort(byName);
-      const ctrs = (inst.containers || []).filter((c) =>
-        !filter || c.name.toLowerCase().includes(filter) ||
-        (c.environment || "").toLowerCase().includes(filter) ||
-        c.image.toLowerCase().includes(filter)).sort(byName);
-      if (filter && stacks.length === 0 && ctrs.length === 0 && inst.reachable) continue;
+  const notice = (title, text) => confirmModal(title, text, { okOnly: true, okText: "OK" });
 
-      const section = document.createElement("section");
-      section.className = "instance" +
-        (filter || expanded.has(iid) ? "" : " collapsed") +
-        (inst.reachable ? "" : " greyed");
-      const badge = inst.reachable
-        ? '<span class="badge ok">● reachable</span>'
-        : `<span class="badge err" title="${esc(inst.error)}">● unreachable</span>`;
-
-      let body;
-      const envErrors = Object.entries(inst.environmentErrors || {});
-      const envNote = envErrors.length
-        ? `<div class="stack-body unreachable-note">Could not read ${envErrors.length === 1 ? "an environment" : envErrors.length + " environments"} — what is shown for ${esc(envErrors.map(([n]) => n).join(", "))} is incomplete, not fine. ${esc(envErrors[0][1])}</div>`
-        : "";
-      if (!inst.reachable) {
-        body = `<div class="stack-body unreachable-note">${esc(inst.error)}</div>`;
-      } else if (stacks.length === 0 && ctrs.length === 0) {
-        body = '<div class="stack-body unreachable-note" style="color:var(--muted)">No stacks or standalone containers.</div>';
-      } else {
-        const envTag = (row) => multiEnv && row.environment
-          ? ` <span class="env-tag" title="Portainer environment">${esc(row.environment)}</span>` : "";
-        // An image whose check failed (usually an environment we couldn't
-        // reach) is neither down nor out of date — but it IS unmonitored, and
-        // the Images column that says so is hidden on phones.
-        const unknownBadge = (images) => {
-          // "local" and "private" are inherent properties, not failures — only
-          // count checks that actually broke.
-          const unknown = (images || []).filter((i) => i.status === "unknown");
-          if (!unknown.length) return "";
-          const why = unknown.map((i) => `${i.image}: ${i.detail || "could not check"}`).join("\n");
-          return ` <span class="badge unk" title="${esc(why)}">? unchecked</span>`;
-        };
-        const stackRow = (s) => {
-          const info = updateInfoFor(iid, s.id);
-          const hasUpd = !!(info && info.updatesAvailable);
-          const updBadge = hasUpd
-            ? ` <span class="badge upd">⬆ ${info.updatesAvailable} update${info.updatesAvailable === 1 ? "" : "s"}</span>` : "";
-          const downBadge = s.status === "inactive"
-            ? ' <span class="badge err">● stopped</span>'
-            : (s.downNames && s.downNames.length
-              ? ` <span class="badge err" title="${esc(s.downNames.join(", "))}">● ${s.downNames.length} down</span>` : "");
-          return `
-          <tr>
-            <td><strong>${esc(s.name)}</strong>${envTag(s)}${downBadge}${updBadge}${unknownBadge(info && info.images)}</td>
-            <td class="hide-sm"><span class="type-tag">${esc(s.git ? s.type + " · git" : s.type)}</span></td>
-            <td class="images hide-sm">${renderImagesCell(s, iid)}</td>
-            <td class="when hide-sm">${fmtWhen(s.updatedAt)}</td>
-            <td>
-              ${s.updateProtected
-                ? '<button class="update-btn" disabled title="This stack runs Portainer or a Portainer agent — redeploying it would stop the container carrying the command, so it could never finish. Update it from that host.">Update</button>'
-                : `<button class="update-btn${hasUpd ? " has-upd" : ""}" data-kind="stack"
-                data-iid="${esc(String(iid))}" data-sid="${esc(String(s.id))}" data-name="${esc(s.name)}"
-                data-stopped="${s.status === "inactive" ? "1" : ""}">${hasUpd ? "⬆ Update" : "Update"}</button>`}
-              ${powerBtn({ kind: "stack", iid, id: s.id, name: s.name,
-                           running: s.status !== "inactive", protected: s.selfCritical })}
-              <span class="result-msg" id="msg-${esc(String(iid))}-${esc(String(s.id))}"></span>
-            </td>
-          </tr>`;
-        };
-        const ctrRow = (c) => {
-          const cInfo = updateInfoForCtr(iid, c.id, c.endpointId);
-          const cKey = ctrKey(c);
-          const hasUpd = !!(cInfo && cInfo.status === "update-available");
-          const isPortainer = cannotRecreate(c.image);
-          const imagesCell = cInfo
-            ? imgLine({ image: c.image, status: cInfo.status, detail: cInfo.detail, rebuild: cInfo.rebuild })
-            : esc(c.image);
-          const downBadge = c.down
-            ? ` <span class="badge err" title="${esc(c.statusText || c.state)}">● down</span>` : "";
-          return `
-          <tr>
-            <td><strong>${esc(c.name)}</strong>${envTag(c)}${downBadge}${hasUpd ? ' <span class="badge upd">⬆ update</span>' : ""}${unknownBadge(cInfo ? [cInfo] : null)}</td>
-            <td class="hide-sm"><span class="type-tag">container</span></td>
-            <td class="images hide-sm">${imagesCell}</td>
-            <td class="when hide-sm"${c.down ? ' style="color:var(--err)"' : ""}>${esc(c.state)}</td>
-            <td>
-              <button class="update-btn${hasUpd ? " has-upd" : ""}" data-kind="container"
-                data-iid="${esc(String(iid))}" data-cid="${esc(c.id)}" data-eid="${esc(String(c.endpointId ?? ""))}" data-name="${esc(c.name)}"
-                data-helper="${helperKind(c.image)}"
-                data-stopped="${["exited", "created", "dead"].includes(c.state) ? "1" : ""}"
-                ${isPortainer ? 'title="Replaced by a short-lived helper the Docker daemon runs — Portainer can\'t recreate this one itself"' : ""}>${hasUpd ? "⬆ Update" : "Update"}</button>
-              ${powerBtn({ kind: "container", iid, id: c.id, eid: c.endpointId, name: c.name,
-                           running: !c.down || c.state === "running", protected: isPortainer })}
-              <span class="result-msg" id="msg-${esc(String(iid))}-${esc(cKey)}"></span>
-            </td>
-          </tr>`;
-        };
-        // One combined A–Z list — stacks and containers interleaved.
-        const rows = [
-          ...stacks.map((s) => ({ name: s.name, html: () => stackRow(s) })),
-          ...ctrs.map((c) => ({ name: c.name, html: () => ctrRow(c) })),
-        ].sort(byName).map((r) => r.html()).join("");
-        body = `<div class="stack-body"><table>
-          <thead><tr><th>Stack / container</th><th class="hide-sm">Type</th><th class="hide-sm">Images</th>
-          <th class="hide-sm">Updated</th><th></th></tr></thead>
-          <tbody>${rows}</tbody></table></div>`;
-      }
-
-      // Count from the rows that actually exist, not straight from the cached
-      // check: an entry for a stack that has since been recreated (new id) or
-      // a container on an environment that didn't enumerate this round would
-      // otherwise be counted here with no row able to show it.
-      const instUpdCount =
-        inst.stacks.reduce(
-          (n, s) => n + ((updateInfoFor(iid, s.id) || {}).updatesAvailable || 0), 0) +
-        (inst.containers || []).filter(
-          (c) => (updateInfoForCtr(iid, c.id, c.endpointId) || {}).status === "update-available").length;
-      const unknownReasons = [];
-      inst.stacks.forEach((st) => {
-        ((updateInfoFor(iid, st.id) || {}).images || [])
-          .filter((i) => i.status === "unknown")
-          .forEach((i) => unknownReasons.push(`${st.name} — ${i.image}: ${i.detail || "could not check"}`));
-      });
-      (inst.containers || []).forEach((c) => {
-        const info = updateInfoForCtr(iid, c.id, c.endpointId) || {};
-        if (info.status === "unknown")
-          unknownReasons.push(`${c.name} — ${c.image}: ${info.detail || "could not check"}`);
-      });
-      const instUnknownCount =
-        inst.stacks.reduce((n, st) => n + (((updateInfoFor(iid, st.id) || {}).images || [])
-          .some((i) => i.status === "unknown") ? 1 : 0), 0) +
-        (inst.containers || []).filter(
-          (c) => (updateInfoForCtr(iid, c.id, c.endpointId) || {}).status === "unknown").length;
-      const instDownCount =
-        inst.stacks.reduce((n, s) =>
-          n + (s.status === "inactive" ? 1 : (s.downNames || []).length), 0) +
-        (inst.containers || []).filter((c) => c.down).length;
-      const ctrCount = (inst.containers || []).length;
-      const open = !!(filter || expanded.has(iid));
-      section.innerHTML = `
-        <div class="instance-header" role="button" tabindex="0" aria-expanded="${open}" aria-label="${esc(inst.instance.name)}: ${open ? "collapse" : "expand"}">
-          <span class="caret" aria-hidden="true">▼</span>
-          <h2>${esc(inst.instance.name)}</h2>
-          <span class="count">${inst.stacks.length} stack${inst.stacks.length === 1 ? "" : "s"}${ctrCount ? ` · ${ctrCount} container${ctrCount === 1 ? "" : "s"}` : ""}</span>
-          ${instDownCount ? `<span class="badge err">● ${instDownCount} down</span>` : ""}
-          ${instUpdCount ? `<span class="badge upd">⬆ ${instUpdCount} update${instUpdCount === 1 ? "" : "s"}</span>` : ""}
-          ${instUnknownCount ? `<span class="badge unk" title="${esc(unknownReasons.slice(0, 40).join("\n"))}">? ${instUnknownCount} unchecked</span>` : ""}
-          ${badge}
-          ${inst.reachable ? `<button class="cleanup-btn" data-iid="${esc(String(iid))}" title="Remove unused images, networks, and optionally volumes">Clean up</button>` : ""}
-          ${inst.reachable && (inst.stacks.length || ctrCount) ?
-            `<button class="update-all-btn${instUpdCount ? " has-upd" : ""}" data-iid="${esc(String(iid))}">${instUpdCount ? "⬆ Update all" : "Update all"}</button>` : ""}
-        </div>${envNote}${body}`;
-
-      const toggle = (e) => {
-        if (e.target.closest("button")) return;
-        const id = inst.instance.id;
-        expanded.has(id) ? expanded.delete(id) : expanded.add(id);
-        section.classList.toggle("collapsed");
-        const header = $(".instance-header", section);
-        header.setAttribute("aria-expanded", String(!section.classList.contains("collapsed")));
-      };
-      const headerEl = $(".instance-header", section);
-      headerEl.addEventListener("click", toggle);
-      headerEl.addEventListener("keydown", (e) => {
-        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(e); }
-      });
-      root.appendChild(section);
-    }
-  }
+  // --- signing in --------------------------------------------------------------
 
   function showLogin(show) {
     $("#view-login").style.display = show ? "" : "none";
@@ -618,16 +700,10 @@
     btn.disabled = true;
     $("#login-msg").textContent = "";
     try {
-      const res = await fetch("/api/login", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          username: $("#l-user").value.trim(),
-          password: $("#l-pass").value,
-        }),
+      await api("/api/login", {
+        method: "POST", expectSignedOut: true,
+        body: { username: $("#l-user").value.trim(), password: $("#l-pass").value },
       });
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
       $("#l-pass").value = "";
       showLogin(false);
       loadUiConfig();
@@ -639,36 +715,30 @@
     btn.disabled = false;
   });
 
+  // --- loading -----------------------------------------------------------------
+
   async function refresh() {
     $("#status-stacks").textContent = "Loading stacks from all instances…";
     $("#refresh").disabled = true;
     try {
-      const res = await fetch("/api/stacks");
-      if (res.status === 401) { showLogin(true); return; }
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      data = await res.json();
+      data = await api("/api/stacks");
+      // Fresh state on screen: results left on rows by earlier actions have had their say.
+      for (const [key, op] of ops) if (op.phase === "settled") ops.delete(key);
       loadUpdates();  // the cached result — cheap, and a scheduled check may have run
       const total = data.reduce((n, i) => n + i.stacks.length, 0);
       const down = data.filter((i) => !i.reachable).length;
       $("#status-stacks").textContent = data.length === 0
         ? "No Portainer instances configured — click “⚙ Instances” to add your servers."
-        : `${total} stacks across ${data.length} instance${data.length === 1 ? "" : "s"}` +
-          (down ? ` — ${down} instance${down === 1 ? "" : "s"} unreachable` : "") +
+        : `${total} stacks across ${plural(data.length, "instance")}` +
+          (down ? ` — ${plural(down, "instance")} unreachable` : "") +
           ` · updated ${new Date().toLocaleTimeString()}`;
       render();
     } catch (err) {
-      $("#status-stacks").textContent = "Failed to load: " + err.message;
+      if (err.status !== 401) $("#status-stacks").textContent = "Failed to load: " + err.message;
     } finally {
       $("#refresh").disabled = false;
       scheduleRefresh();
     }
-  }
-
-  function ago(ts) {
-    const mins = Math.round((Date.now() / 1000 - ts) / 60);
-    if (mins < 1) return "just now";
-    if (mins < 60) return `${mins}m ago`;
-    return `${Math.round(mins / 60)}h ago`;
   }
 
   function renderCheckStatus() {
@@ -681,8 +751,9 @@
 
   async function loadUpdates() {
     try {
-      const res = await fetch("/api/updates");
-      if (res.ok) { updates = await res.json(); render(); renderCheckStatus(); }
+      updates = await api("/api/updates");
+      render();
+      renderCheckStatus();
     } catch (err) { /* update info is optional; dashboard works without it */ }
   }
 
@@ -693,10 +764,7 @@
     checking = true;
     $("#status-updates").textContent = "· checking registries…";
     try {
-      const res = await fetch("/api/check-updates", { method: "POST" });
-      if (res.status === 401) { showLogin(true); return; }
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      updates = await res.json();
+      updates = await api("/api/check-updates", { method: "POST" });
       render();
       renderCheckStatus();
     } catch (err) {
@@ -706,54 +774,10 @@
     }
   }
 
-  function clearUpdateFlags(btn) {
-    // Mirror a successful update in the cached data and the visible badges
-    // right away, without re-rendering (which would wipe the ✅ + duration).
-    const { kind, iid, sid, cid, eid } = btn.dataset;
-    const instUpd = updates.instances.find((u) => u.instance.id === Number(iid));
-    if (instUpd) {
-      if (kind === "container") {
-        const c = updateInfoForCtr(Number(iid), cid, eid ? Number(eid) : null);
-        if (c && c.status === "update-available") c.status = "up-to-date";
-      } else {
-        const s = instUpd.stacks.find((x) => x.id === Number(sid));
-        if (s) {
-          s.images.forEach((i) => { if (i.status === "update-available") i.status = "up-to-date"; });
-          s.updatesAvailable = 0;
-        }
-      }
-    }
-    const row = btn.closest("tr");
-    if (row) {
-      row.querySelector(".badge.upd")?.remove();
-      row.querySelectorAll(".img-line.upd").forEach((el) => {
-        el.classList.remove("upd");
-        el.title = "Updated just now";
-        el.textContent = el.textContent.replace(/^⬆ /, "").replace(/ new version$/, "");
-      });
-    }
-    const section = btn.closest("section");
-    const hdrBadge = section?.querySelector(".instance-header .badge.upd");
-    if (instUpd) {
-      const remaining =
-        instUpd.stacks.reduce((n, s) => n + (s.updatesAvailable || 0), 0) +
-        (instUpd.containers || []).filter((c) => c.status === "update-available").length;
-      if (hdrBadge) {
-        if (remaining) hdrBadge.textContent = `⬆ ${remaining} update${remaining === 1 ? "" : "s"}`;
-        else hdrBadge.remove();
-      }
-      const allBtn = section?.querySelector(".update-all-btn");
-      if (allBtn && !remaining) {
-        allBtn.classList.remove("has-upd");
-        if (!allBtn.disabled) allBtn.textContent = "Update all";
-      }
-    }
-  }
-
-  let busyCount = 0;      // in-flight updates/cleanups pause the auto-refresh
   let refreshBase = 0;    // seconds between refreshes (0 = auto-refresh off)
   let retryDelay = null;  // set while something is unreachable: retry sooner
   let refreshTimer = null;
+  let jobWaitSeconds = 40 * 60;  // how long to keep asking about a job; the server says
 
   // An instance that's unreachable is usually mid-reboot, so re-check in
   // seconds rather than waiting out the full interval, backing off until it
@@ -773,79 +797,63 @@
 
   function autoTick() {
     const loginVisible = $("#view-login").style.display !== "none";
-    if (loginVisible || busyCount > 0 || document.hidden) { scheduleRefresh(); return; }
+    // Not while something is being updated or cleaned: half-way states would
+    // flash past as "down".
+    if (loginVisible || anyBusy() || document.hidden) { scheduleRefresh(); return; }
     refresh();  // reschedules itself when it finishes
   }
 
-  async function runUpdate(btn) {
-    const { kind, iid, sid, cid, eid } = btn.dataset;
-    const key = kind === "container" ? (eid ? `${eid}-${cid}` : cid) : sid;
-    const url = kind === "container"
-      ? `/api/instances/${iid}/containers/${cid}/update${eid ? `?endpointId=${eid}` : ""}`
-      : `/api/instances/${iid}/stacks/${sid}/update`;
-    const msg = document.getElementById(`msg-${iid}-${key}`);
-    const idleLabel = () => btn.classList.contains("has-upd") ? "⬆ Update" : "Update";
-    btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span>Updating…';
-    if (msg) { msg.textContent = ""; msg.className = "result-msg"; }
-    busyCount++;
-    try {
-      const res = await fetch(url, { method: "POST" });
-      let body = await res.json().catch(() => ({}));
-      let status = res.status;
-      if (status === 202 && body.jobId) {
-        // Still deploying: the server keeps watching it; we keep asking.
-        body = await waitForJob(body.jobId);
-        status = body.ok ? 200 : 502;
-      }
-      const ok = status < 400 && !!body.ok;
-      btn.innerHTML = ok ? "✅ Updated" : "❌ Failed";
-      if (ok) { btn.classList.remove("has-upd"); clearUpdateFlags(btn); }
-      if (msg) {
-        msg.textContent = ok
-          ? `${((body.durationMs || 0) / 1000).toFixed(1)}s · ${body.message || "done"}`
-          : (body.message || body.detail || `HTTP ${status}`);
-        msg.className = "result-msg " + (ok ? "ok" : "err");
-      }
-      setTimeout(() => { btn.disabled = false; btn.textContent = idleLabel(); }, 4000);
+  // --- actions -----------------------------------------------------------------
+
+  async function runUpdate(entry) {
+    const key = entry.key;
+    const op = setOp(key, { action: "update", phase: "busy", label: "Updating…", message: "" });
+    const finish = (ok, message) => {
+      Object.assign(op, { phase: ok ? "ok" : "err", ok, message });
+      render();
+      settleLater(key, op);
       return ok;
+    };
+    try {
+      let result = await api(`${entry.path}/update${entry.query}`, { method: "POST" });
+      // Still deploying: the server keeps watching it; we keep asking.
+      if (result.jobId && result.ok == null) result = await waitForJob(result.jobId);
+      if (!result.ok) return finish(false, result.message || "Failed");
+      // The server has already cleared this row's badge in its cached check.
+      await loadUpdates();
+      return finish(true, `${((result.durationMs || 0) / 1000).toFixed(1)}s · ${result.message || "done"}`);
     } catch (err) {
       if (err instanceof TypeError) {
         // The connection to Restruo died mid-update — the usual cause is
         // Restruo redeploying itself. Wait for it to come back, then reload.
-        btn.innerHTML = '<span class="spinner"></span>Reconnecting…';
-        if (msg) {
-          msg.textContent = "Connection lost — if this was Restruo itself, it's restarting. Waiting for it to come back…";
-          msg.className = "result-msg";
-        }
+        Object.assign(op, {
+          label: "Reconnecting…",
+          message: "Connection lost — if this was Restruo itself, it's restarting. Waiting for it to come back…",
+        });
+        render();
         if (await waitForBackend(180)) { location.reload(); return true; }
       }
-      btn.innerHTML = "❌ Failed";
-      if (msg) { msg.textContent = err.message; msg.className = "result-msg err"; }
-      setTimeout(() => { btn.disabled = false; btn.textContent = idleLabel(); }, 4000);
-      return false;
-    } finally {
-      busyCount--;
+      return finish(false, err.message);
     }
   }
 
   async function waitForJob(jobId) {
-    // The server keeps a job for an hour and a helper may run for fifteen
-    // minutes after a slow pull, so wait longer than any job can take; past
-    // that, say tracking was lost rather than call it failed. A brief network
-    // blip is not a failure — keep asking.
-    const deadline = Date.now() + 40 * 60 * 1000;
+    // Wait longer than any job can take; past that, say tracking was lost
+    // rather than call it failed. A brief network blip is not a failure —
+    // keep asking.
+    const deadline = Date.now() + jobWaitSeconds * 1000;
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 2000));
       try {
-        const res = await fetch(`/api/jobs/${jobId}`);
-        if (res.status === 401) { showLogin(true); return { ok: false, message: "Signed out." }; }
-        if (!res.ok) return { ok: false, message: `HTTP ${res.status}` };
-        const job = await res.json();
+        const job = await api(`/api/jobs/${jobId}`);
         if (job.done) return job.result || { ok: false, message: "No result recorded." };
-      } catch (err) { /* transient — try again */ }
+      } catch (err) {
+        if (err instanceof ApiError)
+          return { ok: false, message: err.status === 401 ? "Signed out." : err.message };
+        /* transient — try again */
+      }
     }
-    return { ok: false, message: "Lost track of this update after forty minutes — it was not seen to fail; check the stack in Portainer." };
+    return { ok: false, message: `Lost track of this update after ${Math.round(jobWaitSeconds / 60)} minutes — it was not seen to fail; check the stack in Portainer.` };
   }
 
   async function waitForBackend(seconds) {
@@ -860,20 +868,30 @@
     return false;
   }
 
-  function fmtBytes(bytes) {
-    if (!bytes) return "0 B";
-    const units = ["B", "KB", "MB", "GB", "TB"];
-    const i = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
-    return `${(bytes / 1024 ** i).toFixed(i ? 1 : 0)} ${units[i]}`;
+  async function runPower(entry, verb) {
+    const key = entry.key;
+    const op = setOp(key, { action: "power", verb, phase: "busy", message: "" });
+    try {
+      await api(`${entry.path}/${verb}${entry.query}`, { method: "POST" });
+      op.phase = "ok";
+      render();
+      // Re-read real state so the button flips and the red dot follows.
+      setTimeout(() => { if (ops.get(key) === op) ops.delete(key); refresh(); }, 1500);
+    } catch (err) {
+      Object.assign(op, { phase: "err", ok: false, message: err.message });
+      render();
+      settleLater(key, op);
+    }
   }
 
-  async function runCleanup(btn, inst) {
+  async function runCleanup(inst) {
+    const iid = inst.instance.id;
     const name = inst.instance.name;
     // Stopping a stack removes its containers, so its images look unused.
     // Name them, because "all unused images" would delete exactly those.
-    const stopped = (inst.stacks || []).filter((s) => s.status === "inactive").map((s) => s.name);
+    const stopped = (inst.stacks || []).filter((s) => s.stopped).map((s) => s.name);
     const stoppedWarning = stopped.length
-      ? `<div class="chk"><span class="danger">⚠ ${stopped.length} stopped stack${stopped.length === 1 ? "" : "s"} on this instance (${esc(stopped.join(", "))}). Stopping a stack removes its containers, so its images and volumes look unused — the two ticked-off options below would delete them.</span></div>`
+      ? `<div class="chk"><span class="danger">⚠ ${plural(stopped.length, "stopped stack")} on this instance (${esc(stopped.join(", "))}). Stopping a stack removes its containers, so its images and volumes look unused — the two ticked-off options below would delete them.</span></div>`
       : "";
     const answer = await confirmModal(`Clean up “${name}”?`,
       "Removes Docker leftovers. Running stacks and containers are never touched.",
@@ -895,27 +913,18 @@
     };
     if (!opts || (!opts.images && !opts.networks && !opts.volumes)) return;
 
-    btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span>Cleaning…';
-    busyCount++;
+    setOp(`${iid}:prune`, { action: "prune", phase: "busy" });
     let title;
     let summary;
     try {
-      const res = await fetch(`/api/instances/${inst.instance.id}/prune`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(opts),
-      });
-      if (res.status === 401) { showLogin(true); throw new Error("Signed out"); }
-      const body = await res.json();
-      if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
+      const done = await api(`/api/instances/${iid}/prune`, { method: "POST", body: opts });
       const parts = [];
-      if (opts.images) parts.push(`${body.images} image${body.images === 1 ? "" : "s"}`);
-      if (opts.networks) parts.push(`${body.networks} network${body.networks === 1 ? "" : "s"}`);
-      if (opts.volumes) parts.push(`${body.volumes} volume${body.volumes === 1 ? "" : "s"}`);
-      title = body.ok ? `Cleanup finished — ${name}` : `Cleanup finished with errors — ${name}`;
-      summary = `Freed ${fmtBytes(body.spaceReclaimed)} — removed ${parts.join(", ")}.` +
-        (body.errors.length ? `\n\nProblems: ${body.errors.join("; ")}` : "");
+      if (opts.images) parts.push(plural(done.images, "image"));
+      if (opts.networks) parts.push(plural(done.networks, "network"));
+      if (opts.volumes) parts.push(plural(done.volumes, "volume"));
+      title = done.ok ? `Cleanup finished — ${name}` : `Cleanup finished with errors — ${name}`;
+      summary = `Freed ${fmtBytes(done.spaceReclaimed)} — removed ${parts.join(", ")}.` +
+        (done.errors.length ? `\n\nProblems: ${done.errors.join("; ")}` : "");
     } catch (err) {
       title = `Cleanup failed — ${name}`;
       summary = err.message;
@@ -923,149 +932,112 @@
     // Restore the button as soon as the work is done: the result dialog may sit
     // in the queue behind another instance's, and a spinner waiting on someone
     // else's dialog looks like a hang.
-    busyCount--;
-    btn.disabled = false;
-    btn.textContent = "Clean up";
-    await confirmModal(title, summary, { okOnly: true, okText: "OK" });
+    ops.delete(`${iid}:prune`);
+    render();
+    await notice(title, summary);
   }
 
-  async function runPower(btn) {
-    const { power, kind, iid, id, eid, name } = btn.dataset;
-    const rowKey = kind === "container" && eid ? `${eid}-${id}` : id;
-    const msg = document.getElementById(`msg-${iid}-${rowKey}`);
-    const url = `/api/instances/${iid}/${kind === "container" ? "containers" : "stacks"}/${id}/${power}`
-      + (kind === "container" && eid ? `?endpointId=${eid}` : "");
-    btn.disabled = true;
-    btn.innerHTML = `<span class="spinner"></span>${power === "stop" ? "Stopping…" : "Starting…"}`;
-    if (msg) { msg.textContent = ""; msg.className = "result-msg"; }
-    busyCount++;
-    try {
-      const res = await fetch(url, { method: "POST" });
-      const body = await res.json().catch(() => ({}));
-      const ok = res.ok && body.ok;
-      btn.innerHTML = ok ? "✅ Done" : "❌ Failed";
-      if (msg && !ok) {
-        msg.textContent = body.message || body.detail || `HTTP ${res.status}`;
-        msg.className = "result-msg err";
-      }
-      // Re-read real state so the button flips and the red dot follows.
-      if (ok) setTimeout(refresh, 1500);
-      else setTimeout(() => { btn.disabled = false; btn.textContent = power === "stop" ? "Stop" : "Start"; }, 4000);
-    } catch (err) {
-      btn.innerHTML = "❌ Failed";
-      if (msg) { msg.textContent = err.message; msg.className = "result-msg err"; }
-      setTimeout(() => { btn.disabled = false; btn.textContent = power === "stop" ? "Stop" : "Start"; }, 4000);
-    } finally {
-      busyCount--;
+  async function confirmUpdate(entry) {
+    const r = entry.row;
+    const isContainer = entry.kind === "container";
+    // Which of these applies is the server's call (app/dashboard.py); the
+    // page only words it.
+    let text = isContainer
+      ? "This pulls the image fresh and recreates the container with its existing configuration."
+      : "This repulls the image(s) and redeploys the stack. Containers will restart.";
+    if (r.isSelf)
+      text += " This looks like Restruo itself — the page will disconnect while it restarts, then reload automatically.";
+    if (r.stopped)
+      text = isContainer
+        ? "This container is stopped. It is recreated on the freshly pulled image and then stopped again — Portainer's recreate starts it, so it runs for a moment."
+        : "This stack is stopped, and it stays stopped: its images are pulled so that it starts on the new version next time. Nothing is started.";
+    if (r.helper === "agent")
+      text = "Portainer can't recreate its own agent — the command travels through it. " +
+        "Restruo starts a short-lived helper on that host instead: it pulls the new image first, " +
+        "swaps the container keeping its ports, mounts and settings, and puts the old one back if the new one doesn't stay up. " +
+        "The environment is unreachable for about twenty seconds while it happens.";
+    if (r.helper === "portainer")
+      text = "This replaces Portainer itself, using a short-lived helper on its host: it pulls the new image first, " +
+        "swaps the container keeping its ports, mounts and settings, and puts the old one back if the new one doesn't start. " +
+        "A new Portainer version upgrades its database on first start, and that cannot be undone by going back to the old image — " +
+        "take a backup first (Portainer → Settings → Backup). This instance is unreachable for a minute or so while it happens.";
+    if (await confirmModal(`Update “${entry.name}”?`, text)) runUpdate(entry);
+  }
+
+  async function confirmPower(entry, verb) {
+    if (verb === "stop") {
+      const yes = await confirmModal(`Stop “${entry.name}”?`,
+        "Its containers will shut down and stay down until you start them again.",
+        { okText: "Stop" });
+      if (!yes) return;
     }
+    runPower(entry, verb);  // starting is harmless — no confirmation
+  }
+
+  async function updateAll(inst) {
+    const iid = inst.instance.id;
+    if (!updates.checkedAt) {
+      await notice("No update check yet",
+        "Hit “Refresh” first so the registries get scanned — “Update all” only redeploys stacks and containers that actually have an update available.");
+      return;
+    }
+    // What is on screen with an update waiting — so a filter narrows it — and
+    // that the server will take. Portainer itself is never part of a bulk
+    // update: its database upgrade is one-way, so it gets its own click and
+    // its own warning.
+    const filter = currentFilter();
+    const flagged = entriesOf(inst).filter((e) =>
+      e.updates && matches(e, filter) && !isBusy(e.key) &&
+      !e.row.updateProtected && e.row.helper !== "portainer");
+    if (!flagged.length) {
+      await notice("All up to date", `Nothing on “${inst.instance.name}” has an update available.`);
+      return;
+    }
+    const yes = await confirmModal(
+      `Update ${flagged.length} on “${inst.instance.name}”?`,
+      `Only the ${plural(flagged.length, "item")} with an update available will be repulled and redeployed. ` +
+      `A redeploy takes about a minute each; ${UPDATE_ALL_CONCURRENCY} run at a time.`);
+    if (!yes) return;
+    setOp(`${iid}:all`, { action: "all", phase: "busy" });
+    // Portainer deploys different stacks concurrently without conflict, and
+    // each redeploy takes about a minute — sequentially, twenty stacks is
+    // twenty minutes. Capped so a NAS isn't asked to pull everything at once.
+    const runPool = async (entries) => {
+      const queue = [...entries];
+      await Promise.all(
+        Array.from({ length: Math.min(UPDATE_ALL_CONCURRENCY, queue.length) }, async () => {
+          while (queue.length) await runUpdate(queue.shift());
+        })
+      );
+    };
+    // Agents go last, once nothing is deploying any more: every stack on an
+    // environment is deployed THROUGH its agent, so replacing the agent
+    // mid-deploy would cut that deploy off.
+    await runPool(flagged.filter((e) => e.row.helper !== "agent"));
+    await runPool(flagged.filter((e) => e.row.helper === "agent"));
+    ops.delete(`${iid}:all`);
+    render();
   }
 
   document.addEventListener("click", async (e) => {
     const unkBadge = e.target.closest(".badge.unk, .img-line.unk");
     if (unkBadge && unkBadge.title) {
       e.stopPropagation();  // don't collapse the instance we're inspecting
-      await confirmModal("Couldn't check these for updates", unkBadge.title,
-        { okOnly: true, okText: "OK" });
+      await notice("Couldn't check these for updates", unkBadge.title);
       return;
     }
-    const powerButton = e.target.closest(".power-btn");
-    if (powerButton && powerButton.dataset.power) {
-      const { power, name } = powerButton.dataset;
-      if (power === "stop") {
-        const yes = await confirmModal(`Stop “${name}”?`,
-          "Its containers will shut down and stay down until you start them again.",
-          { okText: "Stop" });
-        if (!yes) return;
-      }
-      runPower(powerButton);  // starting is harmless — no confirmation
+    const btn = e.target.closest("button[data-act]");
+    if (!btn || btn.disabled) return;
+    const act = btn.dataset.act;
+    if (act === "cleanup" || act === "update-all") {
+      const inst = data.find((i) => i.instance.id === Number(btn.dataset.iid));
+      if (inst) (act === "cleanup" ? runCleanup : updateAll)(inst);
       return;
     }
-    const cleanupBtn = e.target.closest(".cleanup-btn");
-    if (cleanupBtn) {
-      const inst = data.find((i) => i.instance.id === Number(cleanupBtn.dataset.iid));
-      if (inst) runCleanup(cleanupBtn, inst);
-      return;
-    }
-    const updateBtn = e.target.closest(".update-btn");
-    if (updateBtn) {
-      const { kind, iid, sid, cid, eid, name } = updateBtn.dataset;
-      let text = kind === "container"
-        ? "This pulls the image fresh and recreates the container with its existing configuration."
-        : "This repulls the image(s) and redeploys the stack. Containers will restart.";
-      const inst = data.find((i) => i.instance.id === Number(iid));
-      const images = kind === "container"
-        ? [(inst?.containers || []).find((c) => c.id === cid
-             && (!eid || c.endpointId === Number(eid)))?.image || ""]
-        : inst?.stacks?.find((s) => s.id === Number(sid))?.images || [];
-      if (images.some((i) => i.toLowerCase().includes("restruo")))
-        text += " This looks like Restruo itself — the page will disconnect while it restarts, then reload automatically.";
-      if (updateBtn.dataset.stopped)
-        text = kind === "container"
-          ? "This container is stopped. It is recreated on the freshly pulled image and then stopped again — Portainer's recreate starts it, so it runs for a moment."
-          : "This stack is stopped, and it stays stopped: its images are pulled so that it starts on the new version next time. Nothing is started.";
-      const helper = updateBtn.dataset.helper;
-      if (helper === "agent")
-        text = "Portainer can't recreate its own agent — the command travels through it. " +
-          "Restruo starts a short-lived helper on that host instead: it pulls the new image first, " +
-          "swaps the container keeping its ports, mounts and settings, and puts the old one back if the new one doesn't stay up. " +
-          "The environment is unreachable for about twenty seconds while it happens.";
-      if (helper === "portainer")
-        text = "This replaces Portainer itself, using a short-lived helper on its host: it pulls the new image first, " +
-          "swaps the container keeping its ports, mounts and settings, and puts the old one back if the new one doesn't start. " +
-          "A new Portainer version upgrades its database on first start, and that cannot be undone by going back to the old image — " +
-          "take a backup first (Portainer → Settings → Backup). This instance is unreachable for a minute or so while it happens.";
-      const yes = await confirmModal(`Update “${name}”?`, text);
-      if (yes) runUpdate(updateBtn);
-      return;
-    }
-    const allBtn = e.target.closest(".update-all-btn");
-    if (allBtn) {
-      const iid = Number(allBtn.dataset.iid);
-      const inst = data.find((i) => i.instance.id === iid);
-      if (!inst) return;
-      if (!updates.checkedAt) {
-        await confirmModal("No update check yet",
-          "Hit “Refresh” first so the registries get scanned — “Update all” only redeploys stacks and containers that actually have an update available.",
-          { okOnly: true, okText: "OK" });
-        return;
-      }
-      const section = allBtn.closest("section");
-      // Portainer itself is never part of a bulk update: its database upgrade
-      // is one-way, so it gets its own click and its own warning.
-      const flagged = [...section.querySelectorAll(".update-btn.has-upd")]
-        .filter((b) => b.dataset.helper !== "portainer");
-      if (!flagged.length) {
-        await confirmModal("All up to date",
-          `Nothing on “${inst.instance.name}” has an update available.`,
-          { okOnly: true, okText: "OK" });
-        return;
-      }
-      const yes = await confirmModal(
-        `Update ${flagged.length} on “${inst.instance.name}”?`,
-        `Only the ${flagged.length} item${flagged.length === 1 ? "" : "s"} with an update available will be repulled and redeployed. ` +
-        `A redeploy takes about a minute each; ${UPDATE_ALL_CONCURRENCY} run at a time.`);
-      if (!yes) return;
-      allBtn.disabled = true;
-      allBtn.innerHTML = '<span class="spinner"></span>Updating…';
-      // Portainer deploys different stacks concurrently without conflict, and
-      // each redeploy takes about a minute — sequentially, twenty stacks is
-      // twenty minutes. Capped so a NAS isn't asked to pull everything at once.
-      const runPool = async (buttons) => {
-        const queue = [...buttons];
-        await Promise.all(
-          Array.from({ length: Math.min(UPDATE_ALL_CONCURRENCY, queue.length) }, async () => {
-            while (queue.length) await runUpdate(queue.shift());
-          })
-        );
-      };
-      // Agents go last, once nothing is deploying any more: every stack on an
-      // environment is deployed THROUGH its agent, so replacing the agent
-      // mid-deploy would cut that deploy off.
-      await runPool(flagged.filter((b) => b.dataset.helper !== "agent"));
-      await runPool(flagged.filter((b) => b.dataset.helper === "agent"));
-      allBtn.disabled = false;
-      allBtn.textContent = "Update all";
-    }
+    const entry = findEntry(btn.dataset.key);
+    if (!entry) return;
+    if (act === "update") confirmUpdate(entry);
+    else confirmPower(entry, act);
   });
 
   // --- instance settings ---
@@ -1128,10 +1100,7 @@
   async function loadInstances() {
     const list = $("#inst-list");
     try {
-      const res = await fetch("/api/instances");
-      if (res.status === 401) { showLogin(true); return; }
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const insts = await res.json();
+      const insts = await api("/api/instances");
       if (!insts.length) {
         list.innerHTML = '<p class="count">No instances yet — add your first Portainer below.</p>';
         return;
@@ -1157,12 +1126,8 @@
         btn.addEventListener("click", async () => {
           btn.disabled = true;
           try {
-            const res = await fetch(`/api/instances/${btn.dataset.id}/move`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ direction: btn.dataset.dir }),
-            });
-            if (!res.ok) alert(`Could not reorder (HTTP ${res.status}).`);
+            await api(`/api/instances/${btn.dataset.id}/move`,
+              { method: "POST", body: { direction: btn.dataset.dir } });
           } catch (err) { alert(`Could not reorder: ${err.message}`); }
           loadInstances();
         }));
@@ -1174,16 +1139,14 @@
           const yes = await confirmModal(`Delete “${btn.dataset.name}”?`,
             "Restruo will forget this Portainer instance and its credentials. Nothing on the machine itself is touched.");
           if (!yes) return;
-          const res = await fetch(`/api/instances/${btn.dataset.id}`, { method: "DELETE" });
-          if (!res.ok) {
-            const body = await res.json().catch(() => ({}));
-            alert(`Could not remove it: ${body.detail || `HTTP ${res.status}`}`);
-          }
-          if (res.ok && editingId === Number(btn.dataset.id)) fillForm(null);
+          try {
+            await api(`/api/instances/${btn.dataset.id}`, { method: "DELETE" });
+            if (editingId === Number(btn.dataset.id)) fillForm(null);
+          } catch (err) { alert(`Could not remove it: ${err.message}`); }
           loadInstances();
         }));
     } catch (err) {
-      list.innerHTML = `<p class="count">Failed to load: ${esc(err.message)}</p>`;
+      if (err.status !== 401) list.innerHTML = `<p class="count">Failed to load: ${esc(err.message)}</p>`;
     }
   }
 
@@ -1192,21 +1155,15 @@
     const saveBtn = $("#f-save");
     saveBtn.disabled = true;
     try {
-      const url = editingId === null ? "/api/instances" : `/api/instances/${editingId}`;
-      const res = await fetch(url, {
-        method: editingId === null ? "POST" : "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(formBody()),
-      });
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
       const wasAdd = editingId === null;
+      await api(wasAdd ? "/api/instances" : `/api/instances/${editingId}`,
+        { method: wasAdd ? "POST" : "PUT", body: formBody() });
       fillForm(null);
       formMsg(wasAdd ? "Instance added." : "Saved.", true);
       loadInstances();
       // Cover the new/changed instance right away instead of waiting for the
       // next scheduled registry check.
-      fetch("/api/check-updates", { method: "POST" }).then(() => loadUpdates()).catch(() => {});
+      api("/api/check-updates", { method: "POST" }).then(() => loadUpdates()).catch(() => {});
     } catch (err) {
       formMsg(err.message, false);
     } finally {
@@ -1217,17 +1174,12 @@
   $("#f-test").addEventListener("click", async () => {
     const btn = $("#f-test");
     btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span>Testing…';
+    btn.innerHTML = SPINNER + "Testing…";
     try {
       const qs = editingId === null ? "" : `?id=${editingId}`;
-      const res = await fetch(`/api/instances/test${qs}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(formBody()),
-      });
-      const body = await res.json();
-      if (body.ok) formMsg(`✅ Connected — ${body.endpoints} environment${body.endpoints === 1 ? "" : "s"} found.`, true);
-      else formMsg(`❌ ${body.error || "Connection failed"}`, false);
+      const tested = await api(`/api/instances/test${qs}`, { method: "POST", body: formBody() });
+      if (tested.ok) formMsg(`✅ Connected — ${plural(tested.endpoints, "environment")} found.`, true);
+      else formMsg(`❌ ${tested.error || "Connection failed"}`, false);
     } catch (err) {
       formMsg(`❌ ${err.message}`, false);
     }
@@ -1243,13 +1195,11 @@
     const btn = $("#email-test");
     const msg = $("#email-msg");
     btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span>Sending…';
+    btn.innerHTML = SPINNER + "Sending…";
     msg.textContent = "";
     try {
-      const res = await fetch("/api/test-email", { method: "POST" });
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
-      msg.textContent = `Sent to ${body.sentTo.join(", ")} — check your inbox.`;
+      const sent = await api("/api/test-email", { method: "POST" });
+      msg.textContent = `Sent to ${sent.sentTo.join(", ")} — check your inbox.`;
       msg.className = "ok";
     } catch (err) {
       msg.textContent = err.message;
@@ -1267,11 +1217,17 @@
   });
   $("#signout-btn").addEventListener("click", async () => {
     try {
-      const res = await fetch("/api/logout", { method: "POST" });
-      if (!res.ok && res.status !== 401) { alert(`Sign-out failed (HTTP ${res.status}) — the session may still be valid.`); return; }
-    } catch (err) { /* already unreachable: nothing to keep */ }
-    data = []; updates = { instances: [] };
-    $("#stacks").innerHTML = "";
+      await api("/api/logout", { method: "POST", expectSignedOut: true });
+    } catch (err) {
+      // Already signed out, or already unreachable: nothing to keep.
+      if (err instanceof ApiError && err.status !== 401) {
+        alert(`Sign-out failed (${err.message}) — the session may still be valid.`);
+        return;
+      }
+    }
+    data = []; updates = { checkedAt: null, instances: [] };
+    ops.clear();
+    render();
     showLogin(true);
   });
 
@@ -1279,31 +1235,32 @@
   $("#search").addEventListener("input", render);
 
   function loadUiConfig() {
-  fetch("/api/ui-config").then((r) => r.ok ? r.json() : null).then((cfg) => {
-    if (cfg && cfg.authEnabled) $("#signout-btn").style.display = "";
-    if (cfg && cfg.refreshSeconds > 0) {
-      refreshBase = cfg.refreshSeconds;
-      scheduleRefresh();
-    }
-    if (cfg && cfg.title) {
-      document.title = cfg.title;
-      $("#login-title").textContent = cfg.title;
-      $("#title").innerHTML = `${esc(cfg.title)} <span>Portainer stack updater</span>`;
-    }
-    if (cfg && cfg.email) {
-      $("#email-panel").style.display = "";
-      $("#email-status").textContent = cfg.email.configured
-        ? `Emailing new updates to ${cfg.email.recipients.join(", ")} via ${cfg.email.host}.`
-        : "Not configured — set RESTRUO_SMTP_USER and RESTRUO_SMTP_PASSWORD to get an email when an update appears.";
-      $("#email-test").disabled = !cfg.email.configured;
-    }
-    // The running build lives on the settings page, out of the way.
-    if (cfg && cfg.version) {
-      const ver = cfg.version === "dev" ? "dev" : cfg.version.slice(0, 7);
-      $("#build-line").textContent = `build ${ver}`;
-      $("#build-line").title = cfg.version;
-    }
-  }).catch(() => {});
+    api("/api/ui-config").then((cfg) => {
+      if (cfg.authEnabled) $("#signout-btn").style.display = "";
+      if (cfg.jobWaitSeconds > 0) jobWaitSeconds = cfg.jobWaitSeconds;
+      if (cfg.refreshSeconds > 0) {
+        refreshBase = cfg.refreshSeconds;
+        scheduleRefresh();
+      }
+      if (cfg.title) {
+        document.title = cfg.title;
+        $("#login-title").textContent = cfg.title;
+        $("#title").innerHTML = `${esc(cfg.title)} <span>Portainer stack updater</span>`;
+      }
+      if (cfg.email) {
+        $("#email-panel").style.display = "";
+        $("#email-status").textContent = cfg.email.configured
+          ? `Emailing new updates to ${cfg.email.recipients.join(", ")} via ${cfg.email.host}.`
+          : "Not configured — set RESTRUO_SMTP_USER and RESTRUO_SMTP_PASSWORD to get an email when an update appears.";
+        $("#email-test").disabled = !cfg.email.configured;
+      }
+      // The running build lives on the settings page, out of the way.
+      if (cfg.version) {
+        const ver = cfg.version === "dev" ? "dev" : cfg.version.slice(0, 7);
+        $("#build-line").textContent = `build ${ver}`;
+        $("#build-line").title = cfg.version;
+      }
+    }).catch(() => {});
   }
   loadUiConfig();
 

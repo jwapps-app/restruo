@@ -19,30 +19,17 @@ import re
 import httpx
 import yaml
 
+from . import timing
+from .errors import PortainerError, describe
+from .health import container_is_down
+
 logger = logging.getLogger("restruo.portainer")
 
-# Reads (list/get) should fail fast; a redeploy legitimately takes minutes
-# because Portainer pulls images before recreating containers.
-READ_TIMEOUT = 10.0
-REDEPLOY_TIMEOUT = 600.0
-
 STACK_TYPE_NAMES = {1: "swarm", 2: "compose", 3: "kubernetes"}
-STACK_STATUS_NAMES = {1: "active", 2: "inactive"}
+STACK_INACTIVE = 2          # Portainer's Status for a stack that has been stopped
+STACK_STATUS_NAMES = {1: "active", STACK_INACTIVE: "inactive"}
 
 _IMAGE_RE = re.compile(r"^\s*image\s*:\s*['\"]?([^'\"\s#]+)", re.MULTILINE)
-
-
-class PortainerError(Exception):
-    """Raised when a Portainer instance returns an error response.
-
-    Carries Portainer's error body verbatim so bad tokens / RBAC problems are
-    debuggable from the dashboard.
-    """
-
-    def __init__(self, status_code: int, message: str):
-        self.status_code = status_code
-        self.message = message
-        super().__init__(f"Portainer returned {status_code}: {message}")
 
 
 def extract_images(stack_file_content: str) -> list[str]:
@@ -292,7 +279,7 @@ class PortainerClient:
         return httpx.AsyncClient(
             base_url=self.instance.base_url,
             headers=self._headers,
-            timeout=READ_TIMEOUT,
+            timeout=timing.READ_TIMEOUT,
             transport=transport,
         )
 
@@ -317,7 +304,7 @@ class PortainerClient:
 
     async def _close_later(self, client: httpx.AsyncClient) -> None:
         try:
-            await asyncio.sleep(REDEPLOY_TIMEOUT + 60)
+            await asyncio.sleep(timing.POOL_RETIRE_SECONDS)
         finally:
             try:
                 await client.aclose()
@@ -530,7 +517,7 @@ class PortainerClient:
             "POST",
             f"/api/endpoints/{endpoint_id}/docker/images/prune",
             params={"filters": json.dumps({"dangling": ["false" if all_unused else "true"]})},
-            timeout=REDEPLOY_TIMEOUT,
+            timeout=timing.REDEPLOY_TIMEOUT,
         )
         self._check(response)
         return response.json()
@@ -567,8 +554,7 @@ class PortainerClient:
                 await self.remove_network(endpoint_id, network["Id"])
                 removed += 1
             except Exception as exc:
-                message = exc.message if isinstance(exc, PortainerError) else str(exc)
-                errors.append(f"{network.get('Name')}: {message}")
+                errors.append(f"{network.get('Name')}: {describe(exc)}")
         return removed, errors
 
     async def prune_volumes(self, endpoint_id: int) -> dict:
@@ -581,7 +567,7 @@ class PortainerClient:
                 "POST",
                 f"/api/endpoints/{endpoint_id}/docker/volumes/prune",
                 params={"filters": json.dumps({"all": ["true"]})},
-                timeout=REDEPLOY_TIMEOUT,
+                timeout=timing.REDEPLOY_TIMEOUT,
             )
             self._check(response)
         except PortainerError as exc:
@@ -590,7 +576,7 @@ class PortainerClient:
             response = await self._request(
                 "POST",
                 f"/api/endpoints/{endpoint_id}/docker/volumes/prune",
-                timeout=REDEPLOY_TIMEOUT,
+                timeout=timing.REDEPLOY_TIMEOUT,
             )
             self._check(response)
         return response.json()
@@ -602,7 +588,7 @@ class PortainerClient:
             "POST",
             f"/api/stacks/{stack_id}/{action}",
             params={"endpointId": endpoint_id},
-            timeout=REDEPLOY_TIMEOUT,
+            timeout=timing.REDEPLOY_TIMEOUT,
         )
         self._check(response)
         try:
@@ -623,7 +609,7 @@ class PortainerClient:
             # unknown length, which it rejects on start as a "non-empty request
             # body" — so starting a container on an agent environment failed.
             json={},
-            timeout=REDEPLOY_TIMEOUT,
+            timeout=timing.REDEPLOY_TIMEOUT,
         )
         # 304 means it was already in that state — not an error worth surfacing.
         if response.status_code != 304:
@@ -656,7 +642,7 @@ class PortainerClient:
             f"/api/endpoints/{endpoint_id}/docker/images/create",
             params={"fromImage": image},
             headers=headers,
-            timeout=REDEPLOY_TIMEOUT,
+            timeout=timing.REDEPLOY_TIMEOUT,
         )
         self._check(response)
         # The Engine answers 200 and reports a failed pull inside the stream.
@@ -674,7 +660,7 @@ class PortainerClient:
             f"/api/endpoints/{endpoint_id}/docker/containers/create",
             params={"name": name},
             json=body,
-            timeout=REDEPLOY_TIMEOUT,
+            timeout=timing.REDEPLOY_TIMEOUT,
         )
         self._check(response)
         return response.json()["Id"]
@@ -707,7 +693,7 @@ class PortainerClient:
             "POST",
             f"/api/docker/{endpoint_id}/containers/{container_id}/recreate",
             json={"PullImage": True},
-            timeout=REDEPLOY_TIMEOUT,
+            timeout=timing.REDEPLOY_TIMEOUT,
         )
         self._check(response)
         try:
@@ -733,7 +719,7 @@ class PortainerClient:
                 "PullImage": True,
                 "Prune": prune,
             },
-            timeout=REDEPLOY_TIMEOUT,
+            timeout=timing.REDEPLOY_TIMEOUT,
         )
         self._check(response)
         return response.json()
@@ -754,7 +740,7 @@ class PortainerClient:
                 "Prune": prune,
                 "RepullImageAndRedeploy": True,
             },
-            timeout=REDEPLOY_TIMEOUT,
+            timeout=timing.REDEPLOY_TIMEOUT,
         )
         self._check(response)
         return response.json()
@@ -860,6 +846,22 @@ def stack_containers(stack: dict, containers: list[dict]) -> list[dict]:
     return out
 
 
+def helper_kind(image: str) -> str:
+    """"portainer", "agent", or "" — which of the two containers that cannot
+    survive their own recreate this image is, if either. They are told apart
+    because replacing Portainer migrates its database and an agent has none."""
+    name = (image or "").lower()
+    if "portainer/portainer" in name:
+        return "portainer"
+    if "portainer/agent" in name:
+        return "agent"
+    return ""
+
+
+def is_restruo_image(image: str) -> bool:
+    return "restruo" in (image or "").lower()
+
+
 def cannot_recreate_image(image: str) -> bool:
     """Images whose container carries the connection used to recreate it.
 
@@ -873,8 +875,7 @@ def cannot_recreate_image(image: str) -> bool:
     Restruo is not included: recreating itself is disruptive but completes,
     because Portainer — not Restruo — performs it.
     """
-    name = (image or "").lower()
-    return "portainer/portainer" in name or "portainer/agent" in name
+    return bool(helper_kind(image))
 
 
 def is_self_critical_image(image: str) -> bool:
@@ -885,15 +886,7 @@ def is_self_critical_image(image: str) -> bool:
     agent, which is that API for its environment. Restruo stopping itself is
     recoverable (from Portainer) but still removes the UI mid-click.
     """
-    name = (image or "").lower()
-    return cannot_recreate_image(image) or "restruo" in name
-
-
-def container_is_down(container: dict) -> bool:
-    """Not running, or running but failing its healthcheck."""
-    state = (container.get("State") or "").lower()
-    status = container.get("Status") or ""
-    return state != "running" or "(unhealthy)" in status
+    return cannot_recreate_image(image) or is_restruo_image(image)
 
 
 def container_name(container: dict) -> str:

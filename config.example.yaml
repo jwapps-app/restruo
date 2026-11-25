@@ -20,10 +20,10 @@
 updates:
   enabled: true
   interval_hours: 6
-  # Tags treated as rolling. Add others if you run projects that ship on them,
-  # e.g. immich's :release. Equivalent to RESTRUO_FLOATING_TAGS.
   # Tags checked as rolling. Leave out to get the default list (latest, lts,
-  # stable, release, edge, main, master, nightly, rolling, dev).
+  # stable, release, edge, main, master, nightly, rolling, dev); add others if
+  # you run projects that ship on them, e.g. immich's :release. Equivalent to
+  # RESTRUO_FLOATING_TAGS.
   # floating_tags: ["latest", "release"]
   # Also check version tags (mariadb:10.11) for a newer build published under
   # the same name. Equivalent to RESTRUO_CHECK_VERSION_TAGS=true.
@@ -37,3 +37,7 @@ ui:
     enabled: true
     username: "admin"
     password_env: "DASHBOARD_PASSWORD"   # password comes from this env var, never from this file
+
+# How much Restruo logs: DEBUG, INFO, WARNING, ERROR or CRITICAL.
+# Equivalent to RESTRUO_LOG_LEVEL.
+# log_level: INFO

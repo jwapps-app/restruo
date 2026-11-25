@@ -3,28 +3,13 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from app import timing
 from app.instances import InstanceRecord, InstanceStore, destination
 from app.main import app
 from app.portainer import PortainerClient
+from tests.fakes import update_settings
 
 BASIC = ("admin", "hunter2")
-
-
-def _reset():
-    for attr in ("config", "store"):
-        if hasattr(app.state, attr):
-            delattr(app.state, attr)
-
-
-@pytest.fixture
-def client(tmp_path, monkeypatch):
-    monkeypatch.setenv("DASHBOARD_PASSWORD", "hunter2")
-    monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "missing.yaml"))
-    monkeypatch.setenv("DATA_PATH", str(tmp_path / "instances.json"))
-    monkeypatch.setenv("RESTRUO_USERNAME", "admin")
-    _reset()
-    with TestClient(app) as c:
-        yield c
 
 
 class StackHost:
@@ -239,7 +224,7 @@ async def test_an_old_replica_beside_a_new_one_is_an_update():
     registry = RegistryClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, headers={"docker-content-digest": NEW})))
     c = PortainerClient(InstanceRecord(id=1, name="p", base_url="https://p", auth_type="api_key", api_key="k"),
                         transport=httpx.MockTransport(portainer))
-    snap = await UpdateChecker(lambda: [(1, c)], registry, interval_hours=6).check_all()
+    snap = await UpdateChecker(lambda: [(1, c)], registry, update_settings()).check_all()
     image = snap["instances"][0]["stacks"][0]["images"][0]
     assert image["status"] == "update-available", image
     assert "o" * 12 in image["detail"] and "n" * 12 not in image["detail"].split("registry")[0]
@@ -277,7 +262,7 @@ async def test_checker_checks_a_profiled_image_when_a_container_runs_it():
     registry = RegistryClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, headers={"docker-content-digest": D})))
     c = PortainerClient(InstanceRecord(id=1, name="p", base_url="https://p", auth_type="api_key", api_key="k"),
                         transport=httpx.MockTransport(portainer))
-    snap = await UpdateChecker(lambda: [(1, c)], registry, interval_hours=6).check_all()
+    snap = await UpdateChecker(lambda: [(1, c)], registry, update_settings()).check_all()
     assert snap["instances"][0]["stacks"][0]["images"][0]["status"] == "up-to-date"
 
 
@@ -352,7 +337,7 @@ def test_stack_names_are_scoped_to_their_environment():
 
 def test_auto_refresh_also_reloads_update_results():
     html = open("web/index.html").read()
-    body = html[html.index("async function refresh()"):html.index("function ago(")]
+    body = html[html.index("async function refresh()"):html.index("function renderCheckStatus(")]
     assert "loadUpdates()" in body
 
 
@@ -367,7 +352,7 @@ async def test_an_unobserved_instance_keeps_what_was_announced():
         async def send(self, events):
             sent.append(list(events))
 
-    checker = UpdateChecker(lambda: [], registry=None, interval_hours=6, notifiers=[Capture()])
+    checker = UpdateChecker(lambda: [], None, update_settings(), notifiers=[Capture()])
     finding = {"instance": {"id": 5, "name": "P"}, "stacks": [
         {"id": 1, "name": "s", "images": [{"image": "x:latest", "status": "update-available"}]}], "containers": []}
     checker.results = [finding]
@@ -433,7 +418,7 @@ def test_secret_files_are_private_from_the_first_byte(tmp_path):
 @pytest.mark.asyncio
 async def test_a_replaced_client_is_retired_not_closed_under_a_running_job(tmp_path, monkeypatch):
     import app.instances as instances
-    monkeypatch.setattr(instances, "RETIRE_AFTER_SECONDS", 0.05)
+    monkeypatch.setattr(timing, "RETIRE_AFTER_SECONDS", 0.05)
     store = InstanceStore(tmp_path / "i.json")
     rec = await store.add({"name": "a", "base_url": "http://a", "api_key": "k"})
     manager = instances.ClientManager(store)
@@ -465,8 +450,8 @@ async def test_a_replaced_client_is_retired_not_closed_under_a_running_job(tmp_p
     (("stack", 6, 2, 7), ("prune", 5), False),              # other instance: fine
 ])
 def test_conflicting_operations_are_refused(key, held, blocked):
-    from app.main import _conflicts
-    assert (_conflicts(key, held) is not None) is blocked
+    from app.operations import conflicts
+    assert (conflicts(key, held) is not None) is blocked
 
 
 def test_stop_is_refused_while_the_stack_is_deploying(client):
@@ -481,12 +466,12 @@ def test_stop_is_refused_while_the_stack_is_deploying(client):
                  "Labels": {"com.docker.compose.project": "plain"}}]
     host.list_containers = plain_containers
     app.state.manager._clients[7] = host
-    app.state.in_flight.add(("stack", 7, 1, 1))
+    app.state.ops.in_flight.add(("stack", 7, 1, 1))
     try:
         r = client.post("/api/instances/7/stacks/1/stop", auth=BASIC)
         assert r.status_code == 409 and host.stopped == []
     finally:
-        app.state.in_flight.discard(("stack", 7, 1, 1))
+        app.state.ops.in_flight.discard(("stack", 7, 1, 1))
 
 
 # --- A25 -------------------------------------------------------------------
@@ -571,7 +556,7 @@ async def test_concurrent_manual_checks_share_one_scan():
         async def list_endpoints(self):
             return []
 
-    checker = UpdateChecker(lambda: [(1, Slow())], registry=None, interval_hours=6)
+    checker = UpdateChecker(lambda: [(1, Slow())], None, update_settings())
     await asyncio.gather(checker.check_all(notify=False), checker.check_all(notify=False),
                          checker.check_all(notify=False))
     assert len(scans) == 1

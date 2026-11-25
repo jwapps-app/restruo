@@ -11,33 +11,18 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-import app.main as main
+from app import actions, timing
 from app.auth import LoginLimiter, SessionManager
 from app.instances import ClientManager, InstanceRecord, InstanceStore
 from app.main import app
+from app.helper_runner import parse_helper_result
 from app.portainer import PortainerClient
 from app.registry import realm_policy
 from app.updates import UpdateChecker
+from tests.fakes import update_settings
 
 CSRF = {"X-Restruo": "1"}
 BASIC = ("admin", "hunter2")
-
-
-def _reset_app_state():
-    for attr in ("config", "store"):
-        if hasattr(app.state, attr):
-            delattr(app.state, attr)
-
-
-@pytest.fixture
-def client(tmp_path, monkeypatch):
-    monkeypatch.setenv("DASHBOARD_PASSWORD", "hunter2")
-    monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "missing.yaml"))
-    monkeypatch.setenv("DATA_PATH", str(tmp_path / "instances.json"))
-    monkeypatch.setenv("RESTRUO_USERNAME", "admin")
-    _reset_app_state()
-    with TestClient(app) as test_client:
-        yield test_client
 
 
 def _login(client):
@@ -87,12 +72,14 @@ class AgentHost:
         pass
 
 
-def test_agent_update_goes_through_the_helper_not_portainers_recreate(client, monkeypatch):
-    monkeypatch.setattr(main, "HELPER_POLL_SECONDS", 0.001)
-    monkeypatch.setenv("RESTRUO_VERSION", "abc123")
+def test_agent_update_goes_through_the_helper_not_portainers_recreate(app_env, monkeypatch):
+    monkeypatch.setattr(timing, "HELPER_POLL_SECONDS", 0.001)
+    monkeypatch.setenv("RESTRUO_VERSION", "abc123")  # read when the app starts
     host = AgentHost()
-    app.state.manager._clients[7] = host
-    r = client.post("/api/instances/7/containers/3c8646c2b71b/update?endpointId=11", auth=BASIC)
+    with TestClient(app) as client:
+        app.state.manager._clients[7] = host
+        r = client.post(
+            "/api/instances/7/containers/3c8646c2b71b/update?endpointId=11", auth=BASIC)
 
     assert r.status_code == 200, r.text
     assert "Updated portainer_agent" in r.json()["message"]
@@ -106,7 +93,7 @@ def test_agent_update_goes_through_the_helper_not_portainers_recreate(client, mo
 
 
 def test_helper_failure_is_reported_with_its_reason(client, monkeypatch):
-    monkeypatch.setattr(main, "HELPER_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(timing, "HELPER_POLL_SECONDS", 0.001)
     host = AgentHost()
 
     async def failed_logs(endpoint_id, cid):
@@ -119,10 +106,10 @@ def test_helper_failure_is_reported_with_its_reason(client, monkeypatch):
 
 
 def test_helper_result_parsing():
-    assert main.parse_helper_result('x\n{"ok": true, "message": "m"}', 0) == {"ok": True, "message": "m"}
-    crashed = main.parse_helper_result("Traceback...\nKeyError: 'Id'", 1)
+    assert parse_helper_result('x\n{"ok": true, "message": "m"}', 0) == {"ok": True, "message": "m"}
+    crashed = parse_helper_result("Traceback...\nKeyError: 'Id'", 1)
     assert crashed["ok"] is False and "KeyError" in crashed["message"]
-    assert main.parse_helper_result("", 137)["ok"] is False
+    assert parse_helper_result("", 137)["ok"] is False
 
 
 def test_docker_log_frames_are_demultiplexed():
@@ -373,7 +360,7 @@ async def test_refresh_keeps_clients_whose_record_is_unchanged(tmp_path):
 # --- #17 long deploys become a job the page polls --------------------------
 
 def test_quick_update_answers_inline_and_slow_one_becomes_a_job(client, monkeypatch):
-    monkeypatch.setattr(main, "JOB_SYNC_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(timing, "JOB_SYNC_WAIT_SECONDS", 0.05)
 
     class Slow:
         instance = type("I", (), {"name": "p"})()
@@ -398,9 +385,9 @@ def test_quick_update_answers_inline_and_slow_one_becomes_a_job(client, monkeypa
     async def fake_update_one(c, stack):
         if next(outcomes) == "slow":
             await asyncio.sleep(0.3)
-        return {"ok": True, "stack": "s", "durationMs": 1, "message": "Redeployed."}
+        return {"ok": True, "name": "s", "durationMs": 1, "message": "Redeployed."}
 
-    monkeypatch.setattr(main, "_update_one", fake_update_one)
+    monkeypatch.setattr(actions, "update_running_stack", fake_update_one)
 
     quick = client.post("/api/instances/9/stacks/1/update", auth=BASIC)
     assert quick.status_code == 200 and quick.json()["ok"] is True
@@ -421,10 +408,10 @@ def test_quick_update_answers_inline_and_slow_one_becomes_a_job(client, monkeypa
 
 def test_notified_state_persists(tmp_path):
     path = tmp_path / "notified.json"
-    first = UpdateChecker(lambda: [], registry=None, interval_hours=6, state_path=path)
+    first = UpdateChecker(lambda: [], None, update_settings(), state_path=path)
     first._notified = {(5, 12, "img:latest"), (5, "container", 11, "abc", "x:latest")}
     first._save_notified()
-    second = UpdateChecker(lambda: [], registry=None, interval_hours=6, state_path=path)
+    second = UpdateChecker(lambda: [], None, update_settings(), state_path=path)
     assert second._notified == first._notified
     assert json.loads(path.read_text())  # plain JSON on disk
 
@@ -432,5 +419,5 @@ def test_notified_state_persists(tmp_path):
 def test_corrupt_notified_state_is_ignored(tmp_path):
     path = tmp_path / "notified.json"
     path.write_text("{not json")
-    checker = UpdateChecker(lambda: [], registry=None, interval_hours=6, state_path=path)
+    checker = UpdateChecker(lambda: [], None, update_settings(), state_path=path)
     assert checker._notified == set()

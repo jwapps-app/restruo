@@ -9,6 +9,7 @@ from app.notifiers import Notifier
 from app.portainer import PortainerClient
 from app.registry import RegistryClient, RegistryError, parse_image_ref
 from app.updates import UpdateChecker
+from tests.fakes import update_settings
 
 INSTANCE = InstanceConfig(
     name="Test", base_url="https://portainer.test:9443", api_key="ptr_test", verify_tls=True
@@ -140,7 +141,7 @@ async def run_check(local_digest: str, remote_digest: str, notifier=None):
     portainer = PortainerClient(INSTANCE, transport=portainer_transport(local_digest))
     registry = RegistryClient(transport=registry_transport(remote_digest, require_token=False))
     checker = UpdateChecker(
-        lambda: [(0, portainer)], registry, interval_hours=6,
+        lambda: [(0, portainer)], registry, update_settings(),
         notifiers=[notifier] if notifier else [],
     )
     snapshot = await checker.check_all()
@@ -216,7 +217,7 @@ async def test_compares_running_container_not_local_tag():
         INSTANCE, transport=container_aware_transport(OLD_DIGEST, NEW_DIGEST)
     )
     registry = RegistryClient(transport=registry_transport(NEW_DIGEST, require_token=False))
-    checker = UpdateChecker(lambda: [(0, portainer)], registry, interval_hours=6)
+    checker = UpdateChecker(lambda: [(0, portainer)], registry, update_settings())
     snapshot = await checker.check_all()
     by_image = {
         img["image"]: img["status"]
@@ -257,7 +258,7 @@ async def test_same_image_across_stacks_hits_registry_once():
 
     portainer = PortainerClient(INSTANCE, transport=httpx.MockTransport(portainer_handler))
     registry = RegistryClient(transport=httpx.MockTransport(registry_handler))
-    checker = UpdateChecker(lambda: [(0, portainer)], registry, interval_hours=6)
+    checker = UpdateChecker(lambda: [(0, portainer)], registry, update_settings())
     snapshot = await checker.check_all()
 
     # web:latest appears in both stacks but the registry is asked only once.
@@ -293,7 +294,7 @@ async def test_floating_tags_extend_the_checked_set():
 
     # Default rule: :release is treated as pinned.
     p1 = PortainerClient(INSTANCE, transport=httpx.MockTransport(handler))
-    default_checker = UpdateChecker(lambda: [(0, p1)], registry, interval_hours=6)
+    default_checker = UpdateChecker(lambda: [(0, p1)], registry, update_settings())
     snapshot = await default_checker.check_all()
     assert snapshot["instances"][0]["stacks"][0]["images"][0]["status"] == "pinned"
     await p1.aclose()
@@ -301,8 +302,7 @@ async def test_floating_tags_extend_the_checked_set():
     # With release in floating_tags it gets checked and flagged.
     p2 = PortainerClient(INSTANCE, transport=httpx.MockTransport(handler))
     wide_checker = UpdateChecker(
-        lambda: [(0, p2)], registry, interval_hours=6,
-        floating_tags=["latest", "release"],
+        lambda: [(0, p2)], registry, update_settings(floating_tags=["latest", "release"]),
     )
     snapshot = await wide_checker.check_all()
     assert snapshot["instances"][0]["stacks"][0]["images"][0]["status"] == "update-available"
@@ -357,7 +357,7 @@ async def test_standalone_container_checked_and_flagged():
     registry = RegistryClient(transport=registry_transport(NEW_DIGEST, require_token=False))
     notifier = RecordingNotifier()
     checker = UpdateChecker(
-        lambda: [(0, portainer)], registry, interval_hours=6, notifiers=[notifier]
+        lambda: [(0, portainer)], registry, update_settings(), notifiers=[notifier]
     )
     snapshot = await checker.check_all()
     containers = snapshot["instances"][0]["containers"]
@@ -374,7 +374,7 @@ async def test_running_container_current_is_up_to_date():
         INSTANCE, transport=container_aware_transport(NEW_DIGEST, NEW_DIGEST)
     )
     registry = RegistryClient(transport=registry_transport(NEW_DIGEST, require_token=False))
-    checker = UpdateChecker(lambda: [(0, portainer)], registry, interval_hours=6)
+    checker = UpdateChecker(lambda: [(0, portainer)], registry, update_settings())
     snapshot = await checker.check_all()
     by_image = {
         img["image"]: img["status"]
@@ -416,7 +416,7 @@ async def test_locally_built_images_are_not_reported_as_failures():
 
     portainer = PortainerClient(INSTANCE, transport=await local_only_transport())
     registry = RegistryClient(transport=httpx.MockTransport(registry_handler))
-    checker = UpdateChecker(lambda: [(0, portainer)], registry, interval_hours=6)
+    checker = UpdateChecker(lambda: [(0, portainer)], registry, update_settings())
     snapshot = await checker.check_all()
     image = snapshot["instances"][0]["stacks"][0]["images"][0]
     assert image["status"] == "local"
@@ -450,7 +450,7 @@ async def test_private_registry_is_reported_distinctly():
 
     portainer = PortainerClient(INSTANCE, transport=httpx.MockTransport(portainer_handler))
     registry = RegistryClient(transport=httpx.MockTransport(registry_handler))
-    checker = UpdateChecker(lambda: [(0, portainer)], registry, interval_hours=6)
+    checker = UpdateChecker(lambda: [(0, portainer)], registry, update_settings())
     snapshot = await checker.check_all()
     image = snapshot["instances"][0]["stacks"][0]["images"][0]
     assert image["status"] == "private"
@@ -485,7 +485,7 @@ def test_errors_always_say_what_they_were():
     """httpx timeouts stringify to nothing; an empty reason is useless."""
     import httpx
 
-    from app.updates import describe_error
+    from app.errors import describe as describe_error
 
     assert describe_error(httpx.ConnectTimeout("")) == "ConnectTimeout"
     assert describe_error(httpx.ReadTimeout("")) == "ReadTimeout"

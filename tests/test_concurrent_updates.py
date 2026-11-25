@@ -10,6 +10,8 @@ import asyncio
 import httpx
 import pytest
 
+from app.errors import Busy
+from app.operations import Operations
 from app.portainer import PortainerClient, PortainerError
 from app.instances import InstanceRecord
 
@@ -43,40 +45,31 @@ def test_message_alone_still_works():
 
 @pytest.mark.asyncio
 async def test_second_update_of_the_same_stack_is_refused():
-    from fastapi import HTTPException
-    from app.main import _exclusive
-
-    class FakeApp:
-        class state:
-            in_flight: set = set()
-
-    class FakeRequest:
-        app = FakeApp
-
+    ops = Operations()
     started = asyncio.Event()
     release = asyncio.Event()
 
     async def first():
-        async with _exclusive(FakeRequest, ("stack", 5, 42)):
+        async with ops.exclusive(("stack", 5, 42)):
             started.set()
             await release.wait()
 
     task = asyncio.create_task(first())
     await started.wait()
 
-    with pytest.raises(HTTPException) as caught:
-        async with _exclusive(FakeRequest, ("stack", 5, 42)):
+    with pytest.raises(Busy) as caught:
+        async with ops.exclusive(("stack", 5, 42)):
             pass
     assert caught.value.status_code == 409
     assert "already running" in caught.value.detail
 
     # A different stack is unaffected — Portainer handles those concurrently.
-    async with _exclusive(FakeRequest, ("stack", 5, 43)):
+    async with ops.exclusive(("stack", 5, 43)):
         pass
 
     release.set()
     await task
 
     # Once finished, the same stack can be updated again.
-    async with _exclusive(FakeRequest, ("stack", 5, 42)):
+    async with ops.exclusive(("stack", 5, 42)):
         pass

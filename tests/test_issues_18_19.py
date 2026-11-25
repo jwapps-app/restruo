@@ -16,12 +16,13 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-import app.main as main
+from app import outcome, timing
 from app.instances import InstanceRecord
 from app.main import app
 from app.portainer import PortainerClient, registry_id_for
 from app.registry import RegistryClient
 from app.updates import UpdateChecker
+from tests.fakes import update_settings
 
 BASIC = ("admin", "hunter2")
 OLD, NEW = "sha256:" + "a" * 64, "sha256:" + "b" * 64
@@ -69,7 +70,7 @@ def registry_serving(digest: str, asked: list):
 async def check(local_digest, **kwargs):
     asked: list = []
     checker = UpdateChecker(lambda: [(1, lab(local_digest))], registry_serving(NEW, asked),
-                            interval_hours=6, **kwargs)
+                            update_settings(**kwargs))
     snap = await checker.check_all(notify=False)
     return {i["image"]: i for i in snap["instances"][0]["stacks"][0]["images"]}, asked
 
@@ -127,23 +128,6 @@ def test_the_page_names_a_rebuild_and_explains_a_pin():
 
 # ---------------------------------------------------------------- #19
 
-def _reset():
-    for attr in ("config", "store"):
-        if hasattr(app.state, attr):
-            delattr(app.state, attr)
-
-
-@pytest.fixture
-def client(tmp_path, monkeypatch):
-    monkeypatch.setenv("DASHBOARD_PASSWORD", "hunter2")
-    monkeypatch.setenv("CONFIG_PATH", str(tmp_path / "missing.yaml"))
-    monkeypatch.setenv("DATA_PATH", str(tmp_path / "instances.json"))
-    monkeypatch.setenv("RESTRUO_USERNAME", "admin")
-    _reset()
-    with TestClient(app) as c:
-        yield c
-
-
 class StoppedStackHost:
     """A Portainer whose stack 1 is stopped (Status 2)."""
     instance = type("I", (), {"name": "p"})()
@@ -197,7 +181,7 @@ def test_a_running_stack_is_still_redeployed(client, monkeypatch):
 
     async def fake_await(client_, stack, before):
         return {"ok": True, "message": "Redeployed 2 containers, all running."}
-    monkeypatch.setattr(main, "_await_deploy", fake_await)
+    monkeypatch.setattr(outcome, "await_deploy", fake_await)
     r = client.post("/api/instances/7/stacks/1/update", auth=BASIC)
     assert r.status_code == 200 and host.redeployed == [1] and host.pulled == []
 
@@ -262,7 +246,7 @@ class ContainerHost:
 
 @pytest.fixture(autouse=True)
 def _fast_container_polls(monkeypatch):
-    monkeypatch.setattr(main, "CONTAINER_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(timing, "CONTAINER_POLL_SECONDS", 0.001)
 
 
 def test_a_stopped_container_is_stopped_again_after_its_update(client):

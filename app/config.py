@@ -202,6 +202,11 @@ class EmailConfig(BaseModel):
         return bool(self.host and self.recipients and self.from_address)
 
 
+DEFAULT_CONFIG_PATH = "/config/config.yaml"
+DEFAULT_DATA_PATH = "/data/instances.json"
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+
+
 class AppConfig(BaseModel):
     # Optional seed list: imported into the instance store on first start,
     # then managed from the settings UI.
@@ -209,9 +214,26 @@ class AppConfig(BaseModel):
     ui: UIConfig = Field(default_factory=UIConfig)
     updates: UpdatesConfig = Field(default_factory=UpdatesConfig)
     email: EmailConfig = Field(default_factory=EmailConfig)
+    # Where the instance list lives; the session secret and the record of
+    # what has been emailed sit beside it.
+    data_path: str = Field(default_factory=lambda: _env_str("DATA_PATH") or DEFAULT_DATA_PATH)
+    log_level: str = Field(
+        default_factory=lambda: _env_str("RESTRUO_LOG_LEVEL") or "INFO", validate_default=True
+    )
+    # Image the update helper runs from. Empty means this build's own image.
+    helper_image: str = Field(default_factory=lambda: _env_str("RESTRUO_HELPER_IMAGE"))
+    # The commit this image was built from; set by the build, not by hand.
+    version: str = Field(default_factory=lambda: _env_str("RESTRUO_VERSION") or "dev")
 
-
-DEFAULT_CONFIG_PATH = "/config/config.yaml"
+    @field_validator("log_level")
+    @classmethod
+    def known_log_level(cls, value: str) -> str:
+        normalized = (value or "INFO").strip().upper()
+        if normalized not in LOG_LEVELS:
+            raise ValueError(
+                f"RESTRUO_LOG_LEVEL must be one of {', '.join(LOG_LEVELS)} — got {value!r}"
+            )
+        return normalized
 
 
 def load_config(path: str | None = None) -> AppConfig:
